@@ -103,8 +103,9 @@ func e2eStack(t *testing.T, target string, srv *httptest.Server) *tee.Service {
 
 	// The TEE's outbound HTTP, egressing through the agent's tunnel.
 	outbound, err := transport.New(transport.Config{
-		Scheme:      "http",
-		DialContext: transport.SOCKS5Dialer(ln.Addr().String(), nil),
+		Scheme:         "http",
+		AllowPlaintext: true,
+		DialContext:    transport.SOCKS5Dialer(ln.Addr().String(), nil),
 	})
 	if err != nil {
 		t.Fatalf("new transport: %v", err)
@@ -123,6 +124,7 @@ func e2eStack(t *testing.T, target string, srv *httptest.Server) *tee.Service {
 		Transport:   outbound,
 		Signer:      proof.NewSigner(newEpoch(t)),
 		Clock:       func() time.Time { return now },
+		Seq:         tee.NewMemorySeqStore(),
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)

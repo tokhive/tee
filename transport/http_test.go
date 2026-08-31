@@ -26,7 +26,7 @@ func hostOf(srv *httptest.Server) string {
 
 func newLocalTransport(t *testing.T) *HTTP {
 	t.Helper()
-	tr, err := New(Config{Scheme: "http"})
+	tr, err := New(Config{Scheme: "http", AllowPlaintext: true})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -333,7 +333,8 @@ func TestDialContextUsed(t *testing.T) {
 
 	var dials atomic.Int32
 	tr, err := New(Config{
-		Scheme: "http",
+		Scheme:         "http",
+		AllowPlaintext: true,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			dials.Add(1)
 			var d net.Dialer

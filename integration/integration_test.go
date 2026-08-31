@@ -550,6 +550,7 @@ func newService(t *testing.T, epoch *fakeEpoch, transport tee.Transport) *tee.Se
 		Transport:   transport,
 		Signer:      proof.NewSigner(epoch),
 		Clock:       func() time.Time { return now },
+		Seq:         tee.NewMemorySeqStore(),
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)

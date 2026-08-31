@@ -35,7 +35,7 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/sim/internal/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 )
 
 // pricePerRequest is the provider's own price table. In the plan, pricing
@@ -216,8 +216,10 @@ func runOnce(teeURL string, spec jobs.Spec, body []byte, provider string, withho
 	fmt.Printf("[receipt] provider=%s seq=%d requestBytes=%d responseBytes=%d chunks=%d status=%d completion=%s\n",
 		r.Provider, r.ProviderSeq, r.RequestBytes, r.ResponseBytes, r.ChunkCount, r.StatusCode, r.Completion)
 
-	// Pricing authority is the provider's: the Hub applies the provider's rate.
-	if r.Completion == proof.CompletionComplete {
+	// Pricing authority is the provider's: the Hub applies the provider's
+	// rate, but only on a genuine success — a 401/429 is the provider
+	// declining or throttling, which earns nothing.
+	if r.Completion == proof.CompletionComplete && r.StatusCode == 200 {
 		ledger.revenue += pricePerRequest[provider]
 		ledger.byProvider[provider]++
 	}

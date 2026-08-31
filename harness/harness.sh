@@ -14,7 +14,7 @@
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BIN="$SCRIPT_DIR/bin"
 SIM="$REPO/.sim"
 
@@ -22,12 +22,18 @@ cd "$REPO" || exit 1
 
 echo "==> repo: $REPO"
 
+# --- kill any stale simulation processes from an interrupted prior run -----
+# (a leftover faketee would still hold :18090 and serve an old policy/seqstore)
+pkill -f "$BIN/" 2>/dev/null
+pkill -f "tokenhive/cmd" 2>/dev/null
+sleep 0.3
+
 # --- build ---------------------------------------------------------------
 echo "==> building simulation binaries"
 mkdir -p "$BIN"
-for pkg in mockprovider faketee hub verify; do
+for pkg in mockprovider faketee hub verify tee agent; do
   echo "    building $pkg"
-  go build -o "$BIN/$pkg" "./tokenhive/sim/$pkg" || { echo "build failed for $pkg"; exit 1; }
+  go build -o "$BIN/$pkg" "./tokenhive/cmd/$pkg" || { echo "build failed for $pkg"; exit 1; }
 done
 
 # --- fresh state ---------------------------------------------------------
@@ -54,7 +60,7 @@ wait_for_port 127.0.0.1 "$MP_PORT"
 
 # --- start simulated TEE -------------------------------------------------
 echo "==> starting faketee (sim TEE) on :$TEE_PORT"
-"$BIN/faketee" -addr "127.0.0.1:$TEE_PORT" > "$SIM/faketee.log" 2>&1 &
+"$BIN/faketee" -addr "127.0.0.1:$TEE_PORT" -seq "$SIM/seqstore.json" > "$SIM/faketee.log" 2>&1 &
 TEE_PID=$!
 wait_for_port 127.0.0.1 "$TEE_PORT"
 
@@ -82,7 +88,7 @@ section "5. provider drops connection mid-stream (CompletionTruncated)"
 section "6. restart faketee; ProviderSeq must keep climbing"
 echo "    (killing faketee pid $TEE_PID)"
 kill "$TEE_PID" 2>/dev/null; wait "$TEE_PID" 2>/dev/null
-"$BIN/faketee" -addr "127.0.0.1:$TEE_PORT" > "$SIM/faketee2.log" 2>&1 &
+"$BIN/faketee" -addr "127.0.0.1:$TEE_PORT" -seq "$SIM/seqstore.json" > "$SIM/faketee2.log" 2>&1 &
 TEE_PID=$!
 wait_for_port 127.0.0.1 "$TEE_PORT"
 echo "    sending 1 request after restart; expect seq to continue, not reset:"
@@ -93,7 +99,7 @@ section "7. ProviderSeq gap: Hub hides one record, audit must catch it"
 echo "    (reset store + restart faketee for an isolated demo)"
 rm -rf "$SIM/receipts" "$SIM/seqstore.json"
 kill "$TEE_PID" 2>/dev/null; wait "$TEE_PID" 2>/dev/null
-"$BIN/faketee" -addr "127.0.0.1:$TEE_PORT" > "$SIM/faketee3.log" 2>&1 &
+"$BIN/faketee" -addr "127.0.0.1:$TEE_PORT" -seq "$SIM/seqstore.json" > "$SIM/faketee3.log" 2>&1 &
 TEE_PID=$!
 wait_for_port 127.0.0.1 "$TEE_PORT"
 echo "    sending 3, withholding the 2nd receipt (expect stored seqs {1,3}):"

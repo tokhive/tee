@@ -206,6 +206,7 @@ func newTestEnv(t *testing.T, opts ...envOption) *testEnv {
 		Transport:   transport,
 		Signer:      proof.NewSigner(epoch),
 		Clock:       func() time.Time { return baseTime },
+		Seq:         NewMemorySeqStore(),
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -781,6 +782,7 @@ func TestServiceRequiresConfiguration(t *testing.T) {
 			Credentials: NewStaticCredentials(),
 			Transport:   &fakeTransport{failAfter: -1},
 			Signer:      proof.NewSigner(newTestEpoch(t)),
+			Seq:         NewMemorySeqStore(),
 		}
 	}
 
@@ -793,6 +795,7 @@ func TestServiceRequiresConfiguration(t *testing.T) {
 		{"no credentials", ErrNoCredentials, func(c *Config) { c.Credentials = nil }},
 		{"no transport", ErrNoTransport, func(c *Config) { c.Transport = nil }},
 		{"no signer", ErrNoSigner, func(c *Config) { c.Signer = nil }},
+		{"no seq store", ErrNoSeqStore, func(c *Config) { c.Seq = nil }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -817,6 +820,7 @@ func TestServiceWithoutTransportIsUnconstructible(t *testing.T) {
 		Policies:    policy.NewSet(),
 		Credentials: NewStaticCredentials(),
 		Signer:      proof.NewSigner(newTestEpoch(t)),
+		Seq:         NewMemorySeqStore(),
 	})
 	if !errors.Is(err, ErrNoTransport) {
 		t.Fatalf("error = %v, want %v", err, ErrNoTransport)

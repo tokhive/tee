@@ -17,7 +17,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/sim/internal/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 )
 
 // mockChunks is the fixed, deterministic response stream. Because it never

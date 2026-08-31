@@ -39,8 +39,9 @@ func startAgent(t *testing.T, cfg AgentConfig) string {
 func tunneledTransport(t *testing.T, agentAddr string, auth *transport.SOCKS5Auth) *transport.HTTP {
 	t.Helper()
 	tr, err := transport.New(transport.Config{
-		Scheme:      "http",
-		DialContext: transport.SOCKS5Dialer(agentAddr, auth),
+		Scheme:         "http",
+		AllowPlaintext: true,
+		DialContext:    transport.SOCKS5Dialer(agentAddr, auth),
 	})
 	if err != nil {
 		t.Fatalf("transport.New: %v", err)

@@ -17,11 +17,16 @@
 //  4. policy authorisation
 //  5. body size against the policy cap
 //  6. credential resolution
+//  7. sequence allocation (see Config.Seq)
 //
 // Steps 2 and 3 establish that the job is internally consistent; only then is
 // it meaningful to ask whether it is permitted. Authorising a request whose
 // body does not match its own description would spend a credential on a
 // question nobody asked.
+//
+// Step 7 is last because it is the only step that mutates state. Every check
+// that can refuse a job runs first, so a refused job never consumes a sequence
+// number and never leaves a hole in the provider's series.
 //
 // # When a receipt exists
 //
@@ -106,6 +111,11 @@ type Result struct {
 
 	// PolicyHash names the policy revision that authorised the job.
 	PolicyHash []byte
+
+	// ProviderSeq is this execution's place in the provider's series. Also
+	// inside the signed receipt; surfaced here so a server can log it without
+	// decoding the receipt it just emitted.
+	ProviderSeq uint64
 }
 
 // Config assembles a Service.
@@ -125,6 +135,10 @@ type Config struct {
 
 	// Signer issues execution receipts from an attested key.
 	Signer *proof.Signer
+
+	// Seq assigns the per-provider monotonic sequence number signed into every
+	// receipt. Mandatory, and deliberately not defaulted: see ErrNoSeqStore.
+	Seq SeqStore
 
 	// Clock is the service's time source. Defaults to time.Now. Injected
 	// because receipt timestamps are part of what gets signed, and tests need
@@ -152,6 +166,7 @@ type Service struct {
 	credentials     CredentialSource
 	transport       Transport
 	signer          *proof.Signer
+	seq             SeqStore
 	clock           func() time.Time
 	requestTimeout  time.Duration
 	submitterVerify func(ctx context.Context, spec jobs.Spec) error
@@ -171,6 +186,9 @@ func NewService(cfg Config) (*Service, error) {
 	if cfg.Signer == nil {
 		return nil, ErrNoSigner
 	}
+	if cfg.Seq == nil {
+		return nil, ErrNoSeqStore
+	}
 	clock := cfg.Clock
 	if clock == nil {
 		clock = time.Now
@@ -180,6 +198,7 @@ func NewService(cfg Config) (*Service, error) {
 		credentials:     cfg.Credentials,
 		transport:       cfg.Transport,
 		signer:          cfg.Signer,
+		seq:             cfg.Seq,
 		clock:           clock,
 		requestTimeout:  cfg.RequestTimeout,
 		submitterVerify: cfg.SubmitterVerifier,
@@ -244,6 +263,22 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc) (*Res
 		return nil, err
 	}
 
+	// The last thing before the wire, and the only thing here that mutates
+	// state. A failure to allocate is a refusal, not a receipt: better to
+	// decline a job than to execute one whose place in the provider's series
+	// cannot be recorded.
+	//
+	// The allocation is conservative in the other direction too. If the
+	// exchange happens but signing then fails, the number is spent with no
+	// receipt to show for it, and the provider sees a gap where nothing was
+	// hidden. That is the right way round — a gap invites a question, while a
+	// number reused after a crash would let a hidden receipt pass as accounted
+	// for.
+	seq, err := s.seq.Next([]byte(job.Spec.Provider))
+	if err != nil {
+		return nil, fmt.Errorf("allocate provider sequence: %w", err)
+	}
+
 	request := Request{
 		Method:           job.Spec.Method,
 		Host:             job.Spec.Host,
@@ -256,7 +291,7 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc) (*Res
 		Timeout:          s.requestTimeout,
 	}
 
-	return s.perform(ctx, request, job.Spec, specHash, decision, onChunk)
+	return s.perform(ctx, request, job.Spec, specHash, decision, seq, onChunk)
 }
 
 // injectCredential merges the caller's headers with the provider's secret,
@@ -308,6 +343,7 @@ func (s *Service) perform(
 	spec jobs.Spec,
 	specHash [32]byte,
 	decision policy.Decision,
+	seq uint64,
 	onChunk ChunkFunc,
 ) (*Result, error) {
 	hasher := proof.NewStreamingHasher(spec.JobID)
@@ -379,6 +415,18 @@ func (s *Service) perform(
 		StartedAt:     startedAt,
 		FinishedAt:    finishedAt,
 		PolicyHash:    decision.PolicyHash,
+
+		// The request side of the exchange. The size was already computed to
+		// check it against the policy cap; signing it costs nothing and is the
+		// only attested record of how much was sent, since the body itself
+		// appears in the receipt only as a hash.
+		RequestBytes: uint64(len(request.Body)),
+
+		// Where this execution sits in the provider's series. A provider
+		// holding a receipt numbered N knows it was used at least N times,
+		// which is what turns a pile of individually-valid receipts into a
+		// ledger whose completeness can be checked.
+		ProviderSeq: seq,
 	}
 
 	signed, err := s.signer.Sign(receipt)
@@ -397,8 +445,9 @@ func (s *Service) perform(
 		// the reverse, would leave the caller guessing which to believe. The
 		// relay's own flag is folded in to cover a transport that swallows a
 		// consumer error and returns success anyway.
-		Truncated:  truncated || completion == proof.CompletionTruncated,
-		PolicyHash: decision.PolicyHash,
+		Truncated:   truncated || completion == proof.CompletionTruncated,
+		PolicyHash:  decision.PolicyHash,
+		ProviderSeq: seq,
 	}
 	return result, nil
 }

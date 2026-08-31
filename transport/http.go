@@ -60,6 +60,18 @@ const (
 // ErrUnsupportedScheme means Config.Scheme was neither http nor https.
 var ErrUnsupportedScheme = errors.New("unsupported URL scheme")
 
+// ErrPlaintextNotAllowed means Config.Scheme was "http" without
+// Config.AllowPlaintext.
+//
+// Plaintext is refused by default because of what this transport carries.
+// Every request it sends has a provider credential injected into a header, and
+// the hop it sends it over may be a Provider Agent — the one component the
+// trust model explicitly does not trust. Over http that agent reads the
+// credential straight off the wire, and nothing about the failure is visible:
+// the request succeeds, the receipt verifies, and the secret is gone. Against a
+// configuration mistake the only defence that works is refusing to build.
+var ErrPlaintextNotAllowed = errors.New("plaintext scheme requires AllowPlaintext")
+
 // Config assembles an HTTP transport.
 type Config struct {
 	// Scheme is the URL scheme for provider requests: "https" or "http". It
@@ -67,6 +79,13 @@ type Config struct {
 	// always TLS, while local demos and tests run plain HTTP. Defaults to
 	// "https".
 	Scheme string
+
+	// AllowPlaintext permits Scheme "http". It exists so that the tests and
+	// local demos which genuinely want to inspect bytes on the wire can say so
+	// out loud, and so that every other caller — including a production
+	// deployment with a mistyped config — fails at construction instead of
+	// leaking a credential on its first job. See ErrPlaintextNotAllowed.
+	AllowPlaintext bool
 
 	// DialContext, when set, replaces the TCP connection underneath the HTTP
 	// client. This is the socket where a Provider Agent pipe plugs in: the
@@ -95,6 +114,9 @@ func New(cfg Config) (*HTTP, error) {
 	}
 	if scheme != "https" && scheme != "http" {
 		return nil, fmt.Errorf("%w: %q", ErrUnsupportedScheme, scheme)
+	}
+	if scheme == "http" && !cfg.AllowPlaintext {
+		return nil, ErrPlaintextNotAllowed
 	}
 	base := &http.Transport{
 		// Deliberately nil rather than ProxyFromEnvironment: see the package
