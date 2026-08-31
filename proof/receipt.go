@@ -137,6 +137,20 @@ type Receipt struct {
 	// Optional so that a receipt stays valid in contexts where no policy was
 	// consulted; the TEE is expected to populate it on every normal job.
 	PolicyHash []byte `cbor:"16,keyasint,omitempty"`
+
+	// RequestBytes is the size of the request body the TEE actually sent to the
+	// provider. The TEE already computes len(body) to enforce MaxResponseBytes,
+	// so attesting it costs nothing and closes the input-side metering gap:
+	// until v1 the request body size was never proven.
+	RequestBytes uint64 `cbor:"17,keyasint,omitempty"`
+
+	// ProviderSeq is a per-provider monotonic sequence number the TEE signs
+	// into every receipt. A receipt proves one execution was genuine; the
+	// sequence proves the set of receipts a provider holds is complete. A
+	// provider holding receipts 2 and 4 knows it was used at least four times
+	// and can demand the missing record. It is the only piece of TEE state and
+	// must survive restarts (sealed in production, a file store in simulation).
+	ProviderSeq uint64 `cbor:"18,keyasint,omitempty"`
 }
 
 // SignedReceipt is a receipt together with the TEE's signature over it.

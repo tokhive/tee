@@ -102,6 +102,17 @@ type Spec struct {
 	ExpiresAt        int64             `cbor:"11,keyasint"`
 	MaxResponseBytes uint64            `cbor:"12,keyasint"`
 	Stream           bool              `cbor:"13,keyasint"`
+
+	// DeclaredModel is a Hub-supplied declaration of which model handled the
+	// request. The TEE does not validate it; it exists for pricing and audit
+	// and is covered by JobSpecHash, so a tampered declaration breaks the
+	// receipt's spec binding. Key 14 is retired (was UserKeyID); 15/16 are the
+	// first free keys.
+	DeclaredModel string `cbor:"15,keyasint,omitempty"`
+
+	// TenantRef is an opaque, non-PII reference the Hub attaches for provider
+	// reconciliation. The TEE never interprets it.
+	TenantRef []byte `cbor:"16,keyasint,omitempty"`
 }
 
 // SupportedMethods are the HTTP methods a job may request. HEAD is excluded:
