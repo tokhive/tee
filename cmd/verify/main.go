@@ -5,8 +5,9 @@
 // receipts is incomplete.
 //
 // Usage:
-//   verify                       verify the whole store (.sim/receipts)
-//   verify -provider openai-sim  verify one provider only
+//
+//	verify                       verify the whole store (.sim/receipts)
+//	verify -provider openai-sim  verify one provider only
 package main
 
 import (
@@ -16,10 +17,10 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 )
 
 func main() {

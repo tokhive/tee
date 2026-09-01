@@ -96,6 +96,13 @@ type AgentConfig struct {
 	// DialTarget replaces the outbound dial. Test injection point; nil uses
 	// the standard dialer.
 	DialTarget func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// Tap, when set, receives a copy of every byte the agent relays on either
+	// wire (the tunnel to the client and the tunnel to the provider). It is a
+	// test/demo affordance only — used by the local simulation to prove the
+	// agent sees only the encrypted bytes of a TLS session it is not party to.
+	// Never set in production; the relay must stay dumb.
+	Tap io.Writer
 }
 
 // Agent is the Provider Agent server. It is safe to Serve once.
@@ -193,7 +200,30 @@ func (a *Agent) handle(conn net.Conn) {
 	if err := a.reply(conn, socks5RepSucceeded); err != nil {
 		return
 	}
+	// After the SOCKS handshake the only bytes on either wire are TLS records
+	// (the client's session with the provider). Mirror them to the tap, if
+	// configured, so a test can prove the agent relays ciphertext and never
+	// the credential the TEE injected inside that tunnel.
+	if a.cfg.Tap != nil {
+		conn = tapConn{Conn: conn, tap: a.cfg.Tap}
+		outbound = tapConn{Conn: outbound, tap: a.cfg.Tap}
+	}
 	pipe(conn, outbound)
+}
+
+// tapConn mirrors every byte written through it to Tap. It is purely a
+// test/demo affordance (see AgentConfig.Tap) and is never used on a production
+// path, where the agent must stay a dumb byte pipe.
+type tapConn struct {
+	net.Conn
+	tap io.Writer
+}
+
+func (c tapConn) Write(b []byte) (int, error) {
+	if c.tap != nil {
+		_, _ = c.tap.Write(b)
+	}
+	return c.Conn.Write(b)
 }
 
 // handshake negotiates the method, authenticates, and returns the CONNECT

@@ -1,13 +1,13 @@
 // Package shared holds the small, reusable pieces the simulation binaries
 // (mockprovider, tee, faketee, hub, verify, agent) share: the .sim working
 // directory, the provider-credential fixtures, the provider-signed policy the
-// TEE loads, the /v1/execute wire type, a throwaway test CA, and the
-// single-RPC HTTP handler that wraps the real tee.Service.
+// TEE loads, and a throwaway test CA.
 //
 // Nothing here is production code. It exists so the simulation runs end to end
 // on a laptop with zero external dependencies and zero real credentials, while
 // still exercising the real tee.Service — the simulation never re-implements
-// the TEE.
+// the TEE. The /v1/execute wire format is not here for that reason: it lives
+// with tee.ServeExecute so that simulation and production speak one definition.
 package shared
 
 import (
@@ -17,24 +17,17 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"math/big"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
 // Default fixtures. The provider's own key signs the policy; the TEE only ever
@@ -57,25 +50,6 @@ func ConfigDir() string {
 // Providers maps a provider name to the credential (API token) the TEE must
 // keep secret. The Hub never sees these values.
 type Providers map[string]string
-
-// ExecuteRequest is the body of POST /v1/execute: a canonical JobSpec plus the
-// raw request bytes the TEE will send to the provider.
-type ExecuteRequest struct {
-	Spec jobs.Spec `cbor:"1,keyasint"`
-	Body []byte    `cbor:"2,keyasint"`
-}
-
-// EncodeCanonical returns the deterministic CBOR encoding of the request.
-func (r ExecuteRequest) EncodeCanonical() ([]byte, error) { return canonical.Marshal(r) }
-
-// DecodeExecuteRequest parses a canonical-CBOR ExecuteRequest.
-func DecodeExecuteRequest(data []byte) (ExecuteRequest, error) {
-	var r ExecuteRequest
-	if err := canonical.Unmarshal(data, &r); err != nil {
-		return ExecuteRequest{}, err
-	}
-	return r, nil
-}
 
 // EnsureDefaults writes the fixture files if they are missing: the provider
 // credential, the provider's signing key, and a provider-signed policy the TEE
@@ -158,6 +132,21 @@ func defaultPolicy() policy.Policy {
 		},
 		IssuedAt:  now.Unix(),
 		ExpiresAt: now.Add(365 * 24 * time.Hour).Unix(),
+
+		// The provider's price, in the provider's own policy. The Hub reads it
+		// from here rather than carrying a table of its own: pricing authority
+		// is the provider's, and a policy hash on the receipt is what makes
+		// the charge reproducible.
+		//
+		// Per-request and per-model only. Volume pricing is covered by the hub
+		// package's unit tests and left at zero here so the harness's per-run
+		// totals stay readable.
+		RateCard: policy.RateCard{
+			PerRequestMicros: 1_000_000, // 1.00 unit per completed request
+			ModelPremiumMicros: map[string]uint64{
+				"sim-mock-large": 500_000, // 0.50 unit surcharge for the big model
+			},
+		},
 	}
 }
 
@@ -274,60 +263,6 @@ func LoadCAPool() (*x509.CertPool, error) {
 		return nil, fmt.Errorf("no certificates parsed from %s", CAPEMPath())
 	}
 	return pool, nil
-}
-
-// ServeExecute is the single RPC: POST /v1/execute (canonical CBOR) -> SSE
-// chunks, terminated by an `event: receipt` frame carrying the base64
-// SignedReceipt. It wraps the REAL tee.Service, so the simulation exercises
-// the genuine execution path rather than a re-implementation.
-//
-// A refusal (no receipt) is reported as an `event: error` frame; the caller
-// learns the reason without a credential ever being touched.
-func ServeExecute(svc *tee.Service, w http.ResponseWriter, r *http.Request) {
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "read body", http.StatusBadRequest)
-		return
-	}
-	req, err := DecodeExecuteRequest(raw)
-	if err != nil {
-		http.Error(w, "decode request: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-	flusher, _ := w.(http.Flusher)
-
-	onChunk := func(chunk []byte) error {
-		fmt.Fprintf(w, "data: %s\n\n", string(chunk))
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return nil
-	}
-
-	res, err := svc.Execute(r.Context(), tee.Job{Spec: req.Spec, Body: req.Body}, onChunk)
-	if err != nil {
-		fmt.Fprintf(w, "event: error\ndata: %s\n\n", err.Error())
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return
-	}
-	emitReceipt(w, flusher, res.Receipt)
-}
-
-func emitReceipt(w http.ResponseWriter, flusher http.Flusher, signed proof.SignedReceipt) {
-	enc, err := signed.EncodeCanonical()
-	if err != nil {
-		return
-	}
-	fmt.Fprintf(w, "event: receipt\ndata: %s\n\n", base64.StdEncoding.EncodeToString(enc))
-	if flusher != nil {
-		flusher.Flush()
-	}
 }
 
 func pemEncode(typ string, der []byte) []byte {

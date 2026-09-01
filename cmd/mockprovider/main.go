@@ -4,10 +4,11 @@
 // talk to over real TLS.
 //
 // Fault injection (query param ?fault=...):
-//   401       -> reject with 401 Unauthorized
-//   429       -> reject with 429 Too Many Requests
-//   truncate  -> send the first chunk, then hard-close the TCP connection
-//   empty     -> 200 with an empty body (zero chunks)
+//
+//	401       -> reject with 401 Unauthorized
+//	429       -> reject with 429 Too Many Requests
+//	truncate  -> send the first chunk, then hard-close the TCP connection
+//	empty     -> 200 with an empty body (zero chunks)
 package main
 
 import (
@@ -16,6 +17,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 )
@@ -70,6 +73,25 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	case "empty":
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
+		return
+	case "slow":
+		// Hold the connection open past the first byte so a test can kill the
+		// egress agent mid-request and confirm the TEE/hub fail cleanly.
+		time.Sleep(2 * time.Second)
+	case "big":
+		// Stream far more than any sane cap so the TEE exercises its
+		// MaxResponseBytes enforcement over a real provider connection.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		chunk := strings.Repeat("x", 1<<16) // 64 KiB per chunk
+		for i := 0; i < 48; i++ {           // ~3 MiB total, over the 1 MiB cap
+			fmt.Fprintf(w, "data: %s\n\n", chunk)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
 		return
 	}
 

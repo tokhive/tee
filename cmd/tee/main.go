@@ -100,7 +100,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/execute", func(w http.ResponseWriter, r *http.Request) {
-		shared.ServeExecute(svc, w, r)
+		tee.ServeExecute(svc, w, r)
 	})
 	log.Printf("tee (sim TEE, real service) listening on http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))

@@ -348,22 +348,32 @@ func (s *Service) perform(
 ) (*Result, error) {
 	hasher := proof.NewStreamingHasher(spec.JobID)
 	truncated := false
+	// Total bytes/chunks the provider actually sent, counted even past the
+	// cap. The StreamHash below covers only what was relayed (so the Hub can
+	// verify the prefix it forwarded), while these totals honestly record how
+	// much arrived — a provider cannot later claim it sent less than it did.
+	var totalBytes, totalChunks uint64
 
 	// Digest before relaying. If the relay fails — the Hub hung up, the
 	// consumer is gone — the receipt still owes the verifier an honest account
 	// of what the provider actually sent. Relaying first would let a consumer
 	// error silently shrink the attested transcript.
 	relay := func(chunk []byte) error {
-		if err := hasher.WriteChunk(chunk); err != nil {
-			return err
-		}
-		// Bytes past the cap are still counted. The receipt then says "this
-		// many arrived, that was too many, we stopped", which a verifier can
-		// check; trimming the count to fit the cap would make the transcript
-		// disagree with the bytes the provider sent.
-		if hasher.BytesWritten() > request.MaxResponseBytes {
+		totalBytes += uint64(len(chunk))
+		totalChunks++
+		// Enforce the cap before the bytes enter the hash. If we hashed first
+		// and checked after, the over-cap chunk would be counted in the
+		// StreamHash but never relayed, so the receipt's hash could never
+		// agree with the bytes the Hub actually forwarded — every truncated
+		// response would then fail the Hub's stream check. Stopping first
+		// keeps the hash equal to the relayed prefix; the overflow lives in
+		// ResponseBytes/ChunkCount instead.
+		if hasher.BytesWritten()+uint64(len(chunk)) > request.MaxResponseBytes {
 			truncated = true
 			return ErrResponseBodyTooLarge
+		}
+		if err := hasher.WriteChunk(chunk); err != nil {
+			return err
 		}
 		if onChunk == nil {
 			return nil
@@ -409,8 +419,8 @@ func (s *Service) perform(
 		Path:          spec.Path,
 		StatusCode:    statusCode,
 		StreamHash:    streamHash[:],
-		ChunkCount:    hasher.ChunkCount(),
-		ResponseBytes: hasher.BytesWritten(),
+		ChunkCount:    totalChunks,
+		ResponseBytes: totalBytes,
 		Completion:    completion,
 		StartedAt:     startedAt,
 		FinishedAt:    finishedAt,
@@ -437,8 +447,8 @@ func (s *Service) perform(
 	result := &Result{
 		Receipt:       signed,
 		StatusCode:    statusCode,
-		ChunkCount:    hasher.ChunkCount(),
-		ResponseBytes: hasher.BytesWritten(),
+		ChunkCount:    totalChunks,
+		ResponseBytes: totalBytes,
 		StreamHash:    streamHash,
 		// Derived from the completion state rather than tracked separately:
 		// a result that says truncated while reporting a complete receipt, or
