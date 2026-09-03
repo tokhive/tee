@@ -103,6 +103,11 @@ type Config struct {
 	SessionTimeout      time.Duration
 	SessionMaxDownBytes uint64
 	SessionIdle         time.Duration
+
+	// AgentSecret is the shared key a Provider Agent must present to dial in
+	// through the reverse-tunnel gate. Nil disables agent registration, which is
+	// a deliberate stance for a Hub that only runs against scripted stand-ins.
+	AgentSecret []byte
 }
 
 // Hub turns a job into a settled charge and an auditable receipt.
@@ -120,6 +125,9 @@ type Hub struct {
 	sessionTimeout      time.Duration
 	sessionMaxDownBytes uint64
 	sessionIdle         time.Duration
+
+	agents      *agentRegistry
+	agentSecret []byte
 }
 
 // New builds a Hub, refusing to construct one that would settle incorrectly.
@@ -152,17 +160,32 @@ func New(cfg Config) (*Hub, error) {
 		ledger:     ledger,
 		quota:      cfg.Quota,
 		commission: CommissionRate{BasisPoints: cfg.Commission},
-		clock:        clock,
-		withhold:     cfg.Withhold,
+		clock:      clock,
+		withhold:   cfg.Withhold,
 
 		sessionTimeout:      cfg.SessionTimeout,
 		sessionMaxDownBytes: cfg.SessionMaxDownBytes,
 		sessionIdle:         cfg.SessionIdle,
+
+		agents:      newAgentRegistry(),
+		agentSecret: cfg.AgentSecret,
 	}, nil
 }
 
 // Ledger returns the Hub's ledger, so a caller can read what it owes.
 func (h *Hub) Ledger() *Ledger { return h.ledger }
+
+// card returns the effective price card the Hub quotes for a provider: the live
+// agent's self-reported card when an agent is online for that provider, and the
+// platform default otherwise. Settling against the same accessor keeps what the
+// scheduler picked and what the ledger bills from drifting apart.
+func (h *Hub) card(provider string) (RateCard, bool) {
+	if a, ok := h.agents.conn(provider); ok {
+		return a.price, true
+	}
+	card, ok := h.rates[provider]
+	return card, ok
+}
 
 // Outcome is what one request through the Hub produced.
 type Outcome struct {
@@ -200,7 +223,7 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 		return Outcome{}, fmt.Errorf("%w: tenant %q", ErrQuotaExceeded, tenant)
 	}
 
-	card, ok := h.rates[spec.Provider]
+	card, ok := h.card(spec.Provider)
 	if !ok {
 		return Outcome{}, fmt.Errorf("%w: %q", ErrUnknownProvider, spec.Provider)
 	}

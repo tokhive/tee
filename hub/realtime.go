@@ -21,8 +21,13 @@ var (
 	// than the ones the Hub actually relayed.
 	ErrSessionStreamMismatch = errors.New("session receipt attests different bytes than the Hub relayed")
 	// ErrSessionLimitExceeded means the Hub stopped relaying because a
-	// configured bound (downlink bytes) was hit. The session is truncated, not
-	// lost: the receipt still covers everything that was relayed.
+	// configured bound (downlink bytes) was hit. Unlike a request — whose cap is
+	// enforced by the TEE, which can attest the exact truncated prefix — a
+	// session's byte cap is enforced here on the Hub, over a tunnel the TEE
+	// deliberately does not truncate. Everything the TEE already forwarded past
+	// the cap is in its digest but was never relayed, so the Hub cannot produce
+	// a receipt that matches it. Truncation therefore ends the session and earns
+	// nothing; it is a bound, not a billable event (matching "断流 0 计价").
 	ErrSessionLimitExceeded = errors.New("session exceeded the Hub's relay bound")
 )
 
@@ -128,6 +133,13 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 
 	up, down, downHash, relErr := relaySession(ctx, conn, link, spec.JobID, h.sessionMaxDownBytes, h.sessionIdle)
 
+	if errors.Is(relErr, ErrSessionLimitExceeded) {
+		// The Hub answered its own byte bound. The tunnel is already torn down;
+		// settle nothing: no receipt can be reconciled (see ErrSessionLimitExceeded),
+		// so nothing is charged and no receipt is stored. Report the frame it cut.
+		return SessionOutcome{Provider: spec.Provider, UplinkBytes: up, DownlinkBytes: down}, relErr
+	}
+
 	receipt, rerr := conn.Receipt()
 	if rerr != nil {
 		return SessionOutcome{}, fmt.Errorf("%w: %v", ErrNoReceiptForSession, rerr)
@@ -145,7 +157,7 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 		return SessionOutcome{}, ErrSessionStreamMismatch
 	}
 
-	card, ok := h.rates[spec.Provider]
+	card, ok := h.card(spec.Provider)
 	if !ok {
 		return SessionOutcome{}, fmt.Errorf("%w: %q", ErrUnknownProvider, spec.Provider)
 	}

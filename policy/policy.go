@@ -99,12 +99,6 @@ type Policy struct {
 	// Nonce lets a provider reissue an otherwise identical policy so that
 	// rotations produce a different policy hash. Optional.
 	Nonce []byte `cbor:"11,keyasint,omitempty"`
-
-	// Key 12 was RateCard, the provider's price list. Pricing is no longer
-	// carried by the policy: it is a Hub-side commercial concern, kept in the
-	// hub package as its own seller-reported rate table. The key is retired
-	// rather than reassigned — a decoder that still emits it must not be read
-	// as a different field.
 }
 
 // Rule permits one family of requests: a path pattern crossed with the methods

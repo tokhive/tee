@@ -1,241 +1,299 @@
 package provider
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/transport"
+	"github.com/gorilla/websocket"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tunnel"
 )
 
-// startAgent brings up an agent on an ephemeral loopback port and returns its
-// address. The agent is closed with the test.
-func startAgent(t *testing.T, cfg AgentConfig) string {
+const testAgentSecret = "s3cret-agent-key"
+
+var testUpgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+
+// startEchoUpstream returns the host:port of a raw TCP server that echoes any
+// bytes written to it.
+func startEchoUpstream(t *testing.T) string {
 	t.Helper()
-	agent, err := NewAgent(cfg)
-	if err != nil {
-		t.Fatalf("NewAgent: %v", err)
-	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("listen: %v", err)
+		t.Fatalf("echo listen: %v", err)
 	}
-	go func() { _ = agent.Serve(ln) }()
-	t.Cleanup(func() { _ = agent.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(c, c); _ = c.Close() }()
+		}
+	}()
 	return ln.Addr().String()
 }
 
-// tunneledTransport builds a ChannelManager whose connections run through the
-// agent at agentAddr. Provider "tunnel" is the registry key that routes through
-// this agent, so every Do below sets Request.Provider to it.
-func tunneledTransport(t *testing.T, agentAddr string, auth *transport.SOCKS5Auth) *transport.ChannelManager {
-	t.Helper()
-	ep := transport.Endpoint{AgentAddr: agentAddr}
-	if auth != nil {
-		ep.Username = auth.Username
-		ep.Password = auth.Password
-	}
-	reg := transport.NewRegistry()
-	reg.Set("tunnel", ep)
-	cm, err := transport.NewChannelManager(transport.ChannelConfig{
-		Scheme:         "http",
-		AllowPlaintext: true,
-		Endpoints:      reg,
-	})
-	if err != nil {
-		t.Fatalf("NewChannelManager: %v", err)
-	}
-	t.Cleanup(func() { _ = cm.Close() })
-	return cm
+// miniHub plays the Hub's gate: authenticate the dial-in, receive the
+// registration, then open a relay stream back toward the agent (the upstream the
+// agent must dial is encoded in the registration's provider name). The relay
+// stream is handed to the test so it can drive the echo directly. It exercises
+// the agent's full reverse-tunnel lifecycle without depending on the rest of the
+// Hub.
+type miniHub struct {
+	registrations chan hub.AgentRegister
+	relays        chan *tunnel.Stream
+	stop          chan struct{}
 }
 
-func TestAgentRelaysSSEStream(t *testing.T) {
-	events := []string{"data: event-0\n\n", "data: event-1\n\n", "data: event-2\n\n"}
-	var gotAuth capturedHeader
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth.Set(r.Header.Get("Authorization"))
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		flusher := w.(http.Flusher)
-		for _, event := range events {
-			fmt.Fprint(w, event)
-			flusher.Flush()
-			time.Sleep(20 * time.Millisecond)
+func (h *miniHub) handler(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get(hub.AgentKeyHeader) != testAgentSecret {
+		http.Error(w, "bad key", http.StatusUnauthorized)
+		return
+	}
+	conn, err := testUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	mux := tunnel.New(tunnel.WrapWS(conn), tunnel.Low)
+	mux.Serve(func(control *tunnel.Stream, open []byte) {
+		var reg hub.AgentRegister
+		if err := json.Unmarshal(open, &reg); err != nil {
+			_ = control.Close()
+			return
 		}
-	}))
-	defer srv.Close()
-	target := strings.TrimPrefix(srv.URL, "http://")
-
-	agentAddr := startAgent(t, AgentConfig{AllowedTargets: []string{target}})
-	tr := tunneledTransport(t, agentAddr, nil)
-
-	var chunks []string
-	resp, err := tr.Do(context.Background(),
-		tee.Request{
-			Method:   "POST",
-			Provider: "tunnel",
-			Host:     target,
-			Path:     "/v1/chat/completions",
-			Headers:  map[string]string{"Authorization": "Bearer shared-credential"},
-			Body:     []byte(`{"stream":true}`),
-		},
-		func(chunk []byte) error {
-			chunks = append(chunks, string(chunk))
-			return nil
-		})
-	if err != nil {
-		t.Fatalf("Do through agent: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	if gotAuth.Get() != "Bearer shared-credential" {
-		t.Errorf("Authorization = %q, want the injected credential", gotAuth.Get())
-	}
-	if len(chunks) < 2 {
-		t.Errorf("got %d chunks, want the stream relayed as it arrives (>= 2)", len(chunks))
-	}
-	if joined := strings.Join(chunks, ""); joined != strings.Join(events, "") {
-		t.Errorf("relayed body = %q, want %q", joined, strings.Join(events, ""))
-	}
-}
-
-func TestAgentRefusesTargetOutsideAllowlist(t *testing.T) {
-	allowed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer allowed.Close()
-	forbidden := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("agent relayed to a target outside its allowlist")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer forbidden.Close()
-
-	agentAddr := startAgent(t, AgentConfig{
-		AllowedTargets: []string{strings.TrimPrefix(allowed.URL, "http://")},
-	})
-	tr := tunneledTransport(t, agentAddr, nil)
-
-	_, err := tr.Do(context.Background(),
-		tee.Request{
-			Method:   "GET",
-			Provider: "tunnel",
-			Host:     strings.TrimPrefix(forbidden.URL, "http://"),
-			Path:     "/v1/models",
-		},
-		func([]byte) error { return nil })
-	if !errors.Is(err, transport.ErrSOCKS5ConnectRefused) {
-		t.Fatalf("error = %v, want ErrSOCKS5ConnectRefused", err)
-	}
-}
-
-func TestAgentAuthenticates(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
-	}))
-	defer srv.Close()
-	target := strings.TrimPrefix(srv.URL, "http://")
-
-	agentAddr := startAgent(t, AgentConfig{
-		Auth:           &Auth{Username: "tee-node-1", Password: "correct-horse"},
-		AllowedTargets: []string{target},
-	})
-
-	t.Run("correct credentials pass", func(t *testing.T) {
-		tr := tunneledTransport(t, agentAddr, &transport.SOCKS5Auth{Username: "tee-node-1", Password: "correct-horse"})
-		_, err := tr.Do(context.Background(),
-			tee.Request{Method: "GET", Provider: "tunnel", Host: target, Path: "/v1/models"},
-			func([]byte) error { return nil })
+		h.registrations <- reg
+		// Open a relay stream toward the agent naming the upstream to dial. The
+		// agent bridges it; we hand the pipe to the test.
+		meta, _ := json.Marshal(hub.UpstreamOpen{Host: echoHostFor(reg.Provider)})
+		relay, err := mux.Dial(meta)
 		if err != nil {
-			t.Fatalf("Do: %v", err)
+			return
 		}
+		// Drain the control stream so it stays open (the agent's lease).
+		go func() { _, _ = io.Copy(io.Discard, control) }()
+		h.relays <- relay
 	})
-
-	t.Run("wrong password is refused", func(t *testing.T) {
-		tr := tunneledTransport(t, agentAddr, &transport.SOCKS5Auth{Username: "tee-node-1", Password: "battery"})
-		_, err := tr.Do(context.Background(),
-			tee.Request{Method: "GET", Provider: "tunnel", Host: target, Path: "/v1/models"},
-			func([]byte) error { return nil })
-		if !errors.Is(err, transport.ErrSOCKS5AuthFailed) {
-			t.Fatalf("error = %v, want ErrSOCKS5AuthFailed", err)
-		}
-	})
-
-	t.Run("no credentials are refused", func(t *testing.T) {
-		tr := tunneledTransport(t, agentAddr, nil)
-		_, err := tr.Do(context.Background(),
-			tee.Request{Method: "GET", Provider: "tunnel", Host: target, Path: "/v1/models"},
-			func([]byte) error { return nil })
-		if !errors.Is(err, transport.ErrSOCKS5MethodRejected) {
-			t.Fatalf("error = %v, want ErrSOCKS5MethodRejected", err)
-		}
-	})
+	// Keep the tunnel alive for the test's lifetime: block the handler instead of
+	// letting it return (which would close the connection out from under the
+	// agent's registration).
+	<-h.stop
+	_ = mux.Close()
+	_ = conn.Close()
 }
 
-func TestAgentRefusesNonConnectCommands(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-	target := strings.TrimPrefix(srv.URL, "http://")
+func startMiniHub(t *testing.T) (*miniHub, string) {
+	t.Helper()
+	mh := &miniHub{
+		registrations: make(chan hub.AgentRegister, 4),
+		relays:        make(chan *tunnel.Stream, 4),
+		stop:          make(chan struct{}),
+	}
+	srv := httptest.NewServer(http.HandlerFunc(mh.handler))
+	t.Cleanup(func() {
+		close(mh.stop)
+		srv.Close()
+	})
+	return mh, "ws" + strings.TrimPrefix(srv.URL, "http") + "/v1/agent"
+}
 
-	agentAddr := startAgent(t, AgentConfig{AllowedTargets: []string{target}})
+// echoHostFor recovers the upstream host the agent must reach from the provider
+// name the miniHub chose for it. The tests name providers as their echo target,
+// which keeps the relay open's meta self-consistent with the allowlist.
+func echoHostFor(provider string) string {
+	if i := strings.Index(provider, ":"); i >= 0 {
+		return provider
+	}
+	return ""
+}
 
-	conn, err := net.Dial("tcp", agentAddr)
+func TestAgentRegistersAndRelays(t *testing.T) {
+	echo := startEchoUpstream(t)
+	mh, gateURL := startMiniHub(t)
+
+	selfPrice := &hub.RateCard{PerRequestMicros: 250_000}
+	a, err := NewAgent(AgentConfig{
+		HubGateURL:     gateURL,
+		SharedKey:      []byte(testAgentSecret),
+		Self:           hub.AgentRegister{Provider: echo, DisplayName: "home-1", SelfPrice: selfPrice},
+		AllowedTargets: []string{echo},
+		ReconnectDelay: 50 * time.Millisecond,
+	})
 	if err != nil {
-		t.Fatalf("dial agent: %v", err)
+		t.Fatalf("NewAgent: %v", err)
 	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx) }()
 
-	// Greeting: no-auth.
-	if _, err := conn.Write([]byte{5, 1, 0}); err != nil {
-		t.Fatalf("write greeting: %v", err)
+	var reg hub.AgentRegister
+	select {
+	case reg = <-mh.registrations:
+	case <-time.After(5 * time.Second):
+		t.Fatal("agent did not register")
 	}
-	var choice [2]byte
-	if _, err := io.ReadFull(conn, choice[:]); err != nil {
-		t.Fatalf("read choice: %v", err)
+	if reg.Provider != echo {
+		t.Errorf("registered provider = %q, want %q", reg.Provider, echo)
 	}
-	if choice[0] != 5 || choice[1] != 0 {
-		t.Fatalf("method choice = %v, want [5 0]", choice)
+	if reg.SelfPrice == nil || reg.SelfPrice.PerRequestMicros != 250_000 {
+		t.Errorf("registered self-price = %+v, want the declared card", reg.SelfPrice)
 	}
 
-	// BIND (0x02) instead of CONNECT.
-	request := []byte{5, 0x02, 0, 1, 127, 0, 0, 1, 0x1f, 0x90}
-	if _, err := conn.Write(request); err != nil {
-		t.Fatalf("write bind request: %v", err)
+	var relay *tunnel.Stream
+	select {
+	case relay = <-mh.relays:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hub did not open a relay stream")
 	}
-	var reply [4]byte
-	if _, err := io.ReadFull(conn, reply[:]); err != nil {
-		t.Fatalf("read reply: %v", err)
+	defer relay.Close()
+
+	msg := []byte("the quick brown fox jumps over the lazy dog")
+	go func() { _, _ = relay.Write(msg) }()
+	back := make([]byte, len(msg))
+	if _, err := io.ReadFull(relay, back); err != nil {
+		t.Fatalf("read relay echo: %v", err)
 	}
-	if reply[1] != socks5RepCmdUnsupported {
-		t.Errorf("reply code = %d, want %d (command not supported)", reply[1], socks5RepCmdUnsupported)
+	if !bytes.Equal(back, msg) {
+		t.Fatalf("echo mismatch: %q", back)
 	}
 }
 
-func TestAgentRequiresAllowlist(t *testing.T) {
-	if _, err := NewAgent(AgentConfig{}); !errors.Is(err, ErrEmptyAllowlist) {
+func TestAgentSampleOnlyMirrorsBytes(t *testing.T) {
+	echo := startEchoUpstream(t)
+	mh, gateURL := startMiniHub(t)
+
+	var tap bytes.Buffer
+	a, err := NewAgent(AgentConfig{
+		HubGateURL:     gateURL,
+		SharedKey:      []byte(testAgentSecret),
+		Self:           hub.AgentRegister{Provider: echo},
+		AllowedTargets: []string{echo},
+		ReconnectDelay: 50 * time.Millisecond,
+		Tap:            &tap,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx) }()
+	<-mh.registrations
+
+	var relay *tunnel.Stream
+	select {
+	case relay = <-mh.relays:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hub did not open a relay stream")
+	}
+	defer relay.Close()
+
+	msg := []byte("plaintext-through-the-tap")
+	go func() { _, _ = relay.Write(msg) }()
+	back := make([]byte, len(msg))
+	if _, err := io.ReadFull(relay, back); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+	if tap.Len() == 0 {
+		t.Error("tap captured nothing")
+	}
+	if !strings.Contains(tap.String(), string(msg)) {
+		t.Errorf("tap bytes %q missing the relayed bytes", tap.String())
+	}
+}
+
+func TestAgentRefusesOutsideAllowlist(t *testing.T) {
+	echo := startEchoUpstream(t)
+	mh, gateURL := startMiniHub(t)
+
+	// Allowlist deliberately omits echo, so the relay open must be refused.
+	a, err := NewAgent(AgentConfig{
+		HubGateURL:     gateURL,
+		SharedKey:      []byte(testAgentSecret),
+		Self:           hub.AgentRegister{Provider: echo},
+		AllowedTargets: []string{"127.0.0.1:1"},
+		ReconnectDelay: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx) }()
+	<-mh.registrations
+
+	var relay *tunnel.Stream
+	select {
+	case relay = <-mh.relays:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hub did not open a relay stream")
+	}
+	defer relay.Close()
+
+	// The agent refuses to dial a host outside its allowlist and hangs up the
+	// stream; the echo must never come back. A read that ends signals the
+	// refusal; a read that succeeds is the failure.
+	buf := make([]byte, 4)
+	got := make(chan error, 1)
+	go func() { _, err := relay.Read(buf); got <- err }()
+	select {
+	case err := <-got:
+		if err == nil {
+			t.Error("expected the relay to refuse the off-allowlist host, but it echoed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay stream neither echoed nor closed for an off-allowlist host")
+	}
+}
+
+func TestAgentRejectsWrongKey(t *testing.T) {
+	_, gateURL := startMiniHub(t)
+	a, err := NewAgent(AgentConfig{
+		HubGateURL:     gateURL,
+		SharedKey:      []byte("wrong-key"),
+		Self:           hub.AgentRegister{Provider: "p1"},
+		AllowedTargets: []string{"127.0.0.1:1"},
+		ReconnectDelay: 10 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); _ = a.Run(ctx) }()
+	// Wrong key is refused at the gate; Run retries. Give it a couple attempts,
+	// then cancel and confirm it unwinds cleanly.
+	time.Sleep(60 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("agent did not stop after cancellation")
+	}
+}
+
+func TestAgentRequiresConfig(t *testing.T) {
+	if _, err := NewAgent(AgentConfig{}); err == nil {
+		t.Fatal("expected an error for empty config")
+	}
+	if _, err := NewAgent(AgentConfig{HubGateURL: "ws://x"}); !errors.Is(err, ErrNoSharedKey) {
+		t.Fatalf("error = %v, want ErrNoSharedKey", err)
+	}
+	if _, err := NewAgent(AgentConfig{HubGateURL: "ws://x", SharedKey: []byte("k")}); !errors.Is(err, ErrNoProvider) {
+		t.Fatalf("error = %v, want ErrNoProvider", err)
+	}
+	if _, err := NewAgent(AgentConfig{
+		HubGateURL: "ws://x", SharedKey: []byte("k"), Self: hub.AgentRegister{Provider: "p"},
+	}); !errors.Is(err, ErrEmptyAllowlist) {
 		t.Fatalf("error = %v, want ErrEmptyAllowlist", err)
 	}
-}
-
-// capturedHeader records one header value from the handler goroutine.
-type capturedHeader struct{ v atomic.Value }
-
-func (c *capturedHeader) Set(s string) { c.v.Store(s) }
-
-func (c *capturedHeader) Get() string {
-	loaded, _ := c.v.Load().(string)
-	return loaded
 }

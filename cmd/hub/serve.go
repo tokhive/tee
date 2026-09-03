@@ -67,6 +67,17 @@ var userRoutes = []userRoute{
 	{Path: "/v1/responses", Done: false},
 }
 
+// agentGatePath and teeRelayPath are the Hub's reverse-tunnel endpoints: the
+// AgentGate a Provider Agent dials to come online, and the TeeRelay the TEE
+// dials to carry egress across those tunnels. Mounting them is what turns the
+// Hub into the rendezvous point for NAT-trapped contributors.
+const (
+	agentGatePath = "/v1/agent"
+	teeRelayPath  = "/v1/relay"
+)
+
+var relayUpgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+
 // runServe exposes the Hub as a resident OpenAI-compatible HTTP service. It
 // blocks until the server stops.
 //
@@ -79,8 +90,11 @@ func runServe(h *hub.Hub, cfg serveConfig) {
 		mux.Handle(route.Path, &userHandler{h: h, cfg: cfg, route: route})
 	}
 	mux.Handle(sessionPath, &sessionHandler{h: h, cfg: cfg})
+	mux.Handle(agentGatePath, h.AgentGate(relayUpgrader))
+	mux.Handle(teeRelayPath, h.TeeRelay(relayUpgrader))
 	log.Printf("hub user-facing API listening on http://%s%v (sessions at %s)",
 		cfg.Addr, routePaths(), sessionPath)
+	log.Printf("hub reverse-tunnel endpoints: agent gate %s, tee relay %s", agentGatePath, teeRelayPath)
 	log.Fatal(http.ListenAndServe(cfg.Addr, mux))
 }
 
@@ -245,6 +259,9 @@ func (c *sessionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	// Bound every user frame the relay reads (first frame and the uplink stream)
+	// so a hostile client cannot blow the Hub's memory with an oversized message.
+	conn.SetReadLimit(16 << 20)
 
 	// The first frame is read here so the model can drive provider selection,
 	// then handed back to the link, which replays it to the provider — reading

@@ -262,15 +262,16 @@ func TestRunRealtimeRejectsStreamMismatch(t *testing.T) {
 	}
 }
 
-func TestRunRealtimeByteCapTruncatesButSettles(t *testing.T) {
+func TestRunRealtimeByteCapTruncatesNotSettled(t *testing.T) {
 	// Two frames; the cap lands between them, so only the first is relayed and
-	// the session is truncated — but the receipt still covers every byte moved,
-	// so the Hub can settle for what it actually delivered.
+	// the session is truncated. Over the Hub's own bound the tunnel's receipt can
+	// never be reconciled (the TEE already hashed past the cap without relaying),
+	// so truncation ends the session with nothing charged and no receipt stored —
+	// "断流 0 计价".
 	down := [][]byte{[]byte("first"), []byte("second")}
-	relayed := [][]byte{down[0]}
 	fake := &ScriptedTEE{
 		OpenReply: func(_ int, spec jobs.Spec) (SessionConn, error) {
-			return &scriptTunnel{frames: down, rec: sessionReceipt(spec.JobID, 0, relayed, 101)}, nil
+			return &scriptTunnel{frames: down, rec: sessionReceipt(spec.JobID, 0, down, 101)}, nil
 		},
 	}
 	h := mustHub(t, Config{
@@ -286,12 +287,13 @@ func TestRunRealtimeByteCapTruncatesButSettles(t *testing.T) {
 	if outcome.DownlinkBytes != uint64(len(down[0])) {
 		t.Fatalf("downlink = %d, want only first frame (%d) relayed", outcome.DownlinkBytes, len(down[0]))
 	}
-	// Truncated does not mean unsettled: the provider earned for real bytes.
-	if !outcome.Stored {
-		t.Fatalf("truncated session did not settle")
+	// Truncated is not billable: the Hub cut the session before any receipt could
+	// be reconciled, so nothing is charged and no receipt is stored.
+	if outcome.Stored {
+		t.Fatalf("truncated session must not store a receipt")
 	}
-	if outcome.Charged != 100 {
-		t.Fatalf("charged = %d, want 100", outcome.Charged)
+	if outcome.Charged != 0 {
+		t.Fatalf("charged = %d, want 0 for a truncated session", outcome.Charged)
 	}
 }
 

@@ -35,8 +35,8 @@ type ScriptedTEE struct {
 	// scripted without cross-talk.
 	OpenReply func(call int, spec jobs.Spec) (SessionConn, error)
 
-	mu       sync.Mutex
-	calls    int
+	mu        sync.Mutex
+	calls     int
 	openCalls int
 }
 

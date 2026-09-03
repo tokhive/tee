@@ -55,6 +55,7 @@ func main() {
 	sessionTimeout := flag.Duration("session-timeout", 10*time.Minute, "max wall-clock lifetime of a streaming session (0 = unlimited)")
 	sessionMax := flag.Uint64("session-max", 1<<20, "max downlink bytes a streaming session may relay (0 = unlimited)")
 	sessionIdle := flag.Duration("session-idle", 30*time.Second, "tear a session down if the provider streams nothing this long (0 = no watchdog)")
+	agentKey := flag.String("agent-key", "", "shared key Provider Agents must present to dial in (required to make the Hub schedulable-by-online)")
 	audit := flag.Bool("audit", false, "audit the receipt store for gaps and verify signatures")
 	flag.Parse()
 
@@ -92,6 +93,7 @@ func main() {
 		SessionTimeout:      *sessionTimeout,
 		SessionMaxDownBytes: *sessionMax,
 		SessionIdle:         *sessionIdle,
+		AgentSecret:         []byte(*agentKey),
 	})
 	if err != nil {
 		log.Fatalf("build hub: %v", err)

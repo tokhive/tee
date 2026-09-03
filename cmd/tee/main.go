@@ -53,6 +53,7 @@ const defaultPlatform = "simulated"
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:18090", "listen address")
+	relay := flag.String("relay", "", "Hub TeeRelay WebSocket URL; when set, every provider connection egresses as a stream over the Hub's reverse tunnel instead of a direct agent dial")
 	agentAddr := flag.String("agent", "", "Provider Agent address applied to every provider; empty means use -agents")
 	agentsFile := flag.String("agents", "", "per-provider endpoint map (JSON: {provider: {agent_addr,...}})")
 	seqPath := flag.String("seq", "", "ProviderSeq store file (default <simdir>/seqstore.json)")
@@ -127,6 +128,7 @@ func main() {
 	cm, err := transport.NewChannelManager(transport.ChannelConfig{
 		Scheme:          "https",
 		Endpoints:       registry,
+		RelayURL:        *relay,
 		TLSClientConfig: upstreamTLS,
 	})
 	if err != nil {

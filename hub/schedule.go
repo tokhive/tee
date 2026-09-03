@@ -14,22 +14,29 @@ import (
 // behind a provider-specific error.
 var ErrNoProviderForModel = errors.New("no provider serves this model")
 
-// providersForModel returns the providers on the market that can serve a
-// model, ordered by their book price for it (ascending), with ties broken by
-// provider name so the order is a pure function of the rate table.
+// providersForModel returns the providers the Hub can route a model to, ordered
+// by their effective book price for it (ascending), with ties broken by provider
+// name so the order is a pure function of supply and price.
 //
-// The book price is the seller's own published card: per-request plus any
-// per-model surcharge. Volume pricing is deliberately left out of the choice —
-// the Hub cannot know how large a response will be before it runs the job, so an
-// order that depended on it would be non-deterministic. Per-request and model
+// The Hub only routes new work to a provider whose agent is online right now —
+// a provider nobody currently egresses for cannot carry traffic, so it is not a
+// candidate. When no agent has dialed in at all (a Hub running purely against a
+// scripted stand-in), the scheduler falls back to the static market table so the
+// embedded business tests can reason about pricing without a live agent.
+//
+// The effective book price is per-request plus any per-model surcharge, taken
+// from the agent's own card when it declared one and the platform default
+// otherwise. Volume pricing is deliberately left out of the choice — the Hub
+// cannot know how large a response will be before it runs the job, so an order
+// that depended on it would be non-deterministic. Per-request and model
 // surcharge are both known before dispatch, which is what a decision needs.
 //
-// Every provider with a published rate is a candidate: an unlisted model pays
-// no premium under a rate card, so the request is still priced and still
-// serveable. The card's numbers, not the Hub's opinion, decide the order.
+// An unlisted model pays no premium under a rate card, so every online provider
+// is a candidate and still priced. The card's numbers, not the Hub's opinion,
+// decide the order.
 func (h *Hub) providersForModel(model string) []string {
 	price := func(provider string) uint64 {
-		card, ok := h.rates[provider]
+		card, ok := h.card(provider)
 		if !ok {
 			return ^uint64(0)
 		}
@@ -43,9 +50,15 @@ func (h *Hub) providersForModel(model string) []string {
 		return book
 	}
 
-	providers := make([]string, 0, len(h.rates))
-	for provider := range h.rates {
-		providers = append(providers, provider)
+	var providers []string
+	online := h.agents.onlineProviders()
+	if len(online) > 0 {
+		providers = online
+	} else {
+		providers = make([]string, 0, len(h.rates))
+		for provider := range h.rates {
+			providers = append(providers, provider)
+		}
 	}
 	sort.SliceStable(providers, func(i, j int) bool {
 		pi, pj := price(providers[i]), price(providers[j])

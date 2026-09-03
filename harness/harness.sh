@@ -12,12 +12,21 @@
 #   ProviderSeq gap        -> Hub hides one record, audit detects the gap
 #   quota                  -> refused request never reaches the TEE, so it
 #                             burns no ProviderSeq and leaves no gap
-#   real TEE via agent     -> genuine tee.Service egressing through a SOCKS5
-#                             Provider Agent over real TLS; a packet capture
-#                             proves the agent relays only ciphertext
+#   real TEE via reverse   -> genuine tee.Service egressing over the reverse
+#     tunnel                 tunnel: a Provider Agent behind a NAT dials the
+#                             Hub, the TEE dials the Hub's TeeRelay, and the
+#                             Hub bridges the TEE's stream into the online
+#                             agent's tunnel. A packet capture proves the
+#                             agent relays only ciphertext.
 #   agent killed mid-req   -> the request fails cleanly, never hangs/panics
 #   epoch rotation         -> a TEE restarted with a new key still verifies
 #   oversize response      -> the TEE truncates at its MaxResponseBytes cap
+#   connection residency   -> N requests reuse exactly one upstream TCP
+#                             connection through the tunnel
+#   streaming session      -> a WebSocket session egresses over the reverse
+#                             tunnel and its receipt verifies offline
+#   lowest-price dispatch  -> the Hub schedules by model to the cheapest
+#                             online agent, with commission on the buyer bill
 #   anthropic + responses  -> Hub relays /v1/messages and /v1/responses
 #                             verbatim, each with its own terminal event
 #
@@ -83,7 +92,7 @@ wait_for_port 127.0.0.1 "$TEE_PORT"
 
 section() { echo; echo "=================================================="; echo "==> $1"; echo "=================================================="; }
 
-# --- 1. normal flow ------------------------------------------------------
+# --- 1. normal flow ---------------------------------
 section "1. normal flow (5 requests)"
 "$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -n 5
 
@@ -141,24 +150,51 @@ echo "        a ProviderSeq would show up here as a missing number."
 "$BIN/hub" -audit
 
 # =====================================================================
-# S4: REAL TEE through a Provider Agent.
-# Scenarios 1-8 above run the A-layer fake TEE (cmd/faketee). These run the
-# genuine tee.Service egressing through a real SOCKS5 Provider Agent over a
-# real TLS session to the provider — the path a production deployment uses.
+# S4: REAL TEE over the REVERSE TUNNEL.
+# Scenarios 1-8 run the A-layer fake TEE (cmd/faketee). These run the genuine
+# tee.Service along the production outbound path: a Provider Agent behind a
+# NAT dials the Hub and keeps a multiplexed reverse tunnel open; the TEE dials
+# the Hub's TeeRelay; the Hub bridges the TEE's stream into the online agent's
+# tunnel, which relays only ciphertext to the provider.
+#
+#   user -> Hub user API (/v1/chat/completions ...)
+#        -> Hub /v1/execute -> TEE
+#        -> Hub TeeRelay (/v1/relay, TEE dials in)
+#        -> Hub AgentGate (/v1/agent, agent dials in)
+#        -> provider (real TLS, terminated inside the TEE)
 # =====================================================================
 
-# --- Agent A + real TEE A, routed through the agent ---------------------
-AGENT_A=18092
+AGENT_SECRET="sim-agent-secret"
+RT_HUB_PORT=18094          # reverse-tunnel hub shared by scenarios 9-14
+RT_HUB_WS="ws://127.0.0.1:$RT_HUB_PORT"
+HUB_WS="ws://127.0.0.1:18085"   # user-facing Hub (scenarios 15-17)
+
+# --- start the reverse-tunnel Hub for scenarios 9-14 ----------------------
+# It mounts AgentGate (/v1/agent) and TeeRelay (/v1/relay) next to the user API.
+echo "==> starting reverse-tunnel Hub on :$RT_HUB_PORT (agent gate /v1/agent, tee relay /v1/relay)"
+"$BIN/hub" -serve "127.0.0.1:$RT_HUB_PORT" -host "127.0.0.1:$MP_PORT" \
+  -agent-key "$AGENT_SECRET" > "$SIM/hub-rt.log" 2>&1 &
+RT_HUB_PID=$!
+wait_for_port 127.0.0.1 "$RT_HUB_PORT"
+
+# The Hub keeps at most one online agent per provider, so each agent here is
+# started, used within its own scenario window, and killed before the next
+# scenario re-registers the same provider under a fresh process.
+
+# --- Scenario 9: real TEE over the reverse tunnel ------------------------
 TEE_A=18095
-section "9. real TEE -> Provider Agent (SOCKS5) -> provider (TLS)"
+section "9. real TEE -> tee relay -> agent reverse tunnel -> provider (TLS)"
 
-echo "    starting provider agent A on :$AGENT_A (tap -> $SIM/tap.log)"
-"$BIN/agent" -addr "127.0.0.1:$AGENT_A" -targets "127.0.0.1:$MP_PORT" -tap "$SIM/tap.log" > "$SIM/agentA.log" 2>&1 &
+echo "    starting provider agent A (openai-sim) dialing the reverse-tunnel hub"
+"$BIN/agent" -hub "$RT_HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
+  -targets "127.0.0.1:$MP_PORT" -tap "$SIM/tap.log" > "$SIM/agentA.log" 2>&1 &
 AGENT_A_PID=$!
-wait_for_port 127.0.0.1 "$AGENT_A"
+# The agent registers asynchronously; give it a beat before the first request.
+sleep 1
 
-echo "    starting REAL tee.Service A on :$TEE_A, egress via agent A"
-"$BIN/tee" -addr "127.0.0.1:$TEE_A" -agent "127.0.0.1:$AGENT_A" -seq "$SIM/seqstore-real.json" > "$SIM/teeA.log" 2>&1 &
+echo "    starting REAL tee.Service A on :$TEE_A, egressing via the hub relay"
+"$BIN/tee" -addr "127.0.0.1:$TEE_A" -relay "$RT_HUB_WS/v1/relay" \
+  -seq "$SIM/seqstore-real.json" > "$SIM/teeA.log" 2>&1 &
 TEE_A_PID=$!
 wait_for_port 127.0.0.1 "$TEE_A"
 
@@ -184,15 +220,12 @@ if [ "$FAIL" -eq 0 ]; then
   echo "      AGENT ONLY SAW CIPHERTEXT: $(wc -c < "$SIM/tap.log") bytes captured, no credential/Bearer/Authorization"
 fi
 
-# --- Agent B + real TEE B, kill the agent mid-request -------------------
-AGENT_B=18093
+# --- Scenario 10: kill the agent mid-request -----------------------------
 TEE_B=18096
 section "10. Provider Agent killed mid-request -> graceful failure"
-echo "    starting agent B on :$AGENT_B and real tee B on :$TEE_B"
-"$BIN/agent" -addr "127.0.0.1:$AGENT_B" -targets "127.0.0.1:$MP_PORT" > "$SIM/agentB.log" 2>&1 &
-AGENT_B_PID=$!
-wait_for_port 127.0.0.1 "$AGENT_B"
-"$BIN/tee" -addr "127.0.0.1:$TEE_B" -agent "127.0.0.1:$AGENT_B" -seq "$SIM/seqstore-teeb.json" > "$SIM/teeB.log" 2>&1 &
+echo "    real tee B on :$TEE_B, egressing back through the SAME agent A"
+"$BIN/tee" -addr "127.0.0.1:$TEE_B" -relay "$RT_HUB_WS/v1/relay" \
+  -seq "$SIM/seqstore-teeb.json" > "$SIM/teeB.log" 2>&1 &
 TEE_B_PID=$!
 wait_for_port 127.0.0.1 "$TEE_B"
 
@@ -203,8 +236,8 @@ echo "    launching a slow request (provider sleeps 2s) in the background:"
 "$BIN/hub" -tee "http://127.0.0.1:$TEE_B" -query "fault=slow" > "$SIM/hub-slow.log" 2>&1 &
 HUB_SLOW_PID=$!
 sleep 0.6
-echo "    killing the agent mid-request (pid $AGENT_B_PID)..."
-kill "$AGENT_B_PID" 2>/dev/null
+echo "    killing the agent mid-request (pid $AGENT_A_PID)..."
+kill "$AGENT_A_PID" 2>/dev/null
 wait "$HUB_SLOW_PID" 2>/dev/null
 
 echo "    -> the TEE must attest the failure as a signed receipt, never hang/panic:"
@@ -224,11 +257,18 @@ fi
 # tee B is no longer needed.
 kill "$TEE_B_PID" 2>/dev/null; wait "$TEE_B_PID" 2>/dev/null
 
-# --- epoch rotation: restart real tee A with a fresh sim key -----------
+# --- Scenario 11: epoch rotation (restart agent A + tee A) ----------------
 section "11. TEE restarts with a NEW signing key (epoch rotation)"
-echo "    (killing tee A pid $TEE_A_PID; a fresh sim epoch => new key)"
+echo "    (a fresh sim epoch => new key; restart agent A so openai-sim is back online)"
+"$BIN/agent" -hub "$RT_HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
+  -targets "127.0.0.1:$MP_PORT" -tap "$SIM/tap.log" > "$SIM/agentA2.log" 2>&1 &
+AGENT_A_PID=$!
+sleep 1
+
+echo "    (killing tee A pid $TEE_A_PID and restarting it under the new key)"
 kill "$TEE_A_PID" 2>/dev/null; wait "$TEE_A_PID" 2>/dev/null
-"$BIN/tee" -addr "127.0.0.1:$TEE_A" -agent "127.0.0.1:$AGENT_A" -seq "$SIM/seqstore-real.json" > "$SIM/teeA2.log" 2>&1 &
+"$BIN/tee" -addr "127.0.0.1:$TEE_A" -relay "$RT_HUB_WS/v1/relay" \
+  -seq "$SIM/seqstore-real.json" > "$SIM/teeA2.log" 2>&1 &
 TEE_A_PID=$!
 wait_for_port 127.0.0.1 "$TEE_A"
 echo "    one request under the new key; the Hub must still verify it:"
@@ -236,7 +276,7 @@ echo "    one request under the new key; the Hub must still verify it:"
 echo "    (verification uses the signer key embedded in each receipt, so a"
 echo "     rotated key is transparent — no trust-root redeploy needed)"
 
-# --- oversize response: TEE enforces MaxResponseBytes -------------------
+# --- Scenario 12: oversize response --------------------------------------
 section "12. oversize provider response -> TEE truncates at the cap"
 echo "    provider streams ~3 MiB; Hub caps the TEE at 64 KiB:"
 "$BIN/hub" -tee "http://127.0.0.1:$TEE_A" -query "fault=big" -max 65536 > "$SIM/hub-big.log" 2>&1
@@ -254,8 +294,8 @@ echo "    (credential still never on the agent wire — see scenario 9's tap)"
 
 # =====================================================================
 # S13: CONNECTION RESIDENCY (C1).
-# A fresh real TEE through an agent; zero the upstream's TCP counter; N
-# requests must reuse exactly ONE connection; a mid-stream disconnect then
+# A fresh real TEE through the online agent; zero the upstream's TCP counter;
+# N requests must reuse exactly ONE connection; a mid-stream disconnect then
 # forces a fresh dial (counter +1) and leaves the next receipt normal.
 # =====================================================================
 TEE_C=18097
@@ -264,12 +304,13 @@ TEE_C=18097
 # nothing back; the 127.0.0.1 probe must always be direct.
 section "13. connection residency (C1): N requests, ONE upstream TCP connection"
 curl -s --noproxy '*' "http://127.0.0.1:$STATS_PORT/reset" > /dev/null   # clean baseline
-echo "    starting fresh real tee C on :$TEE_C, egress via agent A (no pooled conn)"
+echo "    starting fresh real tee C on :$TEE_C, egressing via the reverse tunnel"
 # Fresh TEE, fresh seqstore, so the shared receipt store must be isolated too —
 # otherwise tee C's seq 1..N collide with tee A's receipts from scenarios 9-12
 # and the "[receipt]" lines below never print.
 rm -rf "$SIM/receipts"
-"$BIN/tee" -addr "127.0.0.1:$TEE_C" -agent "127.0.0.1:$AGENT_A" -seq "$SIM/seqstore-teec.json" > "$SIM/teeC.log" 2>&1 &
+"$BIN/tee" -addr "127.0.0.1:$TEE_C" -relay "$RT_HUB_WS/v1/relay" \
+  -seq "$SIM/seqstore-teec.json" > "$SIM/teeC.log" 2>&1 &
 TEE_C_PID=$!
 wait_for_port 127.0.0.1 "$TEE_C"
 
@@ -318,15 +359,15 @@ kill "$TEE_C_PID" 2>/dev/null; wait "$TEE_C_PID" 2>/dev/null
 
 # =====================================================================
 # S14: STREAMING SESSION (C3) — WebSocket upgrade tunnel + session receipt.
-# A real TEE egresses through agent A and upgrades to the provider's
+# A real TEE egresses through the reverse tunnel and upgrades to the provider's
 # /v1/realtime WebSocket; the streamer drives a full-duplex exchange and
 # verifies the terminal 101 session receipt offline against the exact bytes.
 # =====================================================================
 TEE_E=18099
 section "14. streaming session (C3): WebSocket upgrade tunnel + session receipt"
 
-echo "    starting real tee E on :$TEE_E, egress via agent A"
-"$BIN/tee" -addr "127.0.0.1:$TEE_E" -agent "127.0.0.1:$AGENT_A" \
+echo "    starting real tee E on :$TEE_E, egressing via the reverse tunnel"
+"$BIN/tee" -addr "127.0.0.1:$TEE_E" -relay "$RT_HUB_WS/v1/relay" \
   -seq "$SIM/seqstore-t14.json" > "$SIM/teeE.log" 2>&1 &
 TEE_E_PID=$!
 wait_for_port 127.0.0.1 "$TEE_E"
@@ -349,37 +390,44 @@ fi
 
 kill "$TEE_E_PID" 2>/dev/null; wait "$TEE_E_PID" 2>/dev/null
 
+# Scenarios 15-17 run on their own user-facing Hub (port 18085); stop the
+# scenario 9-14 reverse-tunnel Hub and its agent.
+kill "$AGENT_A_PID" 2>/dev/null; wait "$AGENT_A_PID" 2>/dev/null
+kill "$RT_HUB_PID" 2>/dev/null; wait "$RT_HUB_PID" 2>/dev/null
+
 # =====================================================================
 # S15: LOWEST-PRICE SCHEDULING + COMMISSION (C2).
-# A Hub user-facing API over a real TEE that egresses TWO providers
-# through an agent. Both serve the same model at different prices
-# (cheap-sim 0.30, openai-sim 1.00), so the scheduler must pick cheap-sim
-# for every request; the 10% commission must land on the buyer's bill while
-# the provider keeps its own price.
+# A Hub user-facing API over a real TEE that egresses TWO providers, each
+# through its own online agent. Both serve the same model at different prices
+# (cheap-sim 0.30, openai-sim 1.00), so the scheduler must pick cheap-sim for
+# every request; the 10% commission must land on the buyer's bill while the
+# provider keeps its own price.
 # =====================================================================
 HUB_API_PORT=18085
 TEE_D=18098
 section "15. lowest-price scheduling + commission (C2): user API picks cheap-sim"
 
-echo "    writing two-provider agent map (both egress via agent A :$AGENT_A)"
-cat > "$SIM/agents15.json" <<EOF
-{
-  "openai-sim": {"agent_addr":"127.0.0.1:$AGENT_A"},
-  "cheap-sim":  {"agent_addr":"127.0.0.1:$AGENT_A"}
-}
-EOF
+echo "    starting the user-facing Hub on :$HUB_API_PORT (10% commission, agent-key gate)"
+"$BIN/hub" -serve "127.0.0.1:$HUB_API_PORT" -host "127.0.0.1:$MP_PORT" \
+  -tee "http://127.0.0.1:$TEE_D" -commission 1000 -agent-key "$AGENT_SECRET" \
+  > "$SIM/hub-serve.log" 2>&1 &
+HUB_API_PID=$!
+wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
-echo "    starting real tee D on :$TEE_D with the two-provider map"
-"$BIN/tee" -addr "127.0.0.1:$TEE_D" -agents "$SIM/agents15.json" \
+echo "    two provider agents come online: cheap-sim (0.30) and openai-sim (1.00)"
+"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider cheap-sim \
+  -targets "127.0.0.1:$MP_PORT" > "$SIM/agent-cheap.log" 2>&1 &
+AGENT_CHEAP_PID=$!
+"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
+  -targets "127.0.0.1:$MP_PORT" > "$SIM/agent-oai.log" 2>&1 &
+AGENT_OAI_PID=$!
+sleep 1
+
+echo "    starting real tee D on :$TEE_D with the two-provider egress"
+"$BIN/tee" -addr "127.0.0.1:$TEE_D" -relay "$HUB_WS/v1/relay" \
   -seq "$SIM/seqstore-t15.json" > "$SIM/teeD.log" 2>&1 &
 TEE_D_PID=$!
 wait_for_port 127.0.0.1 "$TEE_D"
-
-echo "    starting the hub user-facing API on :$HUB_API_PORT (10% commission)"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_D" -serve "127.0.0.1:$HUB_API_PORT" \
-  -host "127.0.0.1:$MP_PORT" -commission 1000 > "$SIM/hub-serve.log" 2>&1 &
-HUB_API_PID=$!
-wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
 echo "    sending 3 chat requests for model sim-mock-0.5b:"
 for i in 1 2 3; do
@@ -433,18 +481,27 @@ kill "$TEE_D_PID" "$HUB_API_PID" 2>/dev/null; wait "$TEE_D_PID" "$HUB_API_PID" 2
 # =====================================================================
 section "16. Anthropic /v1/messages + OpenAI /v1/responses user APIs"
 
-echo "    (fresh tee + store so receipt counts are unambiguous)"
+echo "    (fresh hub + stores so receipt counts are unambiguous)"
 rm -rf "$SIM/receipts"
-"$BIN/tee" -addr "127.0.0.1:$TEE_D" -agents "$SIM/agents15.json" \
+"$BIN/hub" -serve "127.0.0.1:$HUB_API_PORT" -host "127.0.0.1:$MP_PORT" \
+  -tee "http://127.0.0.1:$TEE_D" -agent-key "$AGENT_SECRET" \
+  > "$SIM/hub-serve16.log" 2>&1 &
+HUB_API16_PID=$!
+wait_for_port 127.0.0.1 "$HUB_API_PORT"
+
+echo "    bringing the two agents back online"
+"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider cheap-sim \
+  -targets "127.0.0.1:$MP_PORT" > "$SIM/agent-cheap16.log" 2>&1 &
+AGENT_CHEAP_PID=$!
+"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
+  -targets "127.0.0.1:$MP_PORT" > "$SIM/agent-oai16.log" 2>&1 &
+AGENT_OAI_PID=$!
+sleep 1
+
+"$BIN/tee" -addr "127.0.0.1:$TEE_D" -relay "$HUB_WS/v1/relay" \
   -seq "$SIM/seqstore-t16.json" > "$SIM/teeD16.log" 2>&1 &
 TEE_D16_PID=$!
 wait_for_port 127.0.0.1 "$TEE_D"
-
-echo "    starting the hub user-facing API on :$HUB_API_PORT"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_D" -serve "127.0.0.1:$HUB_API_PORT" \
-  -host "127.0.0.1:$MP_PORT" > "$SIM/hub-serve16.log" 2>&1 &
-HUB_API16_PID=$!
-wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
 echo "    POST /v1/messages (Anthropic format, model claude-sim):"
 curl -s --noproxy '*' -X POST "http://127.0.0.1:$HUB_API_PORT/v1/messages" \
@@ -510,19 +567,28 @@ kill "$TEE_D16_PID" "$HUB_API16_PID" 2>/dev/null; wait "$TEE_D16_PID" "$HUB_API1
 TEE_G=18091
 section "17. streaming session via the Hub user API (C5): select + settle + duplex"
 
-echo "    (fresh tee + store so the receipt count is unambiguous)"
+echo "    (fresh hub + stores so the receipt count is unambiguous)"
 rm -rf "$SIM/receipts"
-"$BIN/tee" -addr "127.0.0.1:$TEE_G" -agents "$SIM/agents15.json" \
+"$BIN/hub" -serve "127.0.0.1:$HUB_API_PORT" -host "127.0.0.1:$MP_PORT" \
+  -tee "http://127.0.0.1:$TEE_G" -commission 1000 \
+  -session-timeout 30s -session-max 1048576 -session-idle 5s \
+  -agent-key "$AGENT_SECRET" > "$SIM/hub-serve17.log" 2>&1 &
+HUB_API17_PID=$!
+wait_for_port 127.0.0.1 "$HUB_API_PORT"
+
+echo "    two provider agents online (cheap-sim cheapest for the model)"
+"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider cheap-sim \
+  -targets "127.0.0.1:$MP_PORT" > "$SIM/agent-cheap17.log" 2>&1 &
+AGENT_CHEAP_PID=$!
+"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
+  -targets "127.0.0.1:$MP_PORT" > "$SIM/agent-oai17.log" 2>&1 &
+AGENT_OAI_PID=$!
+sleep 1
+
+"$BIN/tee" -addr "127.0.0.1:$TEE_G" -relay "$HUB_WS/v1/relay" \
   -seq "$SIM/seqstore-t17.json" > "$SIM/teeG.log" 2>&1 &
 TEE_G_PID=$!
 wait_for_port 127.0.0.1 "$TEE_G"
-
-echo "    starting the hub user-facing API on :$HUB_API_PORT (10% commission)"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_G" -serve "127.0.0.1:$HUB_API_PORT" \
-  -host "127.0.0.1:$MP_PORT" -commission 1000 \
-  -session-timeout 30s -session-max 1048576 -session-idle 5s > "$SIM/hub-serve17.log" 2>&1 &
-HUB_API17_PID=$!
-wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
 echo "    a streaming session for model sim-mock-0.5b (cheapest provider = cheap-sim):"
 "$BIN/sessiondriver" -url "ws://127.0.0.1:$HUB_API_PORT/v1/session" \
@@ -566,6 +632,6 @@ kill "$TEE_G_PID" "$HUB_API17_PID" 2>/dev/null; wait "$TEE_G_PID" "$HUB_API17_PI
 # --- cleanup -------------------------------------------------------------
 echo
 echo "==> stopping services"
-kill "$MP_PID" "$TEE_PID" "$AGENT_A_PID" "$TEE_A_PID" 2>/dev/null
+kill "$MP_PID" "$TEE_PID" 2>/dev/null
 pkill -f "$BIN/" 2>/dev/null
 echo "==> done. Logs in $SIM/"

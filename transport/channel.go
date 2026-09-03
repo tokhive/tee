@@ -43,6 +43,15 @@ type ChannelConfig struct {
 	// MaxConnsPerHost bounds concurrent pooled connections per (provider, host).
 	// Beyond it, acquisition waits for a slot. Zero means 32.
 	MaxConnsPerHost int
+
+	// RelayURL, when set, is the Hub's TeeRelay WebSocket endpoint. The manager
+	// then dials every provider connection as a stream over one persistent hub
+	// relay tunnel (the Provider Agent dials the Hub in reverse), instead of
+	// dialing the provider's agent directly. TLS still terminates in the TEE over
+	// the stream, so the connection-resident split is unchanged. When empty, the
+	// legacy Endpoints path is used (a TEE co-located with the provider, or the
+	// embedded transport tests).
+	RelayURL string
 }
 
 // DefaultScheme is used when ChannelConfig.Scheme is empty.
@@ -91,6 +100,7 @@ type ChannelManager struct {
 
 	mu    sync.Mutex
 	pools map[string]*channelPool
+	relay *Relay
 
 	// stopReaper halts the background idle sweeper, which reaps idle
 	// connections whose window has elapsed even when no new request ever comes
@@ -123,8 +133,8 @@ func (p pairKey) String() string { return p.provider + "\x00" + p.host }
 
 // NewChannelManager validates the configuration and returns a ready manager.
 func NewChannelManager(cfg ChannelConfig) (*ChannelManager, error) {
-	if cfg.Endpoints == nil {
-		return nil, errors.New("channel manager: no endpoint registry")
+	if cfg.Endpoints == nil && cfg.RelayURL == "" {
+		return nil, errors.New("channel manager: no endpoint registry and no relay URL")
 	}
 	scheme := cfg.Scheme
 	if scheme == "" {
@@ -151,6 +161,13 @@ func NewChannelManager(cfg ChannelConfig) (*ChannelManager, error) {
 		idleTimeout: idle,
 		readBufSize: defaultReadBufferSize,
 		pools:       make(map[string]*channelPool),
+	}
+	if cfg.RelayURL != "" {
+		r, err := NewRelay(RelayConfig{URL: cfg.RelayURL})
+		if err != nil {
+			return nil, err
+		}
+		m.relay = r
 	}
 	m.startReaper()
 	return m, nil
@@ -249,6 +266,9 @@ func (m *ChannelManager) Close() error {
 	for _, p := range pools {
 		p.close()
 	}
+	if m.relay != nil {
+		_ = m.relay.Close()
+	}
 	return nil
 }
 
@@ -269,11 +289,7 @@ func (m *ChannelManager) OpenSession(ctx context.Context, req tee.Request) (tee.
 		defer cancel()
 	}
 
-	endpoint, ok := m.cfg.Endpoints.Endpoint(req.Provider)
-	if !ok {
-		return nil, fmt.Errorf("%w: %q", ErrUnknownEndpoint, req.Provider)
-	}
-	conn, err := m.dialTCP(ctx, endpoint, req.Host)
+	conn, err := m.dialTCP(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -358,18 +374,13 @@ func (m *ChannelManager) release(ch *channel, keep bool) {
 }
 
 func (m *ChannelManager) dial(ctx context.Context, pool *channelPool, req tee.Request) (*channel, error) {
-	endpoint, ok := m.cfg.Endpoints.Endpoint(req.Provider)
-	if !ok {
-		return nil, fmt.Errorf("%w: %q", ErrUnknownEndpoint, req.Provider)
-	}
-
 	// Reserve a slot for a brand-new connection before dialing. This bounds the
 	// resident set per (provider, host); a caller blocked here waits until an
 	// existing connection dies and frees its slot.
 	if err := pool.reserveSlot(); err != nil {
 		return nil, err
 	}
-	conn, err := m.dialTCP(ctx, endpoint, req.Host)
+	conn, err := m.dialTCP(ctx, req)
 	if err != nil {
 		pool.releaseSlot()
 		return nil, err
@@ -377,16 +388,26 @@ func (m *ChannelManager) dial(ctx context.Context, pool *channelPool, req tee.Re
 	return &channel{conn: conn, br: bufio.NewReader(conn), pool: pool}, nil
 }
 
-// dialTCP opens the raw pipe to req.Host, optionally through the provider's
-// agent, and wraps it in TLS when the scheme needs it.
-func (m *ChannelManager) dialTCP(ctx context.Context, endpoint Endpoint, host string) (net.Conn, error) {
+// dialTCP opens the raw pipe to req.Host and wraps it in TLS when the scheme
+// needs it. Through the Hub relay the pipe is a stream over the provider's
+// reverse tunnel; otherwise it is a direct (or legacy SOCKS5) TCP connection. In
+// both cases TLS terminates here, inside the TEE.
+func (m *ChannelManager) dialTCP(ctx context.Context, req tee.Request) (net.Conn, error) {
 	var conn net.Conn
 	var err error
-	if endpoint.AgentAddr != "" {
-		conn, err = SOCKS5Dialer(endpoint.AgentAddr, endpoint.Auth())(ctx, "tcp", host)
+	if m.relay != nil {
+		conn, err = m.relay.Dial(ctx, req.Provider, req.Host)
 	} else {
-		var d net.Dialer
-		conn, err = d.DialContext(ctx, "tcp", host)
+		endpoint, ok := m.cfg.Endpoints.Endpoint(req.Provider)
+		if !ok {
+			return nil, fmt.Errorf("%w: %q", ErrUnknownEndpoint, req.Provider)
+		}
+		if endpoint.AgentAddr != "" {
+			conn, err = SOCKS5Dialer(endpoint.AgentAddr, endpoint.Auth())(ctx, "tcp", req.Host)
+		} else {
+			var d net.Dialer
+			conn, err = d.DialContext(ctx, "tcp", req.Host)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -394,7 +415,14 @@ func (m *ChannelManager) dialTCP(ctx context.Context, endpoint Endpoint, host st
 	if m.scheme != "https" {
 		return conn, nil
 	}
+	return m.wrapTLS(ctx, conn, req.Host)
+}
 
+// wrapTLS upgrades a raw provider pipe to TLS with the config the manager was
+// given. The trust roots determine what the TEE will attest against; only the
+// roots and a minimum version are customised, and the handshake/record layers
+// are standard.
+func (m *ChannelManager) wrapTLS(ctx context.Context, conn net.Conn, host string) (net.Conn, error) {
 	tlsCfg := &tls.Config{
 		ServerName: serverName(host),
 		// The caller's TLS config is optional: nil means the platform defaults,

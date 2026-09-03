@@ -111,9 +111,9 @@ func LoadRates() (Rates, error) {
 }
 
 // writePolicy encodes and writes a Hub-predefined whitelist policy to its
-// per-provider path. The policy is NOT signed: pricing no longer lives in the
-// policy (it is Hub-side rates.json) and the whitelist itself is deployment
-// config, whose integrity the TEE binds into its attestation measurement.
+// per-provider path. The policy is unsigned: pricing lives in the Hub's rates.json
+// (a commercial concern), and the whitelist itself is deployment config, whose
+// integrity the TEE binds into its attestation measurement.
 func writePolicy(provider string, p policy.Policy) error {
 	enc, err := p.EncodeCanonical()
 	if err != nil {

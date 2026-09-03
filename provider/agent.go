@@ -1,375 +1,224 @@
-// Package provider implements the TokenHive Provider Agent: the process a
-// quota contributor runs on their own machine so a TEE can egress through
-// their network.
+// Package provider implements the TokenHive Provider Agent: the process a quota
+// contributor runs on their own machine so a TEE can egress through their
+// network.
 //
-// The agent is deliberately dumb. It speaks just enough SOCKS5 (RFC 1928
-// CONNECT with optional RFC 1929 username/password authentication) to accept
-// a tunnel, checks the requested target against a fixed allowlist, and then
-// copies bytes in both directions without inspecting them. It cannot read the
-// traffic it relays: the TEE's TLS session with the AI provider is end to
-// end, and the agent sees only the encrypted bytes of a session it is not
-// party to.
+// The agent lives behind a home NAT, so it cannot be dialed: it dials the Hub
+// and keeps one multiplexed WebSocket open (what the design calls the reverse
+// tunnel). Registering with the Hub's AgentGate makes it online and schedulable;
+// while that tunnel stays up, the Hub routes this provider's egress through it.
+// The shared key it presents at dial-in is the only thing telling the Hub that
+// this machine may claim to egress for its provider.
+//
+// The agent is deliberately dumb. For each relay stream the Hub opens on its
+// tunnel it dials the named upstream host once — checked against a fixed
+// allowlist — and then copies bytes in both directions without inspecting them.
+// It cannot read the traffic it relays: the TEE's TLS session with the AI
+// provider is end to end, and the agent sees only the encrypted bytes of a
+// session it is not party to.
 //
 // What the agent does enforce, and all it enforces:
 //
-//   - Authentication, when configured, so a discovered agent is not an open
-//     relay for whoever finds it.
 //   - The allowlist. An agent that forwarded to arbitrary hosts would turn a
 //     contributor's machine into a general-purpose proxy; the allowlist keeps
 //     the exposure to "AI provider endpoints", which is what the contributor
 //     signed up for.
 //
 // Absent by design (production concerns, noted for later milestones):
-// connection caps, idle timeouts, and usage metering. The agent is a M2 demo
-// component; a contributor-facing release needs all three.
+// connection caps, idle timeouts, and usage metering. The agent is a simulation
+// milestone component; a contributor-facing release needs all three.
 package provider
 
 import (
 	"context"
-	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"strconv"
-	"sync"
+	"net/http"
 	"time"
-)
 
-// SOCKS5 protocol constants, server side. See the note in the transport
-// package about the two halves owning their own copy.
-const (
-	socks5Version        = 5
-	socks5MethodNone     = 0x00
-	socks5MethodUserPass = 0x02
-	socks5MethodReject   = 0xFF
-	socks5AuthVersion    = 1
-
-	socks5CmdConnect = 0x01
-
-	socks5RepSucceeded      = 0x00
-	socks5RepRefused        = 0x01
-	socks5RepNotAllowed     = 0x02
-	socks5RepCmdUnsupported = 0x07
-	socks5RepAtypBad        = 0x08
-
-	socks5AtypIPv4   = 0x01
-	socks5AtypDomain = 0x03
-	socks5AtypIPv6   = 0x04
+	"github.com/gorilla/websocket"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tunnel"
 )
 
 // Agent errors.
 var (
 	ErrEmptyAllowlist = errors.New("provider agent: allowlist must not be empty")
-	ErrAuthRequired   = errors.New("provider agent: authentication required but no credentials configured")
+	ErrNoGateURL      = errors.New("provider agent: no Hub gate URL")
+	ErrNoSharedKey    = errors.New("provider agent: no shared key")
+	ErrNoProvider     = errors.New("provider agent: no provider name")
 )
-
-// Auth is the username/password pair an agent demands before it will open a
-// tunnel (RFC 1929). Comparison is constant-time: the credentials arrive over
-// the network and login attempts should not double as an oracle.
-type Auth struct {
-	Username string
-	Password string
-}
-
-// matches reports whether the presented credentials are the configured ones.
-func (a *Auth) matches(username, password []byte) bool {
-	u := []byte(a.Username)
-	p := []byte(a.Password)
-	return constantTimeEqual(u, username) && constantTimeEqual(p, password)
-}
 
 // AgentConfig assembles an Agent.
 type AgentConfig struct {
-	// Auth, when set, requires every connection to authenticate first. Leave
-	// nil only for loopback demos.
-	Auth *Auth
+	// HubGateURL is the Hub's AgentGate WebSocket endpoint the agent dials to
+	// come online, e.g. ws://127.0.0.1:18085/v1/agent. Required.
+	HubGateURL string
 
-	// AllowedTargets lists the exact "host:port" destinations the agent will
-	// dial. Anything else is refused before a single byte egresses. It must
-	// be non-empty: an agent that forwards anywhere is a public proxy.
+	// SharedKey is the preset shared secret the agent presents at dial-in. It
+	// must match the Hub's AgentSecret or the gate refuses the tunnel. Required.
+	SharedKey []byte
+
+	// Self announces the agent on registration: which provider it egresses for,
+	// an optional display label, and — when SelfPrice is set — the price it
+	// wants to charge. A nil SelfPrice means the agent accepts the Hub's
+	// platform default. Required: Provider must be set.
+	Self hub.AgentRegister
+
+	// AllowedTargets lists the exact "host:port" upstreams the agent will dial.
+	// Anything else is refused before a single byte egresses. It must be
+	// non-empty: an agent that forwards anywhere is a public proxy.
 	AllowedTargets []string
 
-	// ConnectTimeout bounds dialing the target provider. Zero means 10s.
+	// ConnectTimeout bounds dialing the Hub and dialing each upstream. Zero means
+	// 10s.
 	ConnectTimeout time.Duration
 
-	// DialTarget replaces the outbound dial. Test injection point; nil uses
-	// the standard dialer.
+	// ReconnectDelay pauses between reconnect attempts after the tunnel drops.
+	// Zero means 1s.
+	ReconnectDelay time.Duration
+
+	// DialTarget replaces the outbound upstream dial. Test injection point; nil
+	// uses the standard dialer.
 	DialTarget func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// Tap, when set, receives a copy of every byte the agent relays on either
-	// wire (the tunnel to the client and the tunnel to the provider). It is a
+	// wire (the tunnel to the Hub and the tunnel to the provider). It is a
 	// test/demo affordance only — used by the local simulation to prove the
 	// agent sees only the encrypted bytes of a TLS session it is not party to.
 	// Never set in production; the relay must stay dumb.
 	Tap io.Writer
 }
 
-// Agent is the Provider Agent server. It is safe to Serve once.
+// Agent is the Provider Agent reverse-tunnel client. It is safe to Run once.
 type Agent struct {
 	cfg AgentConfig
-
-	mu     sync.Mutex
-	ln     net.Listener
-	closed bool
+	hdr http.Header
 }
 
 // NewAgent validates the configuration and returns a ready agent.
 func NewAgent(cfg AgentConfig) (*Agent, error) {
+	if cfg.HubGateURL == "" {
+		return nil, ErrNoGateURL
+	}
+	if len(cfg.SharedKey) == 0 {
+		return nil, ErrNoSharedKey
+	}
+	if cfg.Self.Provider == "" {
+		return nil, ErrNoProvider
+	}
 	if len(cfg.AllowedTargets) == 0 {
 		return nil, ErrEmptyAllowlist
 	}
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = 10 * time.Second
 	}
-	return &Agent{cfg: cfg}, nil
+	if cfg.ReconnectDelay <= 0 {
+		cfg.ReconnectDelay = time.Second
+	}
+	a := &Agent{cfg: cfg}
+	a.hdr = http.Header{}
+	a.hdr.Set(hub.AgentKeyHeader, string(cfg.SharedKey))
+	return a, nil
 }
 
-// ListenAndServe listens on addr and serves until Close is called.
-func (a *Agent) ListenAndServe(addr string) error {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("provider agent: listen: %w", err)
-	}
-	return a.Serve(ln)
-}
-
-// Serve accepts connections on ln until Close is called or ln fails.
-func (a *Agent) Serve(ln net.Listener) error {
-	a.mu.Lock()
-	if a.closed {
-		a.mu.Unlock()
-		_ = ln.Close()
-		return errors.New("provider agent: serve on a closed agent")
-	}
-	a.ln = ln
-	a.mu.Unlock()
-
+// Run keeps the agent online until ctx is cancelled, reconnecting after every
+// tunnel drop. register is one full connection cycle: dial, register, and relay
+// until the tunnel ends.
+func (a *Agent) Run(ctx context.Context) error {
 	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			a.mu.Lock()
-			closed := a.closed
-			a.mu.Unlock()
-			if closed {
-				return nil
-			}
-			return fmt.Errorf("provider agent: accept: %w", err)
+		if err := a.runOnce(ctx); err != nil && ctx.Err() != nil {
+			return ctx.Err()
 		}
-		go a.handle(conn)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(a.cfg.ReconnectDelay):
+		}
 	}
 }
 
-// Close stops the listener. In-flight pipes finish on their own: cutting an
-// active transcript mid-relay is the TEE's decision to make, not the agent's.
-func (a *Agent) Close() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.closed {
-		return nil
+// runOnce runs one connection cycle: dial the Hub gate, register, and relay
+// until the tunnel drops. It returns when the tunnel ends so Run can reconnect.
+func (a *Agent) runOnce(ctx context.Context) error {
+	dialer := websocket.Dialer{HandshakeTimeout: a.cfg.ConnectTimeout}
+	conn, resp, err := dialer.DialContext(ctx, a.cfg.HubGateURL, a.hdr)
+	if err != nil {
+		return fmt.Errorf("dial hub gate: %w", err)
 	}
-	a.closed = true
-	if a.ln != nil {
-		return a.ln.Close()
+	defer conn.Close()
+	if resp != nil && resp.StatusCode != http.StatusSwitchingProtocols {
+		return fmt.Errorf("hub gate: %s", resp.Status)
+	}
+
+	mux := tunnel.New(tunnel.WrapWS(conn), tunnel.High)
+	defer mux.Close()
+	mux.Serve(a.handleRelay)
+
+	register, err := json.Marshal(a.cfg.Self)
+	if err != nil {
+		return fmt.Errorf("encode registration: %w", err)
+	}
+	control, err := mux.Dial(register)
+	if err != nil {
+		return fmt.Errorf("register: %w", err)
+	}
+	defer control.Close()
+
+	// The control stream is the agent's lease on being online: it stays open
+	// until the Hub tears the tunnel down or the connection drops, either of
+	// which returns here and lets Run reconnect.
+	if _, err := io.Copy(io.Discard, control); err != nil {
+		return err
 	}
 	return nil
 }
 
-// handle runs one tunnel end to end: handshake, allowlist, dial, pipe.
-func (a *Agent) handle(conn net.Conn) {
-	defer conn.Close()
-
-	target, err := a.handshake(conn)
-	if err != nil {
-		// The handshake writes its own SOCKS-level refusals. Anything left is
-		// a broken client; hanging up is the whole message.
+// handleRelay bridges one Hub-opened relay stream to the named upstream. It runs
+// on its own goroutine (the tunnel spawns each open) and only ever moves bytes.
+func (a *Agent) handleRelay(s *tunnel.Stream, open []byte) {
+	defer s.Close()
+	var up hub.UpstreamOpen
+	if err := json.Unmarshal(open, &up); err != nil {
 		return
 	}
-	if !a.allows(target) {
-		_ = a.reply(conn, socks5RepNotAllowed)
+	if up.Host == "" || !a.allows(up.Host) {
 		return
 	}
-
-	outbound, err := a.dialTarget(target)
+	outbound, err := a.dialTarget(up.Host)
 	if err != nil {
-		_ = a.reply(conn, socks5RepRefused)
 		return
 	}
 	defer outbound.Close()
 
-	if err := a.reply(conn, socks5RepSucceeded); err != nil {
-		return
-	}
-	// After the SOCKS handshake the only bytes on either wire are TLS records
-	// (the client's session with the provider). Mirror them to the tap, if
-	// configured, so a test can prove the agent relays ciphertext and never
-	// the credential the TEE injected inside that tunnel.
+	// After the relay opens, the only bytes on either wire are TLS records (the
+	// TEE's session with the provider). Mirror them to the tap, if configured,
+	// so a test can prove the agent relays ciphertext and never the credential
+	// the TEE injected inside that session.
+	var left, right ioReadWriteCloser = s, outbound
 	if a.cfg.Tap != nil {
-		conn = tapConn{Conn: conn, tap: a.cfg.Tap}
-		outbound = tapConn{Conn: outbound, tap: a.cfg.Tap}
+		left = tapRWC{rw: s, tap: a.cfg.Tap}
+		right = tapRWC{rw: outbound, tap: a.cfg.Tap}
 	}
-	pipe(conn, outbound)
+	bridge(left, right)
 }
 
-// tapConn mirrors every byte written through it to Tap. It is purely a
-// test/demo affordance (see AgentConfig.Tap) and is never used on a production
-// path, where the agent must stay a dumb byte pipe.
-type tapConn struct {
-	net.Conn
-	tap io.Writer
-}
-
-func (c tapConn) Write(b []byte) (int, error) {
-	if c.tap != nil {
-		_, _ = c.tap.Write(b)
-	}
-	return c.Conn.Write(b)
-}
-
-// handshake negotiates the method, authenticates, and returns the CONNECT
-// target as host:port.
-func (a *Agent) handshake(conn net.Conn) (string, error) {
-	// --- method negotiation ---
-	var head [2]byte
-	if _, err := io.ReadFull(conn, head[:]); err != nil {
-		return "", fmt.Errorf("read greeting: %w", err)
-	}
-	if head[0] != socks5Version {
-		return "", errors.New("not a SOCKS5 client")
-	}
-	methods := make([]byte, int(head[1]))
-	if _, err := io.ReadFull(conn, methods); err != nil {
-		return "", fmt.Errorf("read methods: %w", err)
-	}
-
-	var chosen byte = socks5MethodReject
-	for _, method := range methods {
-		if a.cfg.Auth != nil && method == socks5MethodUserPass {
-			chosen = socks5MethodUserPass
-			break
-		}
-		if a.cfg.Auth == nil && method == socks5MethodNone {
-			chosen = socks5MethodNone
-			break
-		}
-	}
-	if chosen == socks5MethodReject {
-		_, _ = conn.Write([]byte{socks5Version, socks5MethodReject})
-		return "", errors.New("no acceptable auth method")
-	}
-	if _, err := conn.Write([]byte{socks5Version, chosen}); err != nil {
-		return "", fmt.Errorf("send method choice: %w", err)
-	}
-
-	// --- RFC 1929 credentials ---
-	if chosen == socks5MethodUserPass {
-		username, password, err := readAuthMessage(conn)
-		if err != nil {
-			return "", err
-		}
-		if !a.cfg.Auth.matches(username, password) {
-			// Status 0x01 then hang up. A failure reply keeps the client from
-			// retrying forever against a pair it does not have.
-			_, _ = conn.Write([]byte{socks5AuthVersion, 1})
-			return "", errors.New("bad credentials")
-		}
-		if _, err := conn.Write([]byte{socks5AuthVersion, 0}); err != nil {
-			return "", fmt.Errorf("send auth status: %w", err)
-		}
-	}
-
-	// --- CONNECT request ---
-	var request [4]byte // VER CMD RSV ATYP
-	if _, err := io.ReadFull(conn, request[:]); err != nil {
-		return "", fmt.Errorf("read connect request: %w", err)
-	}
-	if request[0] != socks5Version {
-		return "", errors.New("malformed connect request")
-	}
-	if request[1] != socks5CmdConnect {
-		// The agent is a relay, not a generic SOCKS server: BIND and UDP
-		// ASSOCIATE have no meaning for a byte pipe.
-		_ = a.reply(conn, socks5RepCmdUnsupported)
-		return "", errors.New("unsupported command")
-	}
-
-	var host string
-	switch request[3] {
-	case socks5AtypIPv4:
-		raw := make([]byte, 4)
-		if _, err := io.ReadFull(conn, raw); err != nil {
-			return "", fmt.Errorf("read IPv4 target: %w", err)
-		}
-		host = net.IP(raw).String()
-	case socks5AtypDomain:
-		var length [1]byte
-		if _, err := io.ReadFull(conn, length[:]); err != nil {
-			return "", fmt.Errorf("read domain length: %w", err)
-		}
-		raw := make([]byte, int(length[0]))
-		if _, err := io.ReadFull(conn, raw); err != nil {
-			return "", fmt.Errorf("read domain target: %w", err)
-		}
-		host = string(raw)
-	case socks5AtypIPv6:
-		raw := make([]byte, 16)
-		if _, err := io.ReadFull(conn, raw); err != nil {
-			return "", fmt.Errorf("read IPv6 target: %w", err)
-		}
-		host = net.IP(raw).String()
-	default:
-		_ = a.reply(conn, socks5RepAtypBad)
-		return "", errors.New("unknown address type")
-	}
-
-	var port [2]byte
-	if _, err := io.ReadFull(conn, port[:]); err != nil {
-		return "", fmt.Errorf("read target port: %w", err)
-	}
-	return net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(port[:])))), nil
-}
-
-// readAuthMessage reads one RFC 1929 username/password message.
-func readAuthMessage(conn net.Conn) (username, password []byte, err error) {
-	var version [1]byte
-	if _, err = io.ReadFull(conn, version[:]); err != nil {
-		return nil, nil, fmt.Errorf("read auth version: %w", err)
-	}
-	if version[0] != socks5AuthVersion {
-		return nil, nil, errors.New("malformed auth message")
-	}
-	var lengths [1]byte
-	if _, err = io.ReadFull(conn, lengths[:]); err != nil {
-		return nil, nil, fmt.Errorf("read username length: %w", err)
-	}
-	username = make([]byte, int(lengths[0]))
-	if _, err = io.ReadFull(conn, username); err != nil {
-		return nil, nil, fmt.Errorf("read username: %w", err)
-	}
-	if _, err = io.ReadFull(conn, lengths[:]); err != nil {
-		return nil, nil, fmt.Errorf("read password length: %w", err)
-	}
-	password = make([]byte, int(lengths[0]))
-	if _, err = io.ReadFull(conn, password); err != nil {
-		return nil, nil, fmt.Errorf("read password: %w", err)
-	}
-	return username, password, nil
-}
-
-// allows reports whether target is on the allowlist. Exact host:port match
-// only: patterns would invite "close enough" targets that were never meant to
-// be allowed.
-func (a *Agent) allows(target string) bool {
+// allows reports whether host is on the allowlist. Exact host:port match only:
+// patterns would invite "close enough" targets that were never meant to be
+// allowed.
+func (a *Agent) allows(host string) bool {
 	for _, allowed := range a.cfg.AllowedTargets {
-		if target == allowed {
+		if host == allowed {
 			return true
 		}
 	}
 	return false
 }
 
-// dialTarget opens the outbound connection to the provider.
-func (a *Agent) dialTarget(target string) (net.Conn, error) {
+// dialTarget opens the outbound connection to the upstream host.
+func (a *Agent) dialTarget(host string) (net.Conn, error) {
 	dial := a.cfg.DialTarget
 	if dial == nil {
 		var d net.Dialer
@@ -377,47 +226,54 @@ func (a *Agent) dialTarget(target string) (net.Conn, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.ConnectTimeout)
 	defer cancel()
-	conn, err := dial(ctx, "tcp", target)
+	conn, err := dial(ctx, "tcp", host)
 	if err != nil {
-		return nil, fmt.Errorf("dial target %s: %w", target, err)
+		return nil, fmt.Errorf("dial upstream %s: %w", host, err)
 	}
 	return conn, nil
 }
 
-// reply sends one SOCKS5 reply. The bound address is zeroed: the client
-// (our transport's dialer) discards it anyway.
-func (a *Agent) reply(conn net.Conn, code byte) error {
-	_, err := conn.Write([]byte{socks5Version, code, 0, socks5AtypIPv4, 0, 0, 0, 0, 0, 0})
-	return err
-}
-
-// pipe copies bytes in both directions until either side closes. The first
-// direction to finish closes both ends, which unblocks the other goroutine:
-// a half-open pipe would otherwise pin a transcript relay forever.
-func pipe(client, upstream net.Conn) {
+// bridge copies bytes in both directions until either side closes. The first
+// direction to finish closes both ends, which unblocks the other goroutine: a
+// half-open relay would otherwise pin a stream pair forever.
+func bridge(a, b io.ReadWriteCloser) {
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(client, upstream)
+		_, _ = io.Copy(a, b)
 		done <- struct{}{}
+		_ = a.Close()
+		_ = b.Close()
 	}()
 	go func() {
-		_, _ = io.Copy(upstream, client)
+		_, _ = io.Copy(b, a)
 		done <- struct{}{}
+		_ = a.Close()
+		_ = b.Close()
 	}()
 	<-done
-	_ = client.Close()
-	_ = upstream.Close()
 }
 
-// constantTimeEqual compares two byte slices without leaking where they
-// differ. Length is not secret here; contents are.
-func constantTimeEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
+// ioReadWriteCloser narrows a full ReadWriteCloser to the surface bridge needs,
+// so the tap wrapper and the raw stream both fit the same parameter.
+type ioReadWriteCloser interface {
+	io.Reader
+	io.Writer
+	io.Closer
+}
+
+// tapRWC mirrors every byte written through it to Tap. It is purely a
+// test/demo affordance (see AgentConfig.Tap) and is never used on a production
+// path, where the agent must stay a dumb byte pipe.
+type tapRWC struct {
+	rw  io.ReadWriteCloser
+	tap io.Writer
+}
+
+func (t tapRWC) Read(p []byte) (int, error) { return t.rw.Read(p) }
+func (t tapRWC) Close() error               { return t.rw.Close() }
+func (t tapRWC) Write(p []byte) (int, error) {
+	if t.tap != nil {
+		_, _ = t.tap.Write(p)
 	}
-	var diff byte
-	for i := range a {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
+	return t.rw.Write(p)
 }
