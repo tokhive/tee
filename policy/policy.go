@@ -52,19 +52,6 @@ const (
 
 	MinNonceLength = 8
 	MaxNonceLength = 64
-
-	// Rate-card bounds. Prices are carried as integer micro-units rather than
-	// floats: a rate card is signed, hashed, and compared byte for byte, and a
-	// float in that position lets the same price encode differently on
-	// different platforms — which, for a signed document, is a forgery-shaped
-	// bug rather than a rounding quirk.
-	MaxRateModels      = 64
-	MaxModelNameLength = 64
-
-	// MaxRateMicros bounds a single price component so the Hub's pricing
-	// arithmetic cannot overflow on a provider-chosen rate card. One micro is
-	// 1e-6 of the provider's currency unit, so the bound is ~1.1e6 units.
-	MaxRateMicros = uint64(1) << 40
 )
 
 // Policy validation errors.
@@ -84,7 +71,6 @@ var (
 	ErrInvalidSigningKey  = errors.New("invalid provider signing key")
 	ErrPolicyExpired      = errors.New("policy has expired")
 	ErrPolicyNotYetValid  = errors.New("policy is not yet valid")
-	ErrInvalidRateCard    = errors.New("invalid rate card")
 )
 
 // Policy is the signed statement of what a shared credential may be used for.
@@ -108,11 +94,11 @@ type Policy struct {
 	// rotations produce a different policy hash. Optional.
 	Nonce []byte `cbor:"11,keyasint,omitempty"`
 
-	// RateCard is the provider's own price list. Pricing authority lives with
-	// the provider: the Hub applies this table, it does not set it. The card
-	// rides inside the signed policy, so the existing PolicyHash already
-	// commits to it and the receipt needs no separate price field.
-	RateCard RateCard `cbor:"12,keyasint,omitempty"`
+	// Key 12 was RateCard, the provider's price list. Pricing is no longer
+	// carried by the policy: it is a Hub-side commercial concern, kept in the
+	// hub package as its own seller-reported rate table. The key is retired
+	// rather than reassigned — a decoder that still emits it must not be read
+	// as a different field.
 }
 
 // Rule permits one family of requests: a path pattern crossed with the methods
@@ -145,66 +131,6 @@ type Limits struct {
 	MaxBodyBytes uint64 `cbor:"2,keyasint"`
 	// AllowedHeaders is the whitelist of caller-settable header names.
 	AllowedHeaders []string `cbor:"3,keyasint"`
-}
-
-// RateCard is the provider's price list, in integer micro-units (1e-6 of the
-// provider's currency unit).
-//
-// Prices live here rather than in the Hub because pricing authority is the
-// provider's: the Hub applies the table, it does not author it. A price change
-// is a new signed policy, which is a feature — it is auditable and the receipt
-// cites it through the existing PolicyHash.
-//
-// Every quantity the card prices on is attested by the TEE: the completion
-// state (key 12) and the response size (key 11) come off the receipt, and the
-// model name is what the Hub declared into the job spec (key 15), so it is
-// bound by the job spec hash.
-type RateCard struct {
-	// PerRequestMicros is charged once for a request the provider completed.
-	PerRequestMicros uint64 `cbor:"1,keyasint,omitempty"`
-	// PerMegabyteMicros is charged per whole mebibyte of attested response
-	// bytes, rounded up, so the smallest non-empty response bills one unit.
-	PerMegabyteMicros uint64 `cbor:"2,keyasint,omitempty"`
-	// ModelPremiumMicros adds a surcharge keyed by the model the Hub declared
-	// in the job spec. An undeclared or unlisted model pays no premium.
-	ModelPremiumMicros map[string]uint64 `cbor:"3,keyasint,omitempty"`
-}
-
-// Validate checks that the card is structurally sound and that every price
-// component is small enough for the Hub's arithmetic to stay in range.
-//
-// A zero card is valid and means the provider works for free — that is the
-// provider's call to make, not the validator's.
-func (r RateCard) Validate() error {
-	if r.PerRequestMicros > MaxRateMicros {
-		return fmt.Errorf("%w: PerRequestMicros %d exceeds %d",
-			ErrInvalidRateCard, r.PerRequestMicros, MaxRateMicros)
-	}
-	if r.PerMegabyteMicros > MaxRateMicros {
-		return fmt.Errorf("%w: PerMegabyteMicros %d exceeds %d",
-			ErrInvalidRateCard, r.PerMegabyteMicros, MaxRateMicros)
-	}
-	if len(r.ModelPremiumMicros) > MaxRateModels {
-		return fmt.Errorf("%w: %d model prices exceeds %d",
-			ErrInvalidRateCard, len(r.ModelPremiumMicros), MaxRateModels)
-	}
-	for model, micros := range r.ModelPremiumMicros {
-		if model == "" || len(model) > MaxModelNameLength {
-			return fmt.Errorf("%w: model name %q length outside [1,%d]",
-				ErrInvalidRateCard, model, MaxModelNameLength)
-		}
-		if micros > MaxRateMicros {
-			return fmt.Errorf("%w: premium for %q is %d, exceeds %d",
-				ErrInvalidRateCard, model, micros, MaxRateMicros)
-		}
-	}
-	return nil
-}
-
-// Premium returns the surcharge for a declared model, or zero if the card
-// prices nothing for it.
-func (r RateCard) Premium(model string) uint64 {
-	return r.ModelPremiumMicros[model]
 }
 
 // EncodeCanonical returns the deterministic CBOR encoding of the policy.
@@ -281,9 +207,6 @@ func (p Policy) Validate() error {
 		return err
 	}
 	if err := p.Limits.Validate(); err != nil {
-		return err
-	}
-	if err := p.RateCard.Validate(); err != nil {
 		return err
 	}
 

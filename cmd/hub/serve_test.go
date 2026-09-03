@@ -33,7 +33,7 @@ func newServeTestHub(t *testing.T, upstream []byte) *hub.Hub {
 func newServeTestHubReply(t *testing.T, upstream []byte, fail error) *hub.Hub {
 	t.Helper()
 
-	// The sim fixtures (providers.json, signed policies for openai-sim and
+	// The sim fixtures (providers.json, seller rate table for openai-sim and
 	// cheap-sim) are generated into a private temp dir so the test never
 	// touches the working tree's .sim.
 	simDir := t.TempDir()
@@ -41,9 +41,9 @@ func newServeTestHubReply(t *testing.T, upstream []byte, fail error) *hub.Hub {
 	if err := shared.EnsureDefaults(); err != nil {
 		t.Fatalf("ensure defaults: %v", err)
 	}
-	policies, err := shared.LoadPolicySetAll()
+	rates, err := shared.LoadRates()
 	if err != nil {
-		t.Fatalf("load policies: %v", err)
+		t.Fatalf("load rates: %v", err)
 	}
 
 	stream := [][]byte{upstream}
@@ -64,7 +64,7 @@ func newServeTestHubReply(t *testing.T, upstream []byte, fail error) *hub.Hub {
 
 	h, err := hub.New(hub.Config{
 		TEE:        fake,
-		Policies:   policies,
+		Rates:      rates,
 		Store:      hub.NewReceiptStore(t.TempDir()),
 		Verify:     func(proof.SignedReceipt) error { return nil },
 		Commission: 0,

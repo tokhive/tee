@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 )
 
@@ -31,11 +30,11 @@ func buildFor(provider string) (jobs.Spec, error) {
 	return testSpec(provider, "m"), nil
 }
 
-func scheduleHub(t *testing.T, set *policy.Set, commission uint64) *Hub {
+func scheduleHub(t *testing.T, rates map[string]RateCard, commission uint64) *Hub {
 	t.Helper()
 	h, err := New(Config{
 		TEE:        &ScriptedTEE{Reply: func(int, jobs.Spec) (Result, error) { return Result{}, nil }},
-		Policies:   set,
+		Rates:      rates,
 		Store:      NewReceiptStore(t.TempDir()),
 		Verify:     acceptAll,
 		Commission: commission,
@@ -47,7 +46,7 @@ func scheduleHub(t *testing.T, set *policy.Set, commission uint64) *Hub {
 }
 
 func TestRankedProvidersOrdersByEffectivePrice(t *testing.T) {
-	set := policySet(t, map[string]policy.RateCard{
+	set := ratesTable(map[string]RateCard{
 		// Effective price for model "m": PerRequest + Premium.
 		"mid":   {PerRequestMicros: 500, ModelPremiumMicros: map[string]uint64{"m": 50}},  // 550
 		"dear":  {PerRequestMicros: 900},                                                  // 900
@@ -69,14 +68,14 @@ func TestRankedProvidersOrdersByEffectivePrice(t *testing.T) {
 }
 
 func TestExecuteForModelPicksCheapestProvider(t *testing.T) {
-	set := policySet(t, map[string]policy.RateCard{
+	set := ratesTable(map[string]RateCard{
 		"dear":  {PerRequestMicros: 900},
 		"cheap": {PerRequestMicros: 100},
 	})
 	fake := &ScriptedTEE{Reply: func(call int, spec jobs.Spec) (Result, error) {
 		return cardReply(call, spec, 100, false)
 	}}
-	h, _ := New(Config{TEE: fake, Policies: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
+	h, _ := New(Config{TEE: fake, Rates: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
 
 	out, err := h.ExecuteForModel(context.Background(), "tenant", "m", nil, buildFor, nil)
 	if err != nil {
@@ -94,7 +93,7 @@ func TestExecuteForModelPicksCheapestProvider(t *testing.T) {
 }
 
 func TestExecuteForModelFallsBackFromFailingCheapest(t *testing.T) {
-	set := policySet(t, map[string]policy.RateCard{
+	set := ratesTable(map[string]RateCard{
 		"cheap": {PerRequestMicros: 100},
 		"dear":  {PerRequestMicros: 900},
 	})
@@ -104,7 +103,7 @@ func TestExecuteForModelFallsBackFromFailingCheapest(t *testing.T) {
 		}
 		return cardReply(call, spec, 900, false)
 	}}
-	h, _ := New(Config{TEE: fake, Policies: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
+	h, _ := New(Config{TEE: fake, Rates: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
 
 	out, err := h.ExecuteForModel(context.Background(), "tenant", "m", nil, buildFor, nil)
 	if err != nil {
@@ -126,7 +125,7 @@ func TestExecuteForModelCommitsAfterFirstRelayedByte(t *testing.T) {
 	// reached the user, so the Hub must NOT fall back to the next provider:
 	// splicing a second provider's transcript onto the first would corrupt the
 	// user's stream and match no single receipt.
-	set := policySet(t, map[string]policy.RateCard{
+	set := ratesTable(map[string]RateCard{
 		"cheap": {PerRequestMicros: 100},
 		"dear":  {PerRequestMicros: 900},
 	})
@@ -145,7 +144,7 @@ func TestExecuteForModelCommitsAfterFirstRelayedByte(t *testing.T) {
 			r.Provider = spec.Provider
 		})}, nil
 	}}
-	h, _ := New(Config{TEE: fake, Policies: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
+	h, _ := New(Config{TEE: fake, Rates: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
 
 	var relayed int
 	out, err := h.ExecuteForModel(context.Background(), "tenant", "m", nil, buildFor, func([]byte) error {
@@ -170,7 +169,7 @@ func TestExecuteForModelCommitsAfterFirstRelayedByte(t *testing.T) {
 }
 
 func TestExecuteForModelFallsBackFromNonBillableCheapest(t *testing.T) {
-	set := policySet(t, map[string]policy.RateCard{
+	set := ratesTable(map[string]RateCard{
 		"cheap": {PerRequestMicros: 100},
 		"dear":  {PerRequestMicros: 900},
 	})
@@ -188,7 +187,7 @@ func TestExecuteForModelFallsBackFromNonBillableCheapest(t *testing.T) {
 			r.Provider = spec.Provider
 		})}, nil
 	}}
-	h, _ := New(Config{TEE: fake, Policies: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
+	h, _ := New(Config{TEE: fake, Rates: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
 
 	out, err := h.ExecuteForModel(context.Background(), "tenant", "m", nil, buildFor, nil)
 	if err != nil {
@@ -203,8 +202,8 @@ func TestExecuteForModelFallsBackFromNonBillableCheapest(t *testing.T) {
 }
 
 func TestExecuteForModelNoProviders(t *testing.T) {
-	set := policySet(t, map[string]policy.RateCard{})
-	h, _ := New(Config{TEE: &ScriptedTEE{}, Policies: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
+	set := ratesTable(map[string]RateCard{})
+	h, _ := New(Config{TEE: &ScriptedTEE{}, Rates: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
 	_, err := h.ExecuteForModel(context.Background(), "tenant", "m", nil, buildFor, nil)
 	if !errors.Is(err, ErrNoProviderForModel) {
 		t.Fatalf("error = %v, want ErrNoProviderForModel", err)
@@ -214,7 +213,7 @@ func TestExecuteForModelNoProviders(t *testing.T) {
 // --- commission -----------------------------------------------------------
 
 func TestCommissionAddsToBuyerAndLedger(t *testing.T) {
-	set := policySet(t, map[string]policy.RateCard{
+	set := ratesTable(map[string]RateCard{
 		"cheap": {PerRequestMicros: 1000},
 	})
 	fake := &ScriptedTEE{Reply: func(call int, spec jobs.Spec) (Result, error) {
@@ -222,7 +221,7 @@ func TestCommissionAddsToBuyerAndLedger(t *testing.T) {
 	}}
 	h, _ := New(Config{
 		TEE:        fake,
-		Policies:   set,
+		Rates:      set,
 		Store:      NewReceiptStore(t.TempDir()),
 		Verify:     acceptAll,
 		Commission: 1000, // 10%
@@ -254,13 +253,13 @@ func TestCommissionAddsToBuyerAndLedger(t *testing.T) {
 }
 
 func TestNoCommissionByDefault(t *testing.T) {
-	set := policySet(t, map[string]policy.RateCard{
+	set := ratesTable(map[string]RateCard{
 		"cheap": {PerRequestMicros: 1000},
 	})
 	fake := &ScriptedTEE{Reply: func(call int, spec jobs.Spec) (Result, error) {
 		return cardReply(call, spec, 1000, false)
 	}}
-	h, _ := New(Config{TEE: fake, Policies: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
+	h, _ := New(Config{TEE: fake, Rates: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
 	out, err := h.ExecuteForModel(context.Background(), "tenant", "m", nil, buildFor, nil)
 	if err != nil {
 		t.Fatalf("execute: %v", err)

@@ -61,9 +61,12 @@ func main() {
 		return
 	}
 
-	policies, err := shared.LoadPolicySetAll()
+	// The Hub's market table: seller-reported prices. The whitelist policy is
+	// a TEE concern and never reaches the Hub — the Hub prices from its own
+	// rates, not from what the TEE will authorise.
+	rates, err := shared.LoadRates()
 	if err != nil {
-		log.Fatalf("load policies: %v", err)
+		log.Fatalf("load rates: %v", err)
 	}
 
 	var quota *hub.Quota
@@ -76,7 +79,7 @@ func main() {
 
 	h, err := hub.New(hub.Config{
 		TEE:        &hub.HTTPTEE{URL: *teeURL + "/v1/execute"},
-		Policies:   policies,
+		Rates:      rates,
 		Store:      store,
 		Verify:     verifyReceipt,
 		Quota:      quota,

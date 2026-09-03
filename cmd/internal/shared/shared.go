@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 )
@@ -53,10 +54,10 @@ func ConfigDir() string {
 type Providers map[string]string
 
 // EnsureDefaults writes the fixture files if they are missing: the provider
-// credentials, the providers' signing keys, and a provider-signed policy per
-// provider that the TEE loads. Each key is generated once and persisted,
-// because the policy is signed by it and a regenerated key would invalidate
-// the policy already on disk.
+// credentials, the providers' signing keys, a provider-signed whitelist policy
+// per provider that the TEE loads, and the Hub's seller-reported rate table.
+// Each key is generated once and persisted, because the policy is signed by it
+// and a regenerated key would invalidate the policy already on disk.
 func EnsureDefaults() error {
 	dir := ConfigDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -66,6 +67,9 @@ func EnsureDefaults() error {
 		providerName:  "sk-sim-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
 		providerCheap: "sk-sim-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
 	}); err != nil {
+		return err
+	}
+	if err := writeIfAbsent(filepath.Join(dir, "rates.json"), DefaultRates()); err != nil {
 		return err
 	}
 	key, err := loadOrGenProviderKey()
@@ -82,6 +86,32 @@ func EnsureDefaults() error {
 		return err
 	}
 	return nil
+}
+
+// DefaultRates is the Hub's seller-reported market price list for the
+// simulation. Prices are commercial data kept by the Hub — deliberately
+// outside the Provider Policy, which is a whitelist, not a price sheet.
+func DefaultRates() Rates {
+	return Rates{
+		// 1.00 unit per request; premium model carries a surcharge.
+		providerName: hub.RateCard{PerRequestMicros: 1_000_000, ModelPremiumMicros: map[string]uint64{
+			"sim-mock-large": 500_000, // 0.50 unit surcharge
+		}},
+		// 0.30 unit per request — the one the scheduler wants.
+		providerCheap: hub.RateCard{PerRequestMicros: 300_000},
+	}
+}
+
+// Rates is the Hub's market table: provider name to seller price card.
+type Rates map[string]hub.RateCard
+
+// LoadRates reads the Hub's rate table.
+func LoadRates() (Rates, error) {
+	var rates Rates
+	if err := readJSON(filepath.Join(ConfigDir(), "rates.json"), &rates); err != nil {
+		return nil, err
+	}
+	return rates, nil
 }
 
 // writePolicy encodes and writes a provider policy to its per-provider path.
@@ -173,21 +203,6 @@ func providerPolicy(provider string) policy.Policy {
 		AllowedHeaders:   []string{"Content-Type"},
 	}
 
-	// The provider's price, in the provider's own policy. The Hub reads it
-	// from here rather than carrying a table of its own: pricing authority is
-	// the provider's, and a policy hash on the receipt is what makes the charge
-	// reproducible. Per-request and per-model only; volume pricing is covered by
-	// the hub package's unit tests and left at zero so the harness totals stay
-	// readable.
-	card := policy.RateCard{PerRequestMicros: 1_000_000} // 1.00 unit
-	if provider == providerCheap {
-		card = policy.RateCard{PerRequestMicros: 300_000} // 0.30 unit — the one the scheduler wants
-	} else {
-		card.ModelPremiumMicros = map[string]uint64{
-			"sim-mock-large": 500_000, // 0.50 unit surcharge
-		}
-	}
-
 	return policy.Policy{
 		Version:    policy.VersionV1,
 		Provider:   provider,
@@ -197,7 +212,6 @@ func providerPolicy(provider string) policy.Policy {
 		Limits:     limits,
 		IssuedAt:   now.Unix(),
 		ExpiresAt:  now.Add(365 * 24 * time.Hour).Unix(),
-		RateCard:   card,
 	}
 }
 

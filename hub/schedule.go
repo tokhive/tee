@@ -9,41 +9,44 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 )
 
-// ErrNoProviderForModel means no installed provider can serve the requested
-// model. That is a supply problem, not a failure path worth hiding behind a
-// provider-specific error.
+// ErrNoProviderForModel means no provider on the market can serve the
+// requested model. That is a supply problem, not a failure path worth hiding
+// behind a provider-specific error.
 var ErrNoProviderForModel = errors.New("no provider serves this model")
 
-// providersForModel returns the installed providers that can serve a model,
-// ordered by their book price for it (ascending), with ties broken by provider
-// name so the order is a pure function of the policy set.
+// providersForModel returns the providers on the market that can serve a
+// model, ordered by their book price for it (ascending), with ties broken by
+// provider name so the order is a pure function of the rate table.
 //
-// The book price is the provider's own policy card: per-request plus any
+// The book price is the seller's own published card: per-request plus any
 // per-model surcharge. Volume pricing is deliberately left out of the choice —
 // the Hub cannot know how large a response will be before it runs the job, so an
 // order that depended on it would be non-deterministic. Per-request and model
 // surcharge are both known before dispatch, which is what a decision needs.
 //
-// Every installed provider is a candidate: an unlisted model pays no premium
-// under a rate card, so the request is still priced and still serveable. The
-// card's numbers, not the Hub's opinion, decide the order.
+// Every provider with a published rate is a candidate: an unlisted model pays
+// no premium under a rate card, so the request is still priced and still
+// serveable. The card's numbers, not the Hub's opinion, decide the order.
 func (h *Hub) providersForModel(model string) []string {
 	price := func(provider string) uint64 {
-		card, ok := h.policies.Get(provider)
+		card, ok := h.rates[provider]
 		if !ok {
 			return ^uint64(0)
 		}
-		book, ok := addChecked(card.RateCard.PerRequestMicros, card.RateCard.Premium(model))
+		book, ok := addChecked(card.PerRequestMicros, card.Premium(model))
 		if !ok {
 			// Saturate rather than overflow: validating refuses such a card for
 			// real, but saturating keeps this sort total and deterministic even
-			// against a hand-built in-memory set.
+			// against a hand-built in-memory table.
 			return ^uint64(0)
 		}
 		return book
 	}
 
-	providers := h.policies.Providers()
+	providers := make([]string, 0, len(h.rates))
+	for provider := range h.rates {
+		providers = append(providers, provider)
+	}
 	sort.SliceStable(providers, func(i, j int) bool {
 		pi, pj := price(providers[i]), price(providers[j])
 		if pi != pj {

@@ -3,9 +3,6 @@ package hub
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -17,7 +14,6 @@ import (
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
@@ -67,37 +63,12 @@ func makeReceipt(seq uint64, stream [][]byte, mutate func(*proof.Receipt)) proof
 
 func acceptAll(proof.SignedReceipt) error { return nil }
 
-// policySet installs one signed policy per entry, so a test can give two
-// providers different prices and show the Hub follows the card, not its own
-// idea of what things cost.
-func policySet(t *testing.T, cards map[string]policy.RateCard) *policy.Set {
-	t.Helper()
-	now := time.Now()
-	set := policy.NewSet()
-	for provider, card := range cards {
-		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		if err != nil {
-			t.Fatalf("generate key: %v", err)
-		}
-		signed, err := policy.SignPolicy(policy.Policy{
-			Version:    policy.VersionV1,
-			Provider:   provider,
-			Hosts:      []string{"provider.test:443"},
-			Rules:      []policy.Rule{{Methods: []string{"POST"}, Path: "/v1/chat/completions", AllowStream: true}},
-			Credential: policy.Credential{Header: "Authorization", Scheme: "Bearer"},
-			Limits:     policy.Limits{MaxResponseBytes: 1 << 20, MaxBodyBytes: 1 << 20},
-			IssuedAt:   now.Add(-time.Minute).Unix(),
-			ExpiresAt:  now.Add(time.Hour).Unix(),
-			RateCard:   card,
-		}, key)
-		if err != nil {
-			t.Fatalf("sign policy for %q: %v", provider, err)
-		}
-		if err := set.Add(signed, now); err != nil {
-			t.Fatalf("install policy for %q: %v", provider, err)
-		}
-	}
-	return set
+// ratesTable returns a Hub market table for a test, so a test can give two
+// providers different prices and show the Hub follows the seller's card, not
+// its own idea of what things cost. The Hub's price source is its own Rates
+// table — pricing is a Hub-side commercial concern, not a TEE policy field.
+func ratesTable(cards map[string]RateCard) map[string]RateCard {
+	return cards
 }
 
 func testSpec(provider, model string) jobs.Spec {
@@ -114,8 +85,8 @@ func testSpec(provider, model string) jobs.Spec {
 
 func mustHub(t *testing.T, cfg Config) *Hub {
 	t.Helper()
-	if cfg.Policies == nil {
-		cfg.Policies = policySet(t, map[string]policy.RateCard{testProvider: {PerRequestMicros: 1_000_000}})
+	if cfg.Rates == nil {
+		cfg.Rates = ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 1_000_000}})
 	}
 	if cfg.Store == nil {
 		cfg.Store = NewReceiptStore(t.TempDir())
@@ -133,7 +104,7 @@ func mustHub(t *testing.T, cfg Config) *Hub {
 // --- pricing ---------------------------------------------------------------
 
 func TestPrice(t *testing.T) {
-	card := policy.RateCard{
+	card := RateCard{
 		PerRequestMicros:   1_000_000,
 		PerMegabyteMicros:  500_000,
 		ModelPremiumMicros: map[string]uint64{"large": 250_000},
@@ -214,9 +185,9 @@ func TestPrice(t *testing.T) {
 }
 
 func TestPriceOverflowIsRejectedNotWrapped(t *testing.T) {
-	card := policy.RateCard{
-		PerRequestMicros:  policy.MaxRateMicros,
-		PerMegabyteMicros: policy.MaxRateMicros,
+	card := RateCard{
+		PerRequestMicros:  MaxRateMicros,
+		PerMegabyteMicros: MaxRateMicros,
 	}
 	receipt := proof.Receipt{
 		StatusCode:    200,
@@ -253,7 +224,7 @@ func TestBillable(t *testing.T) {
 // living with the provider. The Hub holds no price table; if someone adds one
 // back, these two providers stop differing.
 func TestHubChargesTheProvidersPrice(t *testing.T) {
-	set := policySet(t, map[string]policy.RateCard{
+	set := ratesTable(map[string]RateCard{
 		"cheap": {PerRequestMicros: 100},
 		"dear":  {PerRequestMicros: 900},
 	})
@@ -265,7 +236,7 @@ func TestHubChargesTheProvidersPrice(t *testing.T) {
 		})}, nil
 	}}
 
-	h := mustHub(t, Config{TEE: fake, Policies: set})
+	h := mustHub(t, Config{TEE: fake, Rates: set})
 
 	cheap, err := h.Execute(context.Background(), "tenant", testSpec("cheap", "m"), nil, nil)
 	if err != nil {
@@ -548,10 +519,10 @@ func TestWithholdingAReceiptLeavesADetectableGap(t *testing.T) {
 func TestNewRejectsIncompleteWiring(t *testing.T) {
 	base := func() Config {
 		return Config{
-			TEE:      &ScriptedTEE{Reply: func(int, jobs.Spec) (Result, error) { return Result{}, nil }},
-			Policies: policySet(t, map[string]policy.RateCard{testProvider: {}}),
-			Store:    NewReceiptStore(t.TempDir()),
-			Verify:   acceptAll,
+			TEE:    &ScriptedTEE{Reply: func(int, jobs.Spec) (Result, error) { return Result{}, nil }},
+			Rates:  ratesTable(map[string]RateCard{testProvider: {}}),
+			Store:  NewReceiptStore(t.TempDir()),
+			Verify: acceptAll,
 		}
 	}
 
@@ -561,7 +532,7 @@ func TestNewRejectsIncompleteWiring(t *testing.T) {
 		edit func(*Config)
 	}{
 		{"no TEE", ErrNoTEE, func(c *Config) { c.TEE = nil }},
-		{"no policy set", ErrNoPolicySet, func(c *Config) { c.Policies = nil }},
+		{"no rates", ErrNoRates, func(c *Config) { c.Rates = nil }},
 		{"no store", ErrNoStore, func(c *Config) { c.Store = nil }},
 		{"no verifier", ErrNoVerifier, func(c *Config) { c.Verify = nil }},
 	}

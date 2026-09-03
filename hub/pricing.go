@@ -3,7 +3,6 @@ package hub
 import (
 	"errors"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 )
 
@@ -27,19 +26,18 @@ func Billable(r proof.Receipt) bool {
 	return r.Completion == proof.CompletionComplete && r.StatusCode >= 200 && r.StatusCode < 300
 }
 
-// Price computes what a receipt earns under a provider's rate card, in the
+// Price computes what a receipt earns under a seller's rate card, in the
 // integer micro-units the card is written in.
 //
 // Every input is attested: completion state and response size come off the
 // receipt, and the model is the one the Hub declared into the job spec, which
 // the job spec hash binds. That makes a charge reproducible by anyone holding
-// the receipt and the policy — a Hub that pays a provider less than the
-// provider's own card specifies produces a number that does not reconcile,
-// which is the property worth having rather than any particular formula.
+// the receipt and the card the Hub applied — a Hub that pays a provider less
+// than its published card specifies produces a number that does not reconcile.
 //
 // A receipt that is not billable prices at zero rather than erroring: refusal
 // to pay is a normal outcome, not a failure.
-func Price(card policy.RateCard, declaredModel string, r proof.Receipt) (uint64, error) {
+func Price(card RateCard, declaredModel string, r proof.Receipt) (uint64, error) {
 	if !Billable(r) {
 		return 0, nil
 	}

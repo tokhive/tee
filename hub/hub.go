@@ -18,24 +18,24 @@ import (
 	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 )
 
 // Wiring errors. These are construction mistakes, not runtime conditions, and
 // they fire on the first call rather than the first job.
 var (
-	ErrNoTEE       = errors.New("hub has no TEE to dispatch to")
-	ErrNoPolicySet = errors.New("hub has no policy set")
-	ErrNoStore     = errors.New("hub has no receipt store")
-	ErrNoVerifier  = errors.New("hub has no receipt verifier")
+	ErrNoTEE      = errors.New("hub has no TEE to dispatch to")
+	ErrNoRates    = errors.New("hub has no rate table")
+	ErrNoStore    = errors.New("hub has no receipt store")
+	ErrNoVerifier = errors.New("hub has no receipt verifier")
 )
 
 // Execution errors.
 var (
 	// ErrUnknownProvider means the Hub was asked to use a provider it has no
-	// policy for, and therefore no price for either.
-	ErrUnknownProvider = errors.New("no policy installed for provider")
+	// rate for. Rates are the market registry: a seller that has not published
+	// a price is a provider the Hub cannot dispatch to.
+	ErrUnknownProvider = errors.New("no rate published for provider")
 	// ErrQuotaExceeded means the tenant was refused before dispatch.
 	ErrQuotaExceeded = errors.New("tenant quota exhausted")
 	// ErrStreamMismatch means the receipt attests bytes other than the ones
@@ -49,10 +49,12 @@ type Config struct {
 	// TEE is the execution seam. Required.
 	TEE TEE
 
-	// Policies carries the provider-authored policies the Hub prices against.
-	// Required: without one the Hub cannot know what a provider charges, and
-	// guessing would quietly move pricing authority back to the Hub.
-	Policies *policy.Set
+	// Rates is the market price list, keyed by provider. Prices are seller
+	// reported commercial data maintained by the Hub — deliberately NOT part
+	// of the Provider Policy, which is now a Hub-predefined whitelist loaded
+	// into TEE deployment config. Required: without it the Hub cannot know
+	// what a provider charges or even which providers are on the market.
+	Rates map[string]RateCard
 
 	// Store persists the receipts a provider is entitled to audit. Required:
 	// a Hub that keeps no receipts removes the provider's only means of
@@ -77,8 +79,8 @@ type Config struct {
 	// charge, in basis points. 100 is 1%, 1000 is 10%, zero means the Hub takes
 	// no commission.
 	//
-	// Pricing authority on the provider side is unchanged: the ledger keeps
-	// the provider's revenue unchanged, and the commission is tracked as a
+	// Pricing authority on the seller side is unchanged: the ledger keeps the
+	// provider's revenue unchanged, and the commission is tracked as a
 	// separate total. The provider always earns exactly what its rate card says.
 	Commission uint64
 
@@ -95,7 +97,7 @@ type Config struct {
 // Hub turns a job into a settled charge and an auditable receipt.
 type Hub struct {
 	tee        TEE
-	policies   *policy.Set
+	rates      map[string]RateCard
 	store      Store
 	verify     func(proof.SignedReceipt) error
 	ledger     *Ledger
@@ -110,8 +112,8 @@ func New(cfg Config) (*Hub, error) {
 	if cfg.TEE == nil {
 		return nil, ErrNoTEE
 	}
-	if cfg.Policies == nil {
-		return nil, ErrNoPolicySet
+	if cfg.Rates == nil {
+		return nil, ErrNoRates
 	}
 	if cfg.Store == nil {
 		return nil, ErrNoStore
@@ -129,7 +131,7 @@ func New(cfg Config) (*Hub, error) {
 	}
 	return &Hub{
 		tee:        cfg.TEE,
-		policies:   cfg.Policies,
+		rates:      cfg.Rates,
 		store:      cfg.Store,
 		verify:     cfg.Verify,
 		ledger:     ledger,
@@ -173,7 +175,7 @@ func (h *Hub) Execute(ctx context.Context, tenant string, spec jobs.Spec, body [
 		return Outcome{}, fmt.Errorf("%w: tenant %q", ErrQuotaExceeded, tenant)
 	}
 
-	card, ok := h.policies.Get(spec.Provider)
+	card, ok := h.rates[spec.Provider]
 	if !ok {
 		return Outcome{}, fmt.Errorf("%w: %q", ErrUnknownProvider, spec.Provider)
 	}
@@ -194,7 +196,7 @@ func (h *Hub) Execute(ctx context.Context, tenant string, spec jobs.Spec, body [
 		return Outcome{Chunks: res.Chunks}, ErrStreamMismatch
 	}
 
-	charged, err := Price(card.RateCard, spec.DeclaredModel, res.Receipt.Receipt)
+	charged, err := Price(card, spec.DeclaredModel, res.Receipt.Receipt)
 	if err != nil {
 		return Outcome{Chunks: res.Chunks}, err
 	}
