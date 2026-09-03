@@ -42,7 +42,7 @@ func main() {
 		log.Fatalf("write tee identity: %v", err)
 	}
 
-	policies, err := shared.LoadPolicySet()
+	policies, err := shared.LoadPolicySetAll()
 	if err != nil {
 		log.Fatalf("load policy set: %v", err)
 	}

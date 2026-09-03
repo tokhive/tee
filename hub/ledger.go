@@ -15,6 +15,7 @@ type Ledger struct {
 	verified   int
 	settled    int
 	revenue    uint64
+	commission uint64
 	accounts   map[string]*providerAccount
 }
 
@@ -23,6 +24,7 @@ type providerAccount struct {
 	verified   int
 	settled    int
 	revenue    uint64
+	commission uint64
 }
 
 // NewLedger returns an empty ledger.
@@ -59,6 +61,16 @@ func (l *Ledger) NoteSettled(provider string, micros uint64) {
 	account.revenue += micros
 }
 
+// NoteCommission records the Hub's cut on a settled charge, in the same
+// provider-scoped micro-units as the charge it is taken from.
+func (l *Ledger) NoteCommission(provider string, micros uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.commission += micros
+	account := l.account(provider)
+	account.commission += micros
+}
+
 func (l *Ledger) account(provider string) *providerAccount {
 	account := l.accounts[provider]
 	if account == nil {
@@ -74,6 +86,7 @@ type ProviderAccount struct {
 	Verified   int
 	Settled    int
 	Revenue    uint64
+	Commission uint64
 }
 
 // Snapshot is a point-in-time copy of the ledger. Reading the counters
@@ -84,6 +97,7 @@ type Snapshot struct {
 	Verified   int
 	Settled    int
 	Revenue    uint64
+	Commission uint64
 	ByProvider map[string]ProviderAccount
 }
 
@@ -99,6 +113,7 @@ func (l *Ledger) Snapshot() Snapshot {
 			Verified:   account.verified,
 			Settled:    account.settled,
 			Revenue:    account.revenue,
+			Commission: account.commission,
 		}
 	}
 	return Snapshot{
@@ -106,6 +121,7 @@ func (l *Ledger) Snapshot() Snapshot {
 		Verified:   l.verified,
 		Settled:    l.settled,
 		Revenue:    l.revenue,
+		Commission: l.commission,
 		ByProvider: byProvider,
 	}
 }

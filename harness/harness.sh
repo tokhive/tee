@@ -304,6 +304,79 @@ else
 fi
 kill "$TEE_C_PID" 2>/dev/null; wait "$TEE_C_PID" 2>/dev/null
 
+# =====================================================================
+# S15: LOWEST-PRICE SCHEDULING + COMMISSION (C2).
+# A Hub user-facing API over a real TEE that egresses TWO providers
+# through an agent. Both serve the same model at different prices
+# (cheap-sim 0.30, openai-sim 1.00), so the scheduler must pick cheap-sim
+# for every request; the 10% commission must land on the buyer's bill while
+# the provider keeps its own price.
+# =====================================================================
+HUB_API_PORT=18085
+TEE_D=18098
+section "15. lowest-price scheduling + commission (C2): user API picks cheap-sim"
+
+echo "    writing two-provider agent map (both egress via agent A :$AGENT_A)"
+cat > "$SIM/agents15.json" <<EOF
+{
+  "openai-sim": {"agent_addr":"127.0.0.1:$AGENT_A"},
+  "cheap-sim":  {"agent_addr":"127.0.0.1:$AGENT_A"}
+}
+EOF
+
+echo "    starting real tee D on :$TEE_D with the two-provider map"
+"$BIN/tee" -addr "127.0.0.1:$TEE_D" -agents "$SIM/agents15.json" \
+  -seq "$SIM/seqstore-t15.json" > "$SIM/teeD.log" 2>&1 &
+TEE_D_PID=$!
+wait_for_port 127.0.0.1 "$TEE_D"
+
+echo "    starting the hub user-facing API on :$HUB_API_PORT (10% commission)"
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_D" -serve "127.0.0.1:$HUB_API_PORT" \
+  -host "127.0.0.1:$MP_PORT" -commission 1000 > "$SIM/hub-serve.log" 2>&1 &
+HUB_API_PID=$!
+wait_for_port 127.0.0.1 "$HUB_API_PORT"
+
+echo "    sending 3 chat requests for model sim-mock-0.5b:"
+for i in 1 2 3; do
+  curl -s --noproxy '*' -X POST "http://127.0.0.1:$HUB_API_PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' -H 'X-TokenHive-Key: tenant-t15' \
+    -d '{"model":"sim-mock-0.5b","messages":[{"role":"user","content":"hi"}],"stream":true}' \
+    > "$SIM/user-api-$i.out" 2>&1
+done
+
+echo "    assertion: every request served by cheap-sim (0.30), none by openai-sim (1.00):"
+cheap=$(grep -c 'provider="cheap-sim"' "$SIM/hub-serve.log" || true)
+dear=$(grep -c 'provider="openai-sim"' "$SIM/hub-serve.log" || true)
+if [ "$cheap" -ge 3 ] && [ "$dear" -eq 0 ]; then
+  echo "      OK: $cheap requests served by cheap-sim, $dear by openai-sim (scheduler picked the lowest price)"
+else
+  echo "      !! FAIL: cheap-sim=$cheap openai-sim=$dear, want cheap>=3 dear==0"
+fi
+
+echo "    assertion: user-facing stream terminated with data: [DONE]:"
+if grep -Fq 'data: [DONE]' "$SIM/user-api-1.out"; then
+  echo "      OK: SSE stream closed with the OpenAI [DONE] marker"
+else
+  echo "      !! FAIL: no [DONE] marker in the user stream"
+fi
+
+echo "    assertion: commission applied (seller 0.30 -> commission 0.03, buyer 0.33 at 10%):"
+if grep -q 'commission=0.03' "$SIM/hub-serve.log" && grep -q 'buyer=0.33' "$SIM/hub-serve.log"; then
+  echo "      OK: buyer billed 0.33 for a 0.30 seller price (10% commission)"
+else
+  echo "      !! FAIL: expected commission=0.03 and buyer=0.33"
+fi
+
+echo "    assertion: exactly 3 receipts stored under cheap-sim (cheap-sim is used only here):"
+cheap_receipts=$(ls "$SIM/receipts/cheap-sim"/*.cbor 2>/dev/null | wc -l | tr -d ' ')
+if [ "$cheap_receipts" -eq 3 ]; then
+  echo "      OK: $cheap_receipts receipts under cheap-sim"
+else
+  echo "      !! FAIL: expected 3 receipts under cheap-sim, got $cheap_receipts"
+fi
+
+kill "$TEE_D_PID" "$HUB_API_PID" 2>/dev/null; wait "$TEE_D_PID" "$HUB_API_PID" 2>/dev/null
+
 # --- cleanup -------------------------------------------------------------
 echo
 echo "==> stopping services"

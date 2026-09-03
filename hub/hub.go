@@ -73,6 +73,15 @@ type Config struct {
 	// stop a credential being drained should not be on unless asked for.
 	Quota *Quota
 
+	// Commission sets the fixed fraction the Hub takes over every settled
+	// charge, in basis points. 100 is 1%, 1000 is 10%, zero means the Hub takes
+	// no commission.
+	//
+	// Pricing authority on the provider side is unchanged: the ledger keeps
+	// the provider's revenue unchanged, and the commission is tracked as a
+	// separate total. The provider always earns exactly what its rate card says.
+	Commission uint64
+
 	// Clock returns the current time. Defaults to time.Now.
 	Clock func() time.Time
 
@@ -85,14 +94,15 @@ type Config struct {
 
 // Hub turns a job into a settled charge and an auditable receipt.
 type Hub struct {
-	tee      TEE
-	policies *policy.Set
-	store    Store
-	verify   func(proof.SignedReceipt) error
-	ledger   *Ledger
-	quota    *Quota
-	clock    func() time.Time
-	withhold func(uint64) bool
+	tee        TEE
+	policies   *policy.Set
+	store      Store
+	verify     func(proof.SignedReceipt) error
+	ledger     *Ledger
+	quota      *Quota
+	commission CommissionRate
+	clock      func() time.Time
+	withhold   func(uint64) bool
 }
 
 // New builds a Hub, refusing to construct one that would settle incorrectly.
@@ -118,14 +128,15 @@ func New(cfg Config) (*Hub, error) {
 		clock = time.Now
 	}
 	return &Hub{
-		tee:      cfg.TEE,
-		policies: cfg.Policies,
-		store:    cfg.Store,
-		verify:   cfg.Verify,
-		ledger:   ledger,
-		quota:    cfg.Quota,
-		clock:    clock,
-		withhold: cfg.Withhold,
+		tee:        cfg.TEE,
+		policies:   cfg.Policies,
+		store:      cfg.Store,
+		verify:     cfg.Verify,
+		ledger:     ledger,
+		quota:      cfg.Quota,
+		commission: CommissionRate{BasisPoints: cfg.Commission},
+		clock:      clock,
+		withhold:   cfg.Withhold,
 	}, nil
 }
 
@@ -141,6 +152,11 @@ type Outcome struct {
 	// Charged is what the provider earned, in the micro-units of its own rate
 	// card. Zero for anything the provider did not complete.
 	Charged uint64
+	// Commission is the Hub's cut on the charge, in the same micro-units. Zero
+	// when there is no commission or nothing was earned.
+	Commission uint64
+	// Buyer is what the buyer is billed: Charged plus Commission.
+	Buyer uint64
 	// Stored reports whether the receipt reached the provider's audit store.
 	Stored bool
 }
@@ -182,15 +198,25 @@ func (h *Hub) Execute(ctx context.Context, tenant string, spec jobs.Spec, body [
 	if err != nil {
 		return Outcome{Chunks: res.Chunks}, err
 	}
+	commission, err := h.commission.CommissionOn(charged)
+	if err != nil {
+		return Outcome{Chunks: res.Chunks}, err
+	}
+	buyer, ok := addChecked(charged, commission)
+	if !ok {
+		return Outcome{Chunks: res.Chunks}, fmt.Errorf("%w: charged %d plus commission %d",
+			ErrPriceOverflow, charged, commission)
+	}
 	h.ledger.NoteSettled(spec.Provider, charged)
+	h.ledger.NoteCommission(spec.Provider, commission)
 
 	seq := res.Receipt.Receipt.ProviderSeq
 	if h.withhold != nil && h.withhold(seq) {
-		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, Charged: charged}, nil
+		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, Charged: charged, Commission: commission, Buyer: buyer}, nil
 	}
 	if err := h.store.Put(spec.Provider, res.Receipt); err != nil {
-		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, Charged: charged},
+		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, Charged: charged, Commission: commission, Buyer: buyer},
 			fmt.Errorf("store receipt: %w", err)
 	}
-	return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, Charged: charged, Stored: true}, nil
+	return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, Charged: charged, Commission: commission, Buyer: buyer, Stored: true}, nil
 }

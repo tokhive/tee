@@ -33,9 +33,10 @@ import (
 // Default fixtures. The provider's own key signs the policy; the TEE only ever
 // verifies it.
 const (
-	providerName = "openai-sim"
-	providerHost = "127.0.0.1:18080"
-	providerPath = "/v1/chat/completions"
+	providerName  = "openai-sim"
+	providerCheap = "cheap-sim"
+	providerHost  = "127.0.0.1:18080"
+	providerPath  = "/v1/chat/completions"
 )
 
 // ConfigDir returns the simulation working directory. Override with
@@ -52,16 +53,18 @@ func ConfigDir() string {
 type Providers map[string]string
 
 // EnsureDefaults writes the fixture files if they are missing: the provider
-// credential, the provider's signing key, and a provider-signed policy the TEE
-// loads. The key is generated once and persisted, because the policy is signed
-// by it and a regenerated key would invalidate the policy already on disk.
+// credentials, the providers' signing keys, and a provider-signed policy per
+// provider that the TEE loads. Each key is generated once and persisted,
+// because the policy is signed by it and a regenerated key would invalidate
+// the policy already on disk.
 func EnsureDefaults() error {
 	dir := ConfigDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	if err := writeIfAbsent(filepath.Join(dir, "providers.json"), Providers{
-		providerName: "sk-sim-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+		providerName:  "sk-sim-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+		providerCheap: "sk-sim-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
 	}); err != nil {
 		return err
 	}
@@ -69,17 +72,33 @@ func EnsureDefaults() error {
 	if err != nil {
 		return err
 	}
-	// The policy is derived from the stable key, so it is safe to (re)write it
-	// whenever defaults are ensured.
-	signed, err := policy.SignPolicy(defaultPolicy(), key)
+	// primary provider
+	if err := writePolicy(providerName, providerPolicy(providerName), key); err != nil {
+		return err
+	}
+	// a second, cheaper provider so the harness can exercise lowest-price
+	// scheduling over two signed policies pointing at the same upstream.
+	if err := writePolicy(providerCheap, providerPolicy(providerCheap), key); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writePolicy encodes and writes a provider policy to its per-provider path.
+func writePolicy(provider string, p policy.Policy, key *ecdsa.PrivateKey) error {
+	signed, err := policy.SignPolicy(p, key)
 	if err != nil {
-		return fmt.Errorf("sign default policy: %w", err)
+		return fmt.Errorf("sign policy: %w", err)
 	}
 	enc, err := signed.EncodeCanonical()
 	if err != nil {
 		return fmt.Errorf("encode policy: %w", err)
 	}
-	if err := os.WriteFile(policyPath(), enc, 0o644); err != nil {
+	path := policyPathFor(provider)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("make policy dir: %w", err)
+	}
+	if err := os.WriteFile(path, enc, 0o644); err != nil {
 		return fmt.Errorf("write policy: %w", err)
 	}
 	return nil
@@ -87,6 +106,12 @@ func EnsureDefaults() error {
 
 func providerKeyPath() string { return filepath.Join(ConfigDir(), "provider_key.pem") }
 func policyPath() string      { return filepath.Join(ConfigDir(), "policy.cbor") }
+func policyPathFor(p string) string {
+	if p == providerName {
+		return policyPath()
+	}
+	return filepath.Join(ConfigDir(), "policies", p+".cbor")
+}
 
 func loadOrGenProviderKey() (*ecdsa.PrivateKey, error) {
 	if b, err := os.ReadFile(providerKeyPath()); err == nil {
@@ -112,41 +137,49 @@ func loadOrGenProviderKey() (*ecdsa.PrivateKey, error) {
 	return key, nil
 }
 
-// defaultPolicy is the whitelist the simulated TEE enforces. It is the real
-// policy.Policy type — the simulation loads it through the genuine
-// policy.Set, not a parallel hand-rolled structure.
-func defaultPolicy() policy.Policy {
+// providerPolicy is the whitelist the simulated TEE enforces for one provider.
+// It is the real policy.Policy type — the simulation loads it through the
+// genuine policy.Set, not a parallel hand-rolled structure. The two providers
+// differ only in price, so the Hub's lowest-price scheduler has something to
+// choose between; both point at the same upstream host.
+func providerPolicy(provider string) policy.Policy {
 	now := time.Now()
-	return policy.Policy{
-		Version:  policy.VersionV1,
-		Provider: providerName,
-		Hosts:    []string{providerHost},
-		Rules: []policy.Rule{
-			{Methods: []string{"POST"}, Path: providerPath, AllowStream: true, QueryKeys: []string{"fault"}},
-		},
-		Credential: policy.Credential{Header: "Authorization", Scheme: "Bearer"},
-		Limits: policy.Limits{
-			MaxResponseBytes: 1 << 20,
-			MaxBodyBytes:     1 << 20,
-			AllowedHeaders:   []string{"Content-Type"},
-		},
-		IssuedAt:  now.Unix(),
-		ExpiresAt: now.Add(365 * 24 * time.Hour).Unix(),
+	hosts := []string{providerHost}
+	rules := []policy.Rule{
+		{Methods: []string{"POST"}, Path: providerPath, AllowStream: true, QueryKeys: []string{"fault"}},
+	}
+	credential := policy.Credential{Header: "Authorization", Scheme: "Bearer"}
+	limits := policy.Limits{
+		MaxResponseBytes: 1 << 20,
+		MaxBodyBytes:     1 << 20,
+		AllowedHeaders:   []string{"Content-Type"},
+	}
 
-		// The provider's price, in the provider's own policy. The Hub reads it
-		// from here rather than carrying a table of its own: pricing authority
-		// is the provider's, and a policy hash on the receipt is what makes
-		// the charge reproducible.
-		//
-		// Per-request and per-model only. Volume pricing is covered by the hub
-		// package's unit tests and left at zero here so the harness's per-run
-		// totals stay readable.
-		RateCard: policy.RateCard{
-			PerRequestMicros: 1_000_000, // 1.00 unit per completed request
-			ModelPremiumMicros: map[string]uint64{
-				"sim-mock-large": 500_000, // 0.50 unit surcharge for the big model
-			},
-		},
+	// The provider's price, in the provider's own policy. The Hub reads it
+	// from here rather than carrying a table of its own: pricing authority is
+	// the provider's, and a policy hash on the receipt is what makes the charge
+	// reproducible. Per-request and per-model only; volume pricing is covered by
+	// the hub package's unit tests and left at zero so the harness totals stay
+	// readable.
+	card := policy.RateCard{PerRequestMicros: 1_000_000} // 1.00 unit
+	if provider == providerCheap {
+		card = policy.RateCard{PerRequestMicros: 300_000} // 0.30 unit — the one the scheduler wants
+	} else {
+		card.ModelPremiumMicros = map[string]uint64{
+			"sim-mock-large": 500_000, // 0.50 unit surcharge
+		}
+	}
+
+	return policy.Policy{
+		Version:    policy.VersionV1,
+		Provider:   provider,
+		Hosts:      hosts,
+		Rules:      rules,
+		Credential: credential,
+		Limits:     limits,
+		IssuedAt:   now.Unix(),
+		ExpiresAt:  now.Add(365 * 24 * time.Hour).Unix(),
+		RateCard:   card,
 	}
 }
 
@@ -164,6 +197,39 @@ func LoadPolicySet() (*policy.Set, error) {
 	set := policy.NewSet()
 	if err := set.Add(signed, time.Now()); err != nil {
 		return nil, fmt.Errorf("install policy: %w", err)
+	}
+	return set, nil
+}
+
+// LoadPolicySetAll loads every installed provider policy: the legacy single
+// policy.cbor (the primary provider) plus any per-provider file under
+// policies/. The Hub and the real TEE use this so that multi-provider scenarios
+// (lowest-price scheduling) see the whole supply; summaries that keep using
+// LoadPolicySet are unaffected because the primary provider's policy is always
+// included first.
+func LoadPolicySetAll() (*policy.Set, error) {
+	set := policy.NewSet()
+	now := time.Now()
+
+	paths := []string{policyPath()}
+	extra, err := filepath.Glob(filepath.Join(ConfigDir(), "policies", "*.cbor"))
+	if err != nil {
+		return nil, fmt.Errorf("list policies dir: %w", err)
+	}
+	paths = append(paths, extra...)
+
+	for _, path := range paths {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read policy %s: %w", path, err)
+		}
+		signed, err := policy.DecodeSignedPolicy(b)
+		if err != nil {
+			return nil, fmt.Errorf("decode policy %s: %w", path, err)
+		}
+		if err := set.Add(signed, now); err != nil {
+			return nil, fmt.Errorf("install policy %s: %w", path, err)
+		}
 	}
 	return set, nil
 }

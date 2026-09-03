@@ -39,6 +39,7 @@ const microsPerUnit = 1_000_000
 
 func main() {
 	teeURL := flag.String("tee", "http://127.0.0.1:18090", "TEE base URL")
+	serveAddr := flag.String("serve", "", "run as the OpenAI-compatible HTTP service on this address (empty = one-shot CLI mode)")
 	provider := flag.String("provider", "openai-sim", "provider name")
 	host := flag.String("host", "127.0.0.1:18080", "provider host:port (must match policy)")
 	model := flag.String("model", "sim-mock-0.5b", "declared model (opaque to TEE)")
@@ -46,6 +47,7 @@ func main() {
 	tenant := flag.String("tenant", "tenant-demo-001", "tenant the request is attributed to for quota")
 	maxBytes := flag.Uint64("max", 1<<20, "MaxResponseBytes cap sent to the TEE (bytes)")
 	n := flag.Int("n", 1, "number of requests to send")
+	commission := flag.Int("commission", 0, "Hub commission in basis points (100 = 1%)")
 	drop := flag.Int("drop", 0, "withhold the receipt with this ProviderSeq from the store (0 = none)")
 	quotaLimit := flag.Int64("quota", 0, "max requests per tenant per window (0 = unlimited)")
 	quotaWindow := flag.Duration("window", time.Minute, "quota window")
@@ -59,7 +61,7 @@ func main() {
 		return
 	}
 
-	policies, err := shared.LoadPolicySet()
+	policies, err := shared.LoadPolicySetAll()
 	if err != nil {
 		log.Fatalf("load policies: %v", err)
 	}
@@ -73,15 +75,29 @@ func main() {
 	}
 
 	h, err := hub.New(hub.Config{
-		TEE:      &hub.HTTPTEE{URL: *teeURL + "/v1/execute"},
-		Policies: policies,
-		Store:    store,
-		Verify:   verifyReceipt,
-		Quota:    quota,
-		Withhold: withholdSeq(*drop),
+		TEE:        &hub.HTTPTEE{URL: *teeURL + "/v1/execute"},
+		Policies:   policies,
+		Store:      store,
+		Verify:     verifyReceipt,
+		Quota:      quota,
+		Commission: uint64(*commission),
+		Withhold:   withholdSeq(*drop),
 	})
 	if err != nil {
 		log.Fatalf("build hub: %v", err)
+	}
+
+	// Resident user-facing mode: one OpenAI-compatible HTTP endpoint that routes
+	// by model through the lowest-price scheduler.
+	if *serveAddr != "" {
+		runServe(h, serveConfig{
+			Addr:  *serveAddr,
+			Host:  *host,
+			Path:  "/v1/chat/completions",
+			Query: *query,
+			Max:   *maxBytes,
+		})
+		return
 	}
 
 	body := []byte(`{"model":"` + *model + `","messages":[{"role":"user","content":"你是谁？"}],"stream":true}`)
@@ -89,7 +105,7 @@ func main() {
 
 	for i := 1; i <= *n; i++ {
 		fmt.Printf("\n=== request %d/%d ===\n", i, *n)
-		spec, err := buildSpec(*provider, *host, *model, *query, body, *maxBytes)
+		spec, err := buildSpec(*provider, *host, *model, *query, body, *maxBytes, *tenant)
 		if err != nil {
 			logf("build spec: %v", err)
 			continue
@@ -109,9 +125,10 @@ func main() {
 
 func printOutcome(outcome hub.Outcome) {
 	r := outcome.Receipt.Receipt
-	fmt.Printf("[receipt] provider=%s seq=%d requestBytes=%d responseBytes=%d chunks=%d status=%d completion=%s charged=%.2f\n",
+	fmt.Printf("[receipt] provider=%s seq=%d requestBytes=%d responseBytes=%d chunks=%d status=%d completion=%s charged=%.2f commission=%.2f buyer=%.2f\n",
 		r.Provider, r.ProviderSeq, r.RequestBytes, r.ResponseBytes, r.ChunkCount,
-		r.StatusCode, r.Completion, float64(outcome.Charged)/microsPerUnit)
+		r.StatusCode, r.Completion, float64(outcome.Charged)/microsPerUnit,
+		float64(outcome.Commission)/microsPerUnit, float64(outcome.Buyer)/microsPerUnit)
 	if !outcome.Stored {
 		fmt.Printf("[withhold] receipt seq=%d kept out of the provider's store\n", r.ProviderSeq)
 	}
@@ -125,9 +142,12 @@ func printLedger(ledger *hub.Ledger) {
 	fmt.Printf("receipts settled   : %d\n", snap.Settled)
 	fmt.Printf("provider revenue   : %.2f units (price is provider-owned)\n",
 		float64(snap.Revenue)/microsPerUnit)
+	fmt.Printf("hub commission     : %.2f units\n",
+		float64(snap.Commission)/microsPerUnit)
 	for provider, account := range snap.ByProvider {
-		fmt.Printf("  %s : %d settled, %.2f units\n",
-			provider, account.Settled, float64(account.Revenue)/microsPerUnit)
+		fmt.Printf("  %s : %d settled, %.2f units (+%.2f commission)\n",
+			provider, account.Settled, float64(account.Revenue)/microsPerUnit,
+			float64(account.Commission)/microsPerUnit)
 	}
 }
 
@@ -184,7 +204,7 @@ func withholdSeq(seq int) func(uint64) bool {
 	return func(seq uint64) bool { return seq == target }
 }
 
-func buildSpec(provider, host, model, query string, body []byte, maxBytes uint64) (jobs.Spec, error) {
+func buildSpec(provider, host, model, query string, body []byte, maxBytes uint64, tenant string) (jobs.Spec, error) {
 	jobID := make([]byte, jobs.JobIDLength)
 	if _, err := rand.Read(jobID); err != nil {
 		return jobs.Spec{}, err
@@ -208,7 +228,7 @@ func buildSpec(provider, host, model, query string, body []byte, maxBytes uint64
 		MaxResponseBytes: maxBytes,
 		Stream:           true,
 		DeclaredModel:    model,
-		TenantRef:        []byte("tenant-demo-001"),
+		TenantRef:        []byte(tenant),
 	}, nil
 }
 
