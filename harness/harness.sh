@@ -62,10 +62,14 @@ wait_for_port() {
 
 MP_PORT=18080
 TEE_PORT=18090
+STATS_PORT=18081
 
 # --- start mock provider (real TLS via generated test CA) -----------------
+# A separate plain-HTTP stats listener (/stats, /reset) peers at the provider's
+# connection count WITHOUT dialing a connection of its own, so a probe can never
+# perturb the very number it reports.
 echo "==> starting mockprovider (TLS) on :$MP_PORT"
-"$BIN/mockprovider" -addr "127.0.0.1:$MP_PORT" -tls > "$SIM/mockprovider.log" 2>&1 &
+"$BIN/mockprovider" -addr "127.0.0.1:$MP_PORT" -tls -stats-addr "127.0.0.1:$STATS_PORT" > "$SIM/mockprovider.log" 2>&1 &
 MP_PID=$!
 wait_for_port 127.0.0.1 "$MP_PORT"
 
@@ -239,6 +243,66 @@ if grep -Fqa "different bytes" "$SIM/hub-big.log"; then
   echo "      !! FAIL: Hub could not reconcile the attested stream (hash mismatch)"
 fi
 echo "    (credential still never on the agent wire — see scenario 9's tap)"
+
+# =====================================================================
+# S13: CONNECTION RESIDENCY (C1).
+# A fresh real TEE through an agent; zero the upstream's TCP counter; N
+# requests must reuse exactly ONE connection; a mid-stream disconnect then
+# forces a fresh dial (counter +1) and leaves the next receipt normal.
+# =====================================================================
+TEE_C=18097
+# --noproxy '*' : the sim shell carries an HTTP_PROXY env var that would route a
+# query for the local stats listener through the user's proxy and receive
+# nothing back; the 127.0.0.1 probe must always be direct.
+section "13. connection residency (C1): N requests, ONE upstream TCP connection"
+curl -s --noproxy '*' "http://127.0.0.1:$STATS_PORT/reset" > /dev/null   # clean baseline
+echo "    starting fresh real tee C on :$TEE_C, egress via agent A (no pooled conn)"
+"$BIN/tee" -addr "127.0.0.1:$TEE_C" -agent "127.0.0.1:$AGENT_A" -seq "$SIM/seqstore-teec.json" > "$SIM/teeC.log" 2>&1 &
+TEE_C_PID=$!
+wait_for_port 127.0.0.1 "$TEE_C"
+
+conns() { curl -s --noproxy '*' "http://127.0.0.1:$STATS_PORT/stats" | python3 -c "import json,sys;print(json.load(sys.stdin)['new_conns'])"; }
+
+base=$(conns)
+echo "    baseline new_conns=$base (expect 0)"
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_C" -n 5 > "$SIM/hub-resident.log" 2>&1
+after5=$(conns)
+echo "    after 5 requests new_conns=$after5 (expect exactly 1 resident TLS session)"
+if [ "$after5" -eq $((base+1)) ]; then
+  echo "      OK: 5 requests reused 1 TCP connection"
+else
+  echo "      !! FAIL: expected $((base+1)), got $after5 (connection not resident)"
+fi
+
+echo "    injecting a mid-stream disconnect (fault=truncate); channel must be discarded:"
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_C" -query "fault=truncate" > "$SIM/hub-trunc.log" 2>&1
+if grep -q "completion=truncated" "$SIM/hub-trunc.log"; then
+  echo "      OK: truncate receipt (completion=truncated)"
+else
+  echo "      !! FAIL: expected completion=truncated"
+fi
+aftertr=$(conns)
+echo "    after truncate new_conns=$aftertr (expect $after5: reuse, no dial)"
+if [ "$aftertr" -eq "$after5" ]; then
+  echo "      OK: truncate reused the resident conn, then discarded it"
+else
+  echo "      !! FAIL: expected $after5, got $aftertr"
+fi
+
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_C" -n 1 > "$SIM/hub-redial.log" 2>&1
+afterred=$(conns)
+echo "    after the next request new_conns=$afterred (expect $((aftertr+1)): a fresh dial)"
+if [ "$afterred" -eq $((aftertr+1)) ]; then
+  echo "      OK: discarded channel forced a new TCP connection"
+else
+  echo "      !! FAIL: expected $((aftertr+1)), got $afterred"
+fi
+if grep -q "completion=complete" "$SIM/hub-redial.log"; then
+  echo "      OK: post-recovery receipt is normal (completion=complete)"
+else
+  echo "      !! FAIL: expected a normal complete receipt"
+fi
+kill "$TEE_C_PID" 2>/dev/null; wait "$TEE_C_PID" 2>/dev/null
 
 # --- cleanup -------------------------------------------------------------
 echo

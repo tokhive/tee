@@ -26,9 +26,14 @@ var ErrNoTransport = errors.New("no transport configured")
 // transport that quietly "helps" would desynchronise the two.
 type Request struct {
 	Method string
-	Host   string
-	Path   string
-	Query  string
+	// Provider names which provider's network egress this request must ride.
+	// The data path keys its connection pool by (Provider, Host): two providers
+	// hitting the same host still egress through their own agents, so upstream
+	// always sees the source IP of the provider whose credential is being spent.
+	Provider string
+	Host     string
+	Path     string
+	Query    string
 	// Headers is the exact header set to put on the wire. The TEE has already
 	// merged the caller's allowed headers with the injected credential.
 	Headers map[string]string

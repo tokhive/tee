@@ -34,19 +34,28 @@ func startAgent(t *testing.T, cfg AgentConfig) string {
 	return ln.Addr().String()
 }
 
-// tunneledTransport builds an HTTP transport whose TCP connections run
-// through the agent at agentAddr.
-func tunneledTransport(t *testing.T, agentAddr string, auth *transport.SOCKS5Auth) *transport.HTTP {
+// tunneledTransport builds a ChannelManager whose connections run through the
+// agent at agentAddr. Provider "tunnel" is the registry key that routes through
+// this agent, so every Do below sets Request.Provider to it.
+func tunneledTransport(t *testing.T, agentAddr string, auth *transport.SOCKS5Auth) *transport.ChannelManager {
 	t.Helper()
-	tr, err := transport.New(transport.Config{
+	ep := transport.Endpoint{AgentAddr: agentAddr}
+	if auth != nil {
+		ep.Username = auth.Username
+		ep.Password = auth.Password
+	}
+	reg := transport.NewRegistry()
+	reg.Set("tunnel", ep)
+	cm, err := transport.NewChannelManager(transport.ChannelConfig{
 		Scheme:         "http",
 		AllowPlaintext: true,
-		DialContext:    transport.SOCKS5Dialer(agentAddr, auth),
+		Endpoints:      reg,
 	})
 	if err != nil {
-		t.Fatalf("transport.New: %v", err)
+		t.Fatalf("NewChannelManager: %v", err)
 	}
-	return tr
+	t.Cleanup(func() { _ = cm.Close() })
+	return cm
 }
 
 func TestAgentRelaysSSEStream(t *testing.T) {
@@ -72,11 +81,12 @@ func TestAgentRelaysSSEStream(t *testing.T) {
 	var chunks []string
 	resp, err := tr.Do(context.Background(),
 		tee.Request{
-			Method:  "POST",
-			Host:    target,
-			Path:    "/v1/chat/completions",
-			Headers: map[string]string{"Authorization": "Bearer shared-credential"},
-			Body:    []byte(`{"stream":true}`),
+			Method:   "POST",
+			Provider: "tunnel",
+			Host:     target,
+			Path:     "/v1/chat/completions",
+			Headers:  map[string]string{"Authorization": "Bearer shared-credential"},
+			Body:     []byte(`{"stream":true}`),
 		},
 		func(chunk []byte) error {
 			chunks = append(chunks, string(chunk))
@@ -117,9 +127,10 @@ func TestAgentRefusesTargetOutsideAllowlist(t *testing.T) {
 
 	_, err := tr.Do(context.Background(),
 		tee.Request{
-			Method: "GET",
-			Host:   strings.TrimPrefix(forbidden.URL, "http://"),
-			Path:   "/v1/models",
+			Method:   "GET",
+			Provider: "tunnel",
+			Host:     strings.TrimPrefix(forbidden.URL, "http://"),
+			Path:     "/v1/models",
 		},
 		func([]byte) error { return nil })
 	if !errors.Is(err, transport.ErrSOCKS5ConnectRefused) {
@@ -143,7 +154,7 @@ func TestAgentAuthenticates(t *testing.T) {
 	t.Run("correct credentials pass", func(t *testing.T) {
 		tr := tunneledTransport(t, agentAddr, &transport.SOCKS5Auth{Username: "tee-node-1", Password: "correct-horse"})
 		_, err := tr.Do(context.Background(),
-			tee.Request{Method: "GET", Host: target, Path: "/v1/models"},
+			tee.Request{Method: "GET", Provider: "tunnel", Host: target, Path: "/v1/models"},
 			func([]byte) error { return nil })
 		if err != nil {
 			t.Fatalf("Do: %v", err)
@@ -153,7 +164,7 @@ func TestAgentAuthenticates(t *testing.T) {
 	t.Run("wrong password is refused", func(t *testing.T) {
 		tr := tunneledTransport(t, agentAddr, &transport.SOCKS5Auth{Username: "tee-node-1", Password: "battery"})
 		_, err := tr.Do(context.Background(),
-			tee.Request{Method: "GET", Host: target, Path: "/v1/models"},
+			tee.Request{Method: "GET", Provider: "tunnel", Host: target, Path: "/v1/models"},
 			func([]byte) error { return nil })
 		if !errors.Is(err, transport.ErrSOCKS5AuthFailed) {
 			t.Fatalf("error = %v, want ErrSOCKS5AuthFailed", err)
@@ -163,7 +174,7 @@ func TestAgentAuthenticates(t *testing.T) {
 	t.Run("no credentials are refused", func(t *testing.T) {
 		tr := tunneledTransport(t, agentAddr, nil)
 		_, err := tr.Do(context.Background(),
-			tee.Request{Method: "GET", Host: target, Path: "/v1/models"},
+			tee.Request{Method: "GET", Provider: "tunnel", Host: target, Path: "/v1/models"},
 			func([]byte) error { return nil })
 		if !errors.Is(err, transport.ErrSOCKS5MethodRejected) {
 			t.Fatalf("error = %v, want ErrSOCKS5MethodRejected", err)

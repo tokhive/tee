@@ -281,6 +281,7 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc) (*Res
 
 	request := Request{
 		Method:           job.Spec.Method,
+		Provider:         job.Spec.Provider,
 		Host:             job.Spec.Host,
 		Path:             job.Spec.Path,
 		Query:            job.Spec.Query,

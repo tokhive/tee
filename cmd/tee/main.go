@@ -25,7 +25,8 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:18090", "listen address")
-	agentAddr := flag.String("agent", "", "Provider Agent address; empty dials the provider directly over TLS")
+	agentAddr := flag.String("agent", "", "Provider Agent address applied to every provider; empty means use -agents")
+	agentsFile := flag.String("agents", "", "per-provider endpoint map (JSON: {provider: {agent_addr,...}})")
 	seqPath := flag.String("seq", "", "ProviderSeq store file (default <simdir>/seqstore.json)")
 	flag.Parse()
 
@@ -55,24 +56,38 @@ func main() {
 		creds.Set(p, tok)
 	}
 
-	// Transport: real TLS to the provider, optionally tunneled through a
-	// SOCKS5 Provider Agent. The TLS session terminates inside the TEE either
-	// way, so the credential never exists on a wire the agent controls.
+	// Endpoint registry: which provider egresses through which companionship Agent.
+	// The connection-resident data path keys its pool by (provider, host) and
+	// dials through this table, so "provider P's source IP" is pinned to P's own
+	// Agent regardless of how many other providers share the same upstream.
+	registry := transport.NewRegistry()
+	if *agentsFile != "" {
+		if err := registry.LoadEndpointsFile(*agentsFile); err != nil {
+			log.Fatalf("load agent endpoints: %v", err)
+		}
+	} else if *agentAddr != "" {
+		// Legacy single-agent mode: route every provider through this one Agent.
+		for _, p := range policies.Providers() {
+			registry.Set(p, transport.Endpoint{AgentAddr: *agentAddr})
+		}
+	}
+
+	// Data path: real TLS to the provider through explicitly-managed resident
+	// connections. The TLS session terminates inside the TEE either way, so the
+	// credential never exists on a wire the agent controls.
 	tlsConfig, err := shared.LoadCAPool()
 	if err != nil {
 		log.Fatalf("load CA pool: %v", err)
 	}
-	trCfg := transport.Config{
+	cm, err := transport.NewChannelManager(transport.ChannelConfig{
 		Scheme:          "https",
+		Endpoints:       registry,
 		TLSClientConfig: &tls.Config{RootCAs: tlsConfig},
-	}
-	if *agentAddr != "" {
-		trCfg.DialContext = transport.SOCKS5Dialer(*agentAddr, nil)
-	}
-	tr, err := transport.New(trCfg)
+	})
 	if err != nil {
-		log.Fatalf("build transport: %v", err)
+		log.Fatalf("build channel manager: %v", err)
 	}
+	defer cm.Close()
 
 	if *seqPath == "" {
 		*seqPath = filepath.Join(shared.ConfigDir(), "seqstore.json")
@@ -90,7 +105,7 @@ func main() {
 	svc, err := tee.NewService(tee.Config{
 		Policies:    policies,
 		Credentials: creds,
-		Transport:   tr,
+		Transport:   cm,
 		Signer:      signer,
 		Seq:         store,
 	})

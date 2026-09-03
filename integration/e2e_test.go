@@ -101,11 +101,15 @@ func e2eStack(t *testing.T, target string, srv *httptest.Server) *tee.Service {
 	go func() { _ = agent.Serve(ln) }()
 	t.Cleanup(func() { _ = agent.Close() })
 
-	// The TEE's outbound HTTP, egressing through the agent's tunnel.
-	outbound, err := transport.New(transport.Config{
+	// The TEE's connection-resident data path, egressing through the agent's
+	// tunnel. The agent is bound to provider "openai", so every job for that
+	// provider rides a resident connection out of the agent.
+	registry := transport.NewRegistry()
+	registry.Set("openai", transport.Endpoint{AgentAddr: ln.Addr().String()})
+	outbound, err := transport.NewChannelManager(transport.ChannelConfig{
 		Scheme:         "http",
 		AllowPlaintext: true,
-		DialContext:    transport.SOCKS5Dialer(ln.Addr().String(), nil),
+		Endpoints:      registry,
 	})
 	if err != nil {
 		t.Fatalf("new transport: %v", err)
