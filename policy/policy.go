@@ -1,6 +1,5 @@
-// Package policy defines the TokenHive provider policy: the signed,
-// provider-authored rules that bound what a job may ask an AI provider to do
-// with a shared credential.
+// Package policy defines the TokenHive whitelist: the rules that bound what a
+// job may ask an AI provider to do with a shared credential.
 //
 // A job spec describes what to do with a credential. It says nothing about what
 // that credential is allowed to be used for — and since the Hub authors every
@@ -10,13 +9,20 @@
 //
 // The policy is therefore not defence in depth. It is the only thing that
 // stands between the Hub and a credential the Hub is not allowed to see, and
-// the only constraint on the Hub that survives the User trusting it. It is
-// written by whoever contributes the credential, signed by them, and loaded
-// into the TEE, which then refuses any job that steps outside it.
+// the only constraint on the Hub that survives the User trusting it.
 //
-// Policies are canonically encoded and hashed like every other signed
-// TokenHive structure, so a policy hash is a stable reference a receipt or an
-// audit log can point at.
+// Who authors the policy changed with the connection-resident design: it is a
+// Hub-predefined document that ships with the TEE's deployment config, not a
+// per-provider signature the seller must rotate. The TEE loads it at startup
+// (policy.Set.Install), binds its hash into the enclave attestation
+// measurement, and refuses any job that steps outside it. The legacy signed
+// form — a provider key over the same structure — remains supported through
+// SignPolicy / VerifySignedPolicy / Set.Add as a compatibility path for
+// deployments that want an extra authorship layer.
+//
+// Policies are canonically encoded and hashed like every other TokenHive
+// structure, so a policy hash is a stable reference a receipt or an audit log
+// can point at.
 package policy
 
 import (
@@ -158,9 +164,14 @@ func (p Policy) Hash() ([32]byte, error) {
 	return out, nil
 }
 
-// Validate checks structural correctness, including that the embedded signing
-// key is a usable P-256 public key. It does not check the validity window (use
-// ValidateAt) or the signature (use VerifySignedPolicy).
+// Validate checks structural correctness. It does not check the validity window
+// (use ValidateAt) or the signature (use VerifySignedPolicy).
+//
+// The ProviderKey is optional at this level: TokenHive's policy is a
+// Hub-predefined whitelist loaded from TEE deployment config, so a policy need
+// not carry a provider signing key at all. When one IS present it must be a
+// usable P-256 key — that keeps the legacy signed-policy path honest without
+// forcing the deployment path to invent a key it does not use.
 func (p Policy) Validate() error {
 	if p.Version != VersionV1 {
 		return fmt.Errorf("%w: %d", ErrUnsupportedVersion, p.Version)
@@ -217,8 +228,10 @@ func (p Policy) Validate() error {
 		return fmt.Errorf("%w: length %d outside [%d,%d]",
 			ErrInvalidNonce, len(p.Nonce), MinNonceLength, MaxNonceLength)
 	}
-	if err := validateSigningKey(p.ProviderKey); err != nil {
-		return err
+	if len(p.ProviderKey) > 0 {
+		if err := validateSigningKey(p.ProviderKey); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 )
@@ -54,10 +55,9 @@ func ConfigDir() string {
 type Providers map[string]string
 
 // EnsureDefaults writes the fixture files if they are missing: the provider
-// credentials, the providers' signing keys, a provider-signed whitelist policy
-// per provider that the TEE loads, and the Hub's seller-reported rate table.
-// Each key is generated once and persisted, because the policy is signed by it
-// and a regenerated key would invalidate the policy already on disk.
+// credentials, a Hub-predefined whitelist policy per provider (NO provider
+// signature — it is deployment config, not a provider-authored document), and
+// the Hub's seller-reported rate table.
 func EnsureDefaults() error {
 	dir := ConfigDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -72,17 +72,13 @@ func EnsureDefaults() error {
 	if err := writeIfAbsent(filepath.Join(dir, "rates.json"), DefaultRates()); err != nil {
 		return err
 	}
-	key, err := loadOrGenProviderKey()
-	if err != nil {
-		return err
-	}
 	// primary provider
-	if err := writePolicy(providerName, providerPolicy(providerName), key); err != nil {
+	if err := writePolicy(providerName, providerPolicy(providerName)); err != nil {
 		return err
 	}
 	// a second, cheaper provider so the harness can exercise lowest-price
-	// scheduling over two signed policies pointing at the same upstream.
-	if err := writePolicy(providerCheap, providerPolicy(providerCheap), key); err != nil {
+	// scheduling over two policies pointing at the same upstream.
+	if err := writePolicy(providerCheap, providerPolicy(providerCheap)); err != nil {
 		return err
 	}
 	return nil
@@ -114,13 +110,12 @@ func LoadRates() (Rates, error) {
 	return rates, nil
 }
 
-// writePolicy encodes and writes a provider policy to its per-provider path.
-func writePolicy(provider string, p policy.Policy, key *ecdsa.PrivateKey) error {
-	signed, err := policy.SignPolicy(p, key)
-	if err != nil {
-		return fmt.Errorf("sign policy: %w", err)
-	}
-	enc, err := signed.EncodeCanonical()
+// writePolicy encodes and writes a Hub-predefined whitelist policy to its
+// per-provider path. The policy is NOT signed: pricing no longer lives in the
+// policy (it is Hub-side rates.json) and the whitelist itself is deployment
+// config, whose integrity the TEE binds into its attestation measurement.
+func writePolicy(provider string, p policy.Policy) error {
+	enc, err := p.EncodeCanonical()
 	if err != nil {
 		return fmt.Errorf("encode policy: %w", err)
 	}
@@ -134,8 +129,7 @@ func writePolicy(provider string, p policy.Policy, key *ecdsa.PrivateKey) error 
 	return nil
 }
 
-func providerKeyPath() string { return filepath.Join(ConfigDir(), "provider_key.pem") }
-func policyPath() string      { return filepath.Join(ConfigDir(), "policy.cbor") }
+func policyPath() string { return filepath.Join(ConfigDir(), "policy.cbor") }
 func policyPathFor(p string) string {
 	if p == providerName {
 		return policyPath()
@@ -143,42 +137,18 @@ func policyPathFor(p string) string {
 	return filepath.Join(ConfigDir(), "policies", p+".cbor")
 }
 
-func loadOrGenProviderKey() (*ecdsa.PrivateKey, error) {
-	if b, err := os.ReadFile(providerKeyPath()); err == nil {
-		block, _ := pem.Decode(b)
-		if block != nil {
-			if key, err := x509.ParseECPrivateKey(block.Bytes); err == nil {
-				return key, nil
-			}
-		}
-	}
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-	der, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(providerKeyPath(),
-		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), 0o600); err != nil {
-		return nil, err
-	}
-	return key, nil
-}
-
-// providerPolicy is the whitelist the simulated TEE enforces for one provider.
-// It is the real policy.Policy type — the simulation loads it through the
-// genuine policy.Set, not a parallel hand-rolled structure. The two providers
-// differ only in price, so the Hub's lowest-price scheduler has something to
-// choose between; both point at the same upstream host.
+// providerPolicy is the Hub-predefined whitelist the simulated TEE enforces
+// for one provider. It is the real policy.Policy type — the simulation loads
+// it through the genuine policy.Set, not a parallel hand-rolled structure.
+// The two providers differ only in price, so the Hub's lowest-price scheduler
+// has something to choose between; both point at the same upstream host.
 //
 // The whitelisted paths mirror the Hub's user-facing routes: the OpenAI chat
 // completions endpoint, the OpenAI Responses endpoint, the Anthropic messages
 // endpoint, and the streaming-session endpoint. In a real deployment these
 // paths would live on different hosts per provider (api.openai.com vs
 // api.anthropic.com); the simulation runs all shapes behind one mock host so
-// a single signed policy per provider covers all four routes.
+// a single Hub-predefined whitelist per provider covers all four routes.
 func providerPolicy(provider string) policy.Policy {
 	now := time.Now()
 	hosts := []string{providerHost}
@@ -215,30 +185,31 @@ func providerPolicy(provider string) policy.Policy {
 	}
 }
 
-// LoadPolicySet reads the provider-signed policy and installs it into a
-// policy.Set, verifying the signature exactly as the real TEE would.
+// LoadPolicySet reads the primary provider's whitelist policy and installs it
+// into a policy.Set. The policy is a Hub-predefined deployment document, not a
+// provider signature, so it is installed via the unsigned path — the same
+// Install call the real TEE uses for its deployment config.
 func LoadPolicySet() (*policy.Set, error) {
 	b, err := os.ReadFile(policyPath())
 	if err != nil {
 		return nil, fmt.Errorf("read policy: %w", err)
 	}
-	signed, err := policy.DecodeSignedPolicy(b)
-	if err != nil {
+	var p policy.Policy
+	if err := canonical.Unmarshal(b, &p); err != nil {
 		return nil, fmt.Errorf("decode policy: %w", err)
 	}
 	set := policy.NewSet()
-	if err := set.Add(signed, time.Now()); err != nil {
+	if err := set.Install(p, time.Now()); err != nil {
 		return nil, fmt.Errorf("install policy: %w", err)
 	}
 	return set, nil
 }
 
-// LoadPolicySetAll loads every installed provider policy: the legacy single
-// policy.cbor (the primary provider) plus any per-provider file under
-// policies/. The Hub and the real TEE use this so that multi-provider scenarios
-// (lowest-price scheduling) see the whole supply; summaries that keep using
-// LoadPolicySet are unaffected because the primary provider's policy is always
-// included first.
+// LoadPolicySetAll loads every installed provider policy: the primary
+// policy.cbor plus any per-provider file under policies/. The real TEE uses
+// this so that multi-provider scenarios see the whole supply; summaries that
+// keep using LoadPolicySet are unaffected because the primary provider's
+// policy is always included first.
 func LoadPolicySetAll() (*policy.Set, error) {
 	set := policy.NewSet()
 	now := time.Now()
@@ -250,18 +221,20 @@ func LoadPolicySetAll() (*policy.Set, error) {
 	}
 	paths = append(paths, extra...)
 
+	policies := make([]policy.Policy, 0, len(paths))
 	for _, path := range paths {
 		b, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("read policy %s: %w", path, err)
 		}
-		signed, err := policy.DecodeSignedPolicy(b)
-		if err != nil {
+		var p policy.Policy
+		if err := canonical.Unmarshal(b, &p); err != nil {
 			return nil, fmt.Errorf("decode policy %s: %w", path, err)
 		}
-		if err := set.Add(signed, now); err != nil {
-			return nil, fmt.Errorf("install policy %s: %w", path, err)
-		}
+		policies = append(policies, p)
+	}
+	if err := set.InstallAll(policies, now); err != nil {
+		return nil, fmt.Errorf("install policies: %w", err)
 	}
 	return set, nil
 }

@@ -275,11 +275,6 @@ func TestPolicyValidateRejectsMalformed(t *testing.T) {
 			change: func(p *Policy) { p.IssuedAt = 0 },
 		},
 		{
-			name:   "empty signing key",
-			want:   ErrInvalidSigningKey,
-			change: func(p *Policy) { p.ProviderKey = nil },
-		},
-		{
 			name:   "signing key is not a key",
 			want:   ErrInvalidSigningKey,
 			change: func(p *Policy) { p.ProviderKey = []byte("not a key") },
@@ -324,6 +319,27 @@ func TestPolicyValidateAtWindow(t *testing.T) {
 	after := now.Add(24 * time.Hour)
 	if err := policy.ValidateAt(after); !errors.Is(err, ErrPolicyExpired) {
 		t.Fatalf("after window: error = %v, want %v", err, ErrPolicyExpired)
+	}
+}
+
+// TestUnsignedPolicyIsStructurallyValid locks the deployment posture: the
+// Hub-predefined whitelist is not signed by the provider, so a Policy with an
+// empty ProviderKey must pass structure validation. Signatures are optional at
+// this layer — they live on the SignedPolicy wrapper, which keeps the legacy
+// path intact without forcing the deployment path to invent a key.
+func TestUnsignedPolicyIsStructurallyValid(t *testing.T) {
+	policy := openAIPolicy(t, testKey(t))
+	policy.ProviderKey = nil
+	if err := policy.ValidateAt(now); err != nil {
+		t.Fatalf("unsigned deployment policy failed validation: %v", err)
+	}
+	// And its hash is stable and usable as the receipt's PolicyHash anchor.
+	hash, err := policy.Hash()
+	if err != nil {
+		t.Fatalf("hash unsigned policy: %v", err)
+	}
+	if hash == [32]byte{} {
+		t.Fatal("unsigned policy hashed to zero")
 	}
 }
 
@@ -767,6 +783,64 @@ func TestPolicySetLoadIsAtomic(t *testing.T) {
 	}
 	if set.Len() != 1 {
 		t.Fatalf("Len() = %d, want 1", set.Len())
+	}
+}
+
+func TestPolicySetInstallUnsignedDeploymentPolicy(t *testing.T) {
+	set := NewSet()
+
+	// The deployment path: a Hub-predefined whitelist with no provider key.
+	unsigned := openAIPolicy(t, testKey(t))
+	unsigned.ProviderKey = nil
+	if err := set.Install(unsigned, now); err != nil {
+		t.Fatalf("install unsigned policy: %v", err)
+	}
+	if set.Len() != 1 {
+		t.Fatalf("Len() = %d, want 1", set.Len())
+	}
+
+	decision, err := set.Authorize(spec(t, nil))
+	if err != nil {
+		t.Fatalf("authorize deployment-installed policy: %v", err)
+	}
+	if decision.Provider != "openai" {
+		t.Fatalf("provider = %q, want openai", decision.Provider)
+	}
+	// The PolicyHash anchor still works — the receipt binds to the policy hash,
+	// which is independent of whether a signature wrapper was ever present.
+	got, _ := set.Get("openai")
+	if got.Provider != "openai" {
+		t.Fatalf("Get() provider = %q", got.Provider)
+	}
+}
+
+func TestPolicySetInstallAllIsAtomic(t *testing.T) {
+	set := NewSet()
+	good := openAIPolicy(t, testKey(t))
+	good.ProviderKey = nil
+
+	// Structurally invalid after the fact, so InstallAll must fail partway and
+	// install nothing.
+	bad := openAIPolicy(t, testKey(t))
+	bad.Provider = "anthropic"
+	bad.Limits.MaxResponseBytes = 0
+
+	before := set.Len()
+	if err := set.InstallAll([]Policy{good, bad}, now); err == nil {
+		t.Fatal("InstallAll accepted an invalid entry")
+	}
+	if set.Len() != before {
+		t.Fatalf("InstallAll partially applied: Len() = %d, want %d", set.Len(), before)
+	}
+
+	other := openAIPolicy(t, testKey(t))
+	other.Provider = "anthropic"
+	other.ProviderKey = nil
+	if err := set.InstallAll([]Policy{good, other}, now); err != nil {
+		t.Fatalf("InstallAll: %v", err)
+	}
+	if set.Len() != 2 {
+		t.Fatalf("Len() = %d, want 2", set.Len())
 	}
 }
 

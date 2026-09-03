@@ -15,32 +15,66 @@ import (
 // precisely what an attacker would replay once a provider has tightened it.
 var ErrPolicyRollback = errors.New("policy update is older than the installed policy")
 
+// entry is one installed policy. Signature may be nil: TokenHive policies are
+// Hub-predefined whitelists loaded from TEE deployment config (see Install),
+// and the signed form is the legacy/compatibility path (see Add).
+type entry struct {
+	policy Policy
+}
+
 // Set holds the active policy for each provider.
 //
-// A set only ever contains verified policies: Add verifies the signature before
-// installing, so a policy that reaches Authorize cannot have been tampered with
-// in transit or forged by the Hub. That property is what lets the TEE treat the
-// set as trusted input despite it arriving over an untrusted channel.
+// Policies reach the set through one of two doors:
+//
+//   - Install / InstallAll (the deployment door): a policy is loaded from the
+//     TEE's deployment config as-is. It is trusted because it was placed in
+//     the configuration by the operator and its hash is bound into the TEE's
+//     attestation measurement — not because of a per-provider signature.
+//   - Add (the compatibility door): a provider-signed policy is verified
+//     before it is installed. This is the legacy path, kept so that providers
+//     who want an extra layer of authorship can still sign.
+//
+// Either way a policy that reaches Authorize is structurally valid and
+// currently in effect.
 type Set struct {
 	mu       sync.RWMutex
-	policies map[string]SignedPolicy
+	policies map[string]entry
 }
 
 // NewSet returns an empty policy set.
 func NewSet() *Set {
-	return &Set{policies: make(map[string]SignedPolicy)}
+	return &Set{policies: make(map[string]entry)}
 }
 
-// Add verifies a signed policy and installs it for its provider.
-//
-// A provider can be updated — credentials are rotated and scopes change — but
-// the replacement must be issued at or after the policy it replaces.
+// Add verifies a signed policy and installs it for its provider. It is the
+// compatibility door: the signed form predates Hub-predefined whitelists, and
+// deployments that still carry provider signatures can keep using it. Most
+// callers should use Install instead.
 func (s *Set) Add(signed SignedPolicy, now time.Time) error {
 	if err := VerifySignedPolicy(signed, now); err != nil {
 		return err
 	}
+	return s.install(signed.Policy, now)
+}
 
-	provider := signed.Policy.Provider
+// Install installs a Hub-predefined whitelist policy without a provider
+// signature. This is the deployment path: the policy arrives with the TEE's
+// deployment config, and its integrity is anchored by the attestation
+// measurement (the policy-set hash is bound into the enclave evidence), not by
+// a per-provider key.
+func (s *Set) Install(policy Policy, now time.Time) error {
+	if err := policy.ValidateAt(now); err != nil {
+		return err
+	}
+	return s.install(policy, now)
+}
+
+// install does the structural and rollback checks and stores the policy.
+func (s *Set) install(policy Policy, now time.Time) error {
+	if err := policy.ValidateAt(now); err != nil {
+		return err
+	}
+	provider := policy.Provider
 	if provider == "" {
 		return errors.New("policy has no provider")
 	}
@@ -48,39 +82,70 @@ func (s *Set) Add(signed SignedPolicy, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if current, ok := s.policies[provider]; ok && signed.Policy.IssuedAt < current.Policy.IssuedAt {
+	if current, ok := s.policies[provider]; ok && policy.IssuedAt < current.policy.IssuedAt {
 		return fmt.Errorf("%w: incoming %d, installed %d",
-			ErrPolicyRollback, signed.Policy.IssuedAt, current.Policy.IssuedAt)
+			ErrPolicyRollback, policy.IssuedAt, current.policy.IssuedAt)
 	}
-	s.policies[provider] = signed
+	s.policies[provider] = entry{policy: policy}
 	return nil
 }
 
-// Load verifies and installs a batch of policies. It installs all of them or
-// none: a partial policy set would leave some providers silently unserviceable,
-// and a half-applied update is harder to reason about than a failed one.
+// Load verifies and installs a batch of signed policies. It installs all of
+// them or none: a partial policy set would leave some providers silently
+// unserviceable, and a half-applied update is harder to reason about than a
+// failed one. Prefer InstallAll for deployment config.
 func (s *Set) Load(signed []SignedPolicy, now time.Time) error {
-	staged := make(map[string]SignedPolicy, len(signed))
-	for _, entry := range signed {
-		if err := VerifySignedPolicy(entry, now); err != nil {
+	staged := make(map[string]entry, len(signed))
+	for _, signedEntry := range signed {
+		if err := VerifySignedPolicy(signedEntry, now); err != nil {
 			return err
 		}
-		staged[entry.Policy.Provider] = entry
+		staged[signedEntry.Policy.Provider] = entryFromPolicy(signedEntry.Policy)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for provider, entry := range staged {
-		if current, ok := s.policies[provider]; ok && entry.Policy.IssuedAt < current.Policy.IssuedAt {
+	for provider, candidate := range staged {
+		if current, ok := s.policies[provider]; ok && candidate.policy.IssuedAt < current.policy.IssuedAt {
 			return fmt.Errorf("%w: %q incoming %d, installed %d",
-				ErrPolicyRollback, provider, entry.Policy.IssuedAt, current.Policy.IssuedAt)
+				ErrPolicyRollback, provider, candidate.policy.IssuedAt, current.policy.IssuedAt)
 		}
 	}
-	for provider, entry := range staged {
-		s.policies[provider] = entry
+	for provider, candidate := range staged {
+		s.policies[provider] = candidate
 	}
 	return nil
 }
+
+// InstallAll installs a batch of Hub-predefined whitelist policies without
+// signatures, atomically. It is the deployment-path counterpart of Load: the
+// TEE loads its entire policy configuration at startup from the deployment
+// config, and the set must be all-or-nothing so a partial install cannot
+// leave some providers silently unserviceable.
+func (s *Set) InstallAll(policies []Policy, now time.Time) error {
+	staged := make(map[string]entry, len(policies))
+	for _, p := range policies {
+		if err := p.ValidateAt(now); err != nil {
+			return err
+		}
+		staged[p.Provider] = entryFromPolicy(p)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for provider, candidate := range staged {
+		if current, ok := s.policies[provider]; ok && candidate.policy.IssuedAt < current.policy.IssuedAt {
+			return fmt.Errorf("%w: %q incoming %d, installed %d",
+				ErrPolicyRollback, provider, candidate.policy.IssuedAt, current.policy.IssuedAt)
+		}
+	}
+	for provider, candidate := range staged {
+		s.policies[provider] = candidate
+	}
+	return nil
+}
+
+func entryFromPolicy(p Policy) entry { return entry{policy: p} }
 
 // Remove drops the policy for a provider, immediately denying its jobs.
 func (s *Set) Remove(provider string) {
@@ -94,11 +159,11 @@ func (s *Set) Get(provider string) (Policy, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	signed, ok := s.policies[provider]
+	e, ok := s.policies[provider]
 	if !ok {
 		return Policy{}, false
 	}
-	return signed.Policy, true
+	return e.policy, true
 }
 
 // Providers returns the installed provider names in sorted order.
@@ -124,23 +189,23 @@ func (s *Set) Len() int {
 // Authorize resolves the job's provider and checks the spec against its policy.
 func (s *Set) Authorize(spec jobs.Spec) (Decision, error) {
 	s.mu.RLock()
-	signed, ok := s.policies[spec.Provider]
+	e, ok := s.policies[spec.Provider]
 	s.mu.RUnlock()
 
 	if !ok {
 		return Decision{}, fmt.Errorf("%w: %q", ErrUnknownProvider, spec.Provider)
 	}
-	return signed.Policy.Authorize(spec)
+	return e.policy.Authorize(spec)
 }
 
 // AuthorizeAt is Authorize plus both validity windows.
 func (s *Set) AuthorizeAt(spec jobs.Spec, now time.Time) (Decision, error) {
 	s.mu.RLock()
-	signed, ok := s.policies[spec.Provider]
+	e, ok := s.policies[spec.Provider]
 	s.mu.RUnlock()
 
 	if !ok {
 		return Decision{}, fmt.Errorf("%w: %q", ErrUnknownProvider, spec.Provider)
 	}
-	return signed.Policy.AuthorizeAt(spec, now)
+	return e.policy.AuthorizeAt(spec, now)
 }
