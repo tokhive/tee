@@ -70,18 +70,27 @@ func main() {
 		log.Fatalf("ensure defaults: %v", err)
 	}
 
-	epoch, err := buildEpoch(*platformName)
+	// The whitelist is part of this enclave's measured configuration: load it
+	// before the epoch so its hash can be bound into the attestation evidence.
+	// A receipt then proves not just "the trusted image ran" but "the trusted
+	// image ran with exactly this policy set".
+	policies, err := shared.LoadPolicySetAll()
+	if err != nil {
+		log.Fatalf("load policy set: %v", err)
+	}
+	policySetHash, err := policies.Hash()
+	if err != nil {
+		log.Fatalf("hash policy set: %v", err)
+	}
+
+	epoch, err := buildEpoch(*platformName, policySetHash)
 	if err != nil {
 		log.Fatalf("build platform epoch: %v", err)
 	}
 	if err := shared.WriteTEEIdentity(epoch.Identity()); err != nil {
 		log.Fatalf("write tee identity: %v", err)
 	}
-
-	policies, err := shared.LoadPolicySetAll()
-	if err != nil {
-		log.Fatalf("load policy set: %v", err)
-	}
+	log.Printf("policy set hash bound into attestation evidence: %x", policySetHash)
 
 	creds := tee.NewStaticCredentials()
 	providers, err := shared.LoadProviders()

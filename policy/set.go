@@ -1,6 +1,8 @@
 package policy
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sort"
@@ -9,6 +11,12 @@ import (
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 )
+
+// PolicySetHashDomain separates the policy-set digest from every other hash in
+// the TokenHive stack. It is the value a TEE binds into its attestation
+// measurement so a verifier can confirm which whitelist configuration the
+// enclave was deployed with.
+const PolicySetHashDomain = "TokenHive.PolicySet.v1"
 
 // ErrPolicyRollback means an update tried to replace a policy with an older
 // one. Rollbacks are refused because an expired, over-permissive policy is
@@ -208,4 +216,42 @@ func (s *Set) AuthorizeAt(spec jobs.Spec, now time.Time) (Decision, error) {
 		return Decision{}, fmt.Errorf("%w: %q", ErrUnknownProvider, spec.Provider)
 	}
 	return e.policy.AuthorizeAt(spec, now)
+}
+
+// Hash returns one deterministic digest for the whole policy set: the
+// per-provider policy hashes, sorted by provider name, folded together with a
+// domain separator. This is the value the TEE binds into its attestation
+// measurement — changing any whitelist entry, adding a provider, or removing
+// one all change the set hash, so a verifier can tell exactly which policy
+// configuration an enclave was deployed with.
+//
+// An empty set is not an error (an operator may deploy with no policies, which
+// means no provider can serve); it hashes to a fixed digest of nothing.
+func (s *Set) Hash() ([32]byte, error) {
+	s.mu.RLock()
+	providers := make([]string, 0, len(s.policies))
+	byProvider := make(map[string]Policy, len(s.policies))
+	for provider, e := range s.policies {
+		providers = append(providers, provider)
+		byProvider[provider] = e.policy
+	}
+	s.mu.RUnlock()
+	sort.Strings(providers)
+
+	h := sha256.New()
+	h.Write([]byte(PolicySetHashDomain))
+	var count [8]byte
+	binary.BigEndian.PutUint64(count[:], uint64(len(providers)))
+	h.Write(count[:])
+	for _, provider := range providers {
+		hash, err := byProvider[provider].Hash()
+		if err != nil {
+			return [32]byte{}, fmt.Errorf("hash policy for %q: %w", provider, err)
+		}
+		h.Write(hash[:])
+	}
+
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out, nil
 }

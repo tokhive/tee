@@ -118,17 +118,24 @@ func main() {
 		log.Fatalf("ensure defaults: %v", err)
 	}
 
-	epoch, err := simulated.NewEpoch()
+	policies, err := shared.LoadPolicySet()
+	if err != nil {
+		log.Fatalf("load policy set: %v", err)
+	}
+	policySetHash, err := policies.Hash()
+	if err != nil {
+		log.Fatalf("hash policy set: %v", err)
+	}
+
+	// Like the real TEE, the A-layer fake binds its loaded whitelist into the
+	// simulated attestation evidence, so receipts it produces are comparable
+	// to the real TEE's.
+	epoch, err := simulated.NewDeploymentEpoch(policySetHash)
 	if err != nil {
 		log.Fatalf("create sim epoch: %v", err)
 	}
 	if err := shared.WriteTEEIdentity(epoch.Identity()); err != nil {
 		log.Fatalf("write tee identity: %v", err)
-	}
-
-	policies, err := shared.LoadPolicySet()
-	if err != nil {
-		log.Fatalf("load policy set: %v", err)
 	}
 
 	creds := tee.NewStaticCredentials()
