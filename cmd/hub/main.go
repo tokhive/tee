@@ -164,6 +164,15 @@ func runAudit(store *hub.ReceiptStore, provider string) {
 	}
 	fmt.Printf("verified %d/%d receipts for provider %q\n", report.Verified, report.Total, provider)
 
+	// The deployment binding: receipts issued by a TEE deployed with the
+	// current whitelist carry that policy-set hash in their evidence. When the
+	// local deployment config exists, compare; receipts whose evidence lacks
+	// the binding (issued by an unbound epoch) are flagged as warnings.
+	expectedHash, haveDeployment := localPolicySetHash()
+	if haveDeployment {
+		fmt.Printf("expected deployment policy-set hash: %x\n", expectedHash)
+	}
+
 	// Evidence is checked separately from the signature: a receipt can be
 	// perfectly signed and still point at an attestation that no longer
 	// resolves, which is a cache problem rather than a forgery.
@@ -177,6 +186,13 @@ func runAudit(store *hub.ReceiptStore, provider string) {
 			fmt.Printf("  [WARN] seq=%d: identity: %v\n", signed.Receipt.ProviderSeq, err)
 			continue
 		}
+		if haveDeployment {
+			if err := simulated.CheckEvidenceForDeployment(id, expectedHash); err != nil {
+				fmt.Printf("  [WARN] seq=%d: deployment binding: %v\n", signed.Receipt.ProviderSeq, err)
+				continue
+			}
+			continue
+		}
 		if err := simulated.CheckEvidence(id); err != nil {
 			fmt.Printf("  [WARN] seq=%d: evidence: %v\n", signed.Receipt.ProviderSeq, err)
 		}
@@ -188,6 +204,23 @@ func runAudit(store *hub.ReceiptStore, provider string) {
 	}
 	fmt.Printf(">>> GAP DETECTED: provider was used at least %d times but is missing receipts %v\n",
 		report.MaxSeq, report.Missing)
+}
+
+// localPolicySetHash loads the deployment policy config the way cmd/tee does
+// and returns the hash a correctly-deployed TEE would have bound into its
+// evidence. haveDeployment is false when no policy config exists locally, in
+// which case callers fall back to binding-free evidence checks.
+func localPolicySetHash() (hash [32]byte, haveDeployment bool) {
+	set, err := shared.LoadPolicySetAll()
+	if err != nil {
+		return hash, false
+	}
+	hash, err = set.Hash()
+	if err != nil {
+		logf("hash policy set: %v", err)
+		return hash, false
+	}
+	return hash, true
 }
 
 // verifyReceipt checks a receipt's signature and attestation. The allowed

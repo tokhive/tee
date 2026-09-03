@@ -118,7 +118,7 @@ func main() {
 		log.Fatalf("ensure defaults: %v", err)
 	}
 
-	policies, err := shared.LoadPolicySet()
+	policies, err := shared.LoadPolicySetAll()
 	if err != nil {
 		log.Fatalf("load policy set: %v", err)
 	}
