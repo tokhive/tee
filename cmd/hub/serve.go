@@ -40,9 +40,25 @@ type userRoute struct {
 	Done bool
 }
 
-// userRoutes is the Hub's user-facing API surface.
+// userRoutes is the Hub's user-facing API surface. Every route is a byte
+// relay of the same shape — read the body, let the model field drive provider
+// selection, forward the bytes upstream, stream the upstream's bytes back —
+// and differs only in which provider path it addresses and whether the
+// user-visible stream needs an OpenAI chat-style [DONE] appended.
+//
+// The three formats are served verbatim, not translated:
+//   - /v1/chat/completions  (OpenAI Chat Completions)  — terminator: [DONE]
+//   - /v1/messages          (Anthropic Messages)       — terminator: message_stop
+//   - /v1/responses         (OpenAI Responses)         — terminator: response.completed
+//
+// All three carry the model name in the JSON body's top-level "model" field,
+// which is the only part the Hub reads; the rest of the request travels
+// untouched, and the response bytes the user sees are exactly the bytes the
+// provider produced.
 var userRoutes = []userRoute{
 	{Path: "/v1/chat/completions", Done: true},
+	{Path: "/v1/messages", Done: false},
+	{Path: "/v1/responses", Done: false},
 }
 
 // runServe exposes the Hub as a resident OpenAI-compatible HTTP service. It
@@ -138,7 +154,7 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	log.Printf("chat model=%q path=%s tenant=%q provider=%q chunks=%d charged=%.2f commission=%.2f buyer=%.2f err=%v",
+	log.Printf("api model=%q path=%s tenant=%q provider=%q chunks=%d charged=%.2f commission=%.2f buyer=%.2f err=%v",
 		req.Model, c.route.Path, tenant, outcome.Receipt.Receipt.Provider, chunks,
 		float64(outcome.Charged)/microsPerUnit, float64(outcome.Commission)/microsPerUnit,
 		float64(outcome.Buyer)/microsPerUnit, err)

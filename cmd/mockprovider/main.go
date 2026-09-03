@@ -1,7 +1,7 @@
-// Command mockprovider is a stand-in for an LLM provider (OpenAI-compatible
-// chat completions endpoint). It returns a FIXED set of SSE chunks and never
-// invokes a real model. It exists purely so the simulation has something to
-// talk to over real TLS.
+// Command mockprovider is a stand-in for an LLM provider. It serves three
+// wire shapes — OpenAI chat completions, Anthropic messages, and OpenAI
+// Responses — all returning FIXED SSE streams and never invoking a real model.
+// It exists purely so the simulation has something to talk to over real TLS.
 //
 // Fault injection (query param ?fault=...):
 //
@@ -95,14 +95,42 @@ func handleReset(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// mockChunks is the fixed, deterministic response stream. Because it never
-// changes, the TEE's StreamHash is stable and the Hub can make golden
-// assertions against it.
-var mockChunks = []string{
+// chatChunks is the fixed, deterministic OpenAI chat-completions stream.
+// Because it never changes, the TEE's StreamHash is stable and the Hub can
+// make golden assertions against it.
+var chatChunks = []string{
 	`{"id":"chatcmpl-sim1","object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant","content":"你好"}}]}`,
 	`{"id":"chatcmpl-sim1","object":"chat.completion.chunk","choices":[{"delta":{"content":"，我是由 TokenHive 托管的"}}]}`,
 	`{"id":"chatcmpl-sim1","object":"chat.completion.chunk","choices":[{"delta":{"content":"模拟模型，不调用任何真实大模型。"}}]}`,
 	`{"id":"chatcmpl-sim1","object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+}
+
+// responsesChunks is the fixed, deterministic OpenAI Responses stream. Each
+// element is one SSE event's data payload (the wire carries `data: <json>`);
+// the terminal response.completed event is what an SDK treats as the end of
+// the stream, so no extra [DONE] is needed.
+var responsesChunks = []string{
+	`{"type":"response.created","response":{"id":"resp_sim1","object":"response","status":"in_progress","model":"sim-mock-0.5b"}}`,
+	`{"type":"response.output_text.delta","delta":"你好，我是由 TokenHive 托管的"}`,
+	`{"type":"response.output_text.delta","delta":"模拟模型，不调用任何真实大模型。"}`,
+	`{"type":"response.completed","response":{"id":"resp_sim1","object":"response","status":"completed"}}`,
+}
+
+// anthropicMessagesChunks is the fixed, deterministic Anthropic Messages
+// stream. Anthropic SSE frames carry an event: name and a data: payload; the
+// terminal message_stop event ends the stream, so no extra [DONE] is needed.
+var anthropicMessagesChunks = [][2]string{
+	{"message_start", `{"type":"message_start","message":{"id":"msg_sim1","type":"message","role":"assistant","model":"sim-claude-haiku","content":[]}}`},
+	{"content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"你好，我是由 TokenHive 托管的模拟 Claude 模型。"}}`},
+	{"message_stop", `{"type":"message_stop"}`},
+}
+
+// sseFrame renders one OpenAI-style SSE event: `data: <payload>\n\n`.
+func sseFrame(payload string) string { return "data: " + payload + "\n\n" }
+
+// anthropicFrame renders one Anthropic SSE event: `event: <name>\ndata: <payload>\n\n`.
+func anthropicFrame(name, payload string) string {
+	return "event: " + name + "\ndata: " + payload + "\n\n"
 }
 
 func main() {
@@ -112,11 +140,13 @@ func main() {
 	flag.Parse()
 
 	// The provider's one HTTP server, whose connections are the thing being
-	// counted. /v1/chat/completions is the fixed SSE endpoint; /v1/realtime is
-	// the streaming-session (WebSocket) endpoint whose frames scenario 14
-	// exercises.
+	// counted. /v1/chat/completions, /v1/messages, and /v1/responses are the
+	// fixed SSE endpoints the Hub's user API relays; /v1/realtime is the
+	// streaming-session (WebSocket) endpoint scenario 14 exercises.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", handleChat)
+	mux.HandleFunc("/v1/messages", handleMessages)
+	mux.HandleFunc("/v1/responses", handleResponses)
 	mux.HandleFunc("/v1/realtime", handleRealtime)
 	srv := &http.Server{Addr: *addr, Handler: mux, ConnState: trackConn}
 
@@ -152,9 +182,17 @@ func main() {
 	log.Fatal(srv.ListenAndServe())
 }
 
-func handleChat(w http.ResponseWriter, r *http.Request) {
-	fault := r.URL.Query().Get("fault")
-	switch fault {
+// streamHandler writes one fixed SSE body, applying the fault switch. frames
+// are the fully-rendered SSE events; emit may be nil.
+type streamHandler struct {
+	// fault is the ?fault= query value; empty means the normal fixed stream.
+	fault string
+	// frames returns the wire frames to stream on the normal path.
+	frames func() []string
+}
+
+func (h streamHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch h.fault {
 	case "401":
 		http.Error(w, `{"error":"invalid api key"}`, http.StatusUnauthorized)
 		return
@@ -191,9 +229,10 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 
-	for i, chunk := range mockChunks {
-		if fault == "truncate" && i >= 1 {
-			// Send one chunk, then violently close the connection to simulate
+	frames := h.frames()
+	for i, frame := range frames {
+		if h.fault == "truncate" && i >= 1 {
+			// Send one frame, then violently close the connection to simulate
 			// the provider dropping mid-stream.
 			if hijacker, ok := w.(http.Hijacker); ok {
 				if conn, _, herr := hijacker.Hijack(); herr == nil {
@@ -202,11 +241,47 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		fmt.Fprintf(w, "data: %s\n\n", chunk)
+		fmt.Fprint(w, frame)
 		if flusher != nil {
 			flusher.Flush()
 		}
 	}
+}
+
+func handleChat(w http.ResponseWriter, r *http.Request) {
+	handler := streamHandler{fault: r.URL.Query().Get("fault")}
+	handler.frames = func() []string {
+		frames := make([]string, 0, len(chatChunks))
+		for _, chunk := range chatChunks {
+			frames = append(frames, sseFrame(chunk))
+		}
+		return frames
+	}
+	handler.ServeHTTP(w, r)
+}
+
+func handleMessages(w http.ResponseWriter, r *http.Request) {
+	handler := streamHandler{fault: r.URL.Query().Get("fault")}
+	handler.frames = func() []string {
+		frames := make([]string, 0, len(anthropicMessagesChunks))
+		for _, pair := range anthropicMessagesChunks {
+			frames = append(frames, anthropicFrame(pair[0], pair[1]))
+		}
+		return frames
+	}
+	handler.ServeHTTP(w, r)
+}
+
+func handleResponses(w http.ResponseWriter, r *http.Request) {
+	handler := streamHandler{fault: r.URL.Query().Get("fault")}
+	handler.frames = func() []string {
+		frames := make([]string, 0, len(responsesChunks))
+		for _, chunk := range responsesChunks {
+			frames = append(frames, sseFrame(chunk))
+		}
+		return frames
+	}
+	handler.ServeHTTP(w, r)
 }
 
 // realtimeUpgrader turns /v1/realtime into a WebSocket for streaming sessions.

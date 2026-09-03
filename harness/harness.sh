@@ -18,6 +18,8 @@
 #   agent killed mid-req   -> the request fails cleanly, never hangs/panics
 #   epoch rotation         -> a TEE restarted with a new key still verifies
 #   oversize response      -> the TEE truncates at its MaxResponseBytes cap
+#   anthropic + responses  -> Hub relays /v1/messages and /v1/responses
+#                             verbatim, each with its own terminal event
 #
 # Nothing here talks to a real model or a real enclave. The Hub's business
 # rules (pricing, quota, ledger, gap detection) are unit tested in-process
@@ -419,6 +421,81 @@ else
 fi
 
 kill "$TEE_D_PID" "$HUB_API_PID" 2>/dev/null; wait "$TEE_D_PID" "$HUB_API_PID" 2>/dev/null
+
+# =====================================================================
+# S16: ANTHROPIC MESSAGES + OPENAI RESPONSES USER-FACING APIS.
+# The Hub relays two more wire shapes verbatim over the same scheduler:
+# /v1/messages (Anthropic: event: message_start ... message_stop) and
+# /v1/responses (OpenAI Responses: response.created ... response.completed).
+# Unlike chat completions these carry their own terminal events, so the Hub
+# must NOT append [DONE]. Both must pick cheap-sim (lowest price) and store
+# one receipt each.
+# =====================================================================
+section "16. Anthropic /v1/messages + OpenAI /v1/responses user APIs"
+
+echo "    (fresh tee + store so receipt counts are unambiguous)"
+rm -rf "$SIM/receipts"
+"$BIN/tee" -addr "127.0.0.1:$TEE_D" -agents "$SIM/agents15.json" \
+  -seq "$SIM/seqstore-t16.json" > "$SIM/teeD16.log" 2>&1 &
+TEE_D16_PID=$!
+wait_for_port 127.0.0.1 "$TEE_D"
+
+echo "    starting the hub user-facing API on :$HUB_API_PORT"
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_D" -serve "127.0.0.1:$HUB_API_PORT" \
+  -host "127.0.0.1:$MP_PORT" > "$SIM/hub-serve16.log" 2>&1 &
+HUB_API16_PID=$!
+wait_for_port 127.0.0.1 "$HUB_API_PORT"
+
+echo "    POST /v1/messages (Anthropic format, model claude-sim):"
+curl -s --noproxy '*' -X POST "http://127.0.0.1:$HUB_API_PORT/v1/messages" \
+  -H 'Content-Type: application/json' -H 'X-TokenHive-Key: tenant-t16' \
+  -d '{"model":"claude-sim-haiku","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}' \
+  > "$SIM/user-api-messages.out" 2>&1
+
+echo "    POST /v1/responses (OpenAI Responses format):"
+curl -s --noproxy '*' -X POST "http://127.0.0.1:$HUB_API_PORT/v1/responses" \
+  -H 'Content-Type: application/json' -H 'X-TokenHive-Key: tenant-t16' \
+  -d '{"model":"sim-mock-0.5b","input":"hi","stream":true}' \
+  > "$SIM/user-api-responses.out" 2>&1
+
+echo "    assertion: Anthropic framing relayed with its own terminal event:"
+if grep -Fq 'event: message_start' "$SIM/user-api-messages.out" \
+   && grep -Fq 'event: message_stop' "$SIM/user-api-messages.out"; then
+  echo "      OK: Anthropic SSE framing (message_start...message_stop) relayed"
+else
+  echo "      !! FAIL: expected Anthropic message_start/message_stop events"
+fi
+
+echo "    assertion: OpenAI Responses framing relayed with response.completed:"
+if grep -Fq 'response.completed' "$SIM/user-api-responses.out"; then
+  echo "      OK: Responses framing (response.created...response.completed) relayed"
+else
+  echo "      !! FAIL: expected a response.completed terminal event"
+fi
+
+echo "    assertion: no [DONE] glued onto the non-chat streams:"
+if grep -Fq '[DONE]' "$SIM/user-api-messages.out" || grep -Fq '[DONE]' "$SIM/user-api-responses.out"; then
+  echo "      !! FAIL: non-chat stream should carry its own terminator, no [DONE]"
+else
+  echo "      OK: no foreign [DONE] marker on Anthropic/Responses streams"
+fi
+
+echo "    assertion: both requests served by cheap-sim and each stored a receipt:"
+if grep -q 'path=/v1/messages .*provider="cheap-sim"' "$SIM/hub-serve16.log" \
+   && grep -q 'path=/v1/responses .*provider="cheap-sim"' "$SIM/hub-serve16.log"; then
+  echo "      OK: scheduler picked cheap-sim for both new routes"
+else
+  echo "      !! FAIL: expected cheap-sim on /v1/messages and /v1/responses"
+  grep 'path=/v1/' "$SIM/hub-serve16.log"
+fi
+messages_receipts=$(ls "$SIM/receipts/cheap-sim"/*.cbor 2>/dev/null | wc -l | tr -d ' ')
+if [ "$messages_receipts" -eq 2 ]; then
+  echo "      OK: 2 receipts stored under cheap-sim (one per request)"
+else
+  echo "      !! FAIL: expected 2 receipts under cheap-sim, got $messages_receipts"
+fi
+
+kill "$TEE_D16_PID" "$HUB_API16_PID" 2>/dev/null; wait "$TEE_D16_PID" "$HUB_API16_PID" 2>/dev/null
 
 # --- cleanup -------------------------------------------------------------
 echo

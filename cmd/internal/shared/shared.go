@@ -142,11 +142,25 @@ func loadOrGenProviderKey() (*ecdsa.PrivateKey, error) {
 // genuine policy.Set, not a parallel hand-rolled structure. The two providers
 // differ only in price, so the Hub's lowest-price scheduler has something to
 // choose between; both point at the same upstream host.
+//
+// The whitelisted paths mirror the Hub's user-facing routes: the OpenAI chat
+// completions endpoint, the OpenAI Responses endpoint, the Anthropic messages
+// endpoint, and the streaming-session endpoint. In a real deployment these
+// paths would live on different hosts per provider (api.openai.com vs
+// api.anthropic.com); the simulation runs all shapes behind one mock host so
+// a single signed policy per provider covers all four routes.
 func providerPolicy(provider string) policy.Policy {
 	now := time.Now()
 	hosts := []string{providerHost}
 	rules := []policy.Rule{
 		{Methods: []string{"POST"}, Path: providerPath, AllowStream: true, QueryKeys: []string{"fault"}},
+		// The OpenAI Responses API: a streaming endpoint served by the same
+		// mock host, whitelisted so /v1/responses user requests can dispatch
+		// to these providers.
+		{Methods: []string{"POST"}, Path: "/v1/responses", AllowStream: true, QueryKeys: []string{"fault"}},
+		// The Anthropic Messages API: same pattern, so /v1/messages user
+		// requests (model: claude-*) can dispatch to these providers.
+		{Methods: []string{"POST"}, Path: "/v1/messages", AllowStream: true, QueryKeys: []string{"fault"}},
 		// The streaming-session endpoint: a WebSocket upgrade, so it is a GET
 		// with no body whose whole framing is the Hub's business. AllowStream is
 		// set because the tunnel is unbounded by definition.
