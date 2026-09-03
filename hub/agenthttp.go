@@ -2,7 +2,6 @@ package hub
 
 import (
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 
@@ -113,30 +112,5 @@ func (h *Hub) relayStream(teeStream *tunnel.Stream, open []byte) {
 		return
 	}
 	defer agentStream.Close()
-	bridge(teeStream, agentStream)
+	tunnel.Bridge(teeStream, agentStream)
 }
-
-// bridge copies bytes in both directions until either side closes. The first
-// direction to finish closes both ends, which unblocks the other goroutine: a
-// half-open relay would otherwise pin a stream pair forever.
-func bridge(a, b io.ReadWriteCloser) {
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(a, b)
-		done <- struct{}{}
-		_ = a.Close()
-		_ = b.Close()
-	}()
-	go func() {
-		_, _ = io.Copy(b, a)
-		done <- struct{}{}
-		_ = a.Close()
-		_ = b.Close()
-	}()
-	<-done
-}
-
-// ErrAgentOffline reports a relay attempt for a provider whose agent is not
-// online. It is informational; callers (the transport) treat it as a plain
-// connection failure and hand the job to the next-cheapest provider.
-var ErrAgentOffline = errors.New("no online agent for provider")

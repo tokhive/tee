@@ -20,9 +20,21 @@ type wsStream struct {
 }
 
 // WrapWS wraps a WebSocket connection as a stream suitable for tunnel.New.
+//
+// The read limit bounds one inbound message before the tunnel's per-frame cap
+// can see it. A single frame never exceeds maxPayload on the wire, so a message
+// much larger than that is a hostile (or corrupt) peer trying to allocate
+// unboundedly, not a legal payload; the limit stops that allocation.
 func WrapWS(conn *websocket.Conn) ioReadWriteCloser {
+	conn.SetReadLimit(wsReadLimit)
 	return &wsStream{conn: conn}
 }
+
+// wsReadLimit bounds one WebSocket message. The tunnel splits payloads to
+// maxPayload per frame, so a legal message is at most that plus the frame
+// header; the slack leaves headroom for message bundling while still capping a
+// hostile peer's allocation.
+const wsReadLimit = maxPayload + 1<<10
 
 func (w *wsStream) Read(p []byte) (int, error) {
 	for len(w.rbuf) == 0 {

@@ -63,35 +63,35 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 // socket. If the shared tunnel has dropped, it is re-established once and the
 // stream retried; an error past that is returned as-is.
 func (r *Relay) Dial(ctx context.Context, provider, host string) (net.Conn, error) {
-	conn, err := r.dialOnce(ctx, provider, host)
+	conn, used, err := r.dialOnce(ctx, provider, host)
 	if err == nil {
 		return conn, nil
 	}
-	// The shared tunnel is dead; drop it so the next call (or this retry) builds
-	// a fresh one, then try exactly once more. Nothing has been spent because no
-	// provider bytes crossed the wire before the stream existed.
-	r.reset()
-	conn, err = r.dialOnce(ctx, provider, host)
+	// The tunnel we dialed over is dead; drop it so the next call (or this
+	// retry) builds a fresh one, then try exactly once more. Nothing has been
+	// spent because no provider bytes crossed the wire before the stream existed.
+	r.resetIf(used)
+	conn, _, err = r.dialOnce(ctx, provider, host)
 	if err != nil {
 		return nil, err
 	}
 	return conn, nil
 }
 
-func (r *Relay) dialOnce(ctx context.Context, provider, host string) (net.Conn, error) {
+func (r *Relay) dialOnce(ctx context.Context, provider, host string) (net.Conn, *tunnel.Multiplexer, error) {
 	tun, err := r.tunnel(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	meta, err := json.Marshal(hub.RelayOpen{Provider: provider, Host: host})
 	if err != nil {
-		return nil, err
+		return nil, tun, err
 	}
 	s, err := tun.Dial(meta)
 	if err != nil {
-		return nil, err
+		return nil, tun, err
 	}
-	return streamConn{Stream: s}, nil
+	return streamConn{Stream: s}, tun, nil
 }
 
 // tunnel returns the live tunnel, dialing the Hub relay endpoint if none exists.
@@ -116,12 +116,16 @@ func (r *Relay) tunnel(ctx context.Context) (*tunnel.Multiplexer, error) {
 	return tun, nil
 }
 
-// reset drops a dead tunnel so the next Dial rebuilds it. A concurrent Dial that
-// still holds the old one will surface its own stream error and is a no-op here.
-func (r *Relay) reset() {
+// resetIf drops a tunnel that failed to serve a stream, but only when it is
+// still the tunnel the relay owns. A concurrent Dial may already have torn the
+// dead tunnel down and rebuilt a fresh one; resetting the stale reference then
+// would tear that healthy tunnel down too. Fine-grained: a controller that never
+// dialed the failed tunnel leaves it untouched, so a single stream failure never
+// kills unrelated streams.
+func (r *Relay) resetIf(tun *tunnel.Multiplexer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.tun != nil {
+	if r.tun == tun {
 		_ = r.tun.Close()
 		r.tun = nil
 	}

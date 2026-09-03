@@ -304,6 +304,28 @@ func (m *Multiplexer) drop(s *Stream) {
 	s.eofNow()
 }
 
+// Bridge copies bytes in both directions between two read-write-closers until
+// either side closes. The first direction to finish closes both ends, which
+// unblocks the other goroutine: a half-open bridge would otherwise pin a pair of
+// connections forever. It is shared by the Hub's agent relay and the Provider
+// Agent's upstream bridge, which both do the same ciphertext-only copy.
+func Bridge(a, b io.ReadWriteCloser) {
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(a, b)
+		done <- struct{}{}
+		_ = a.Close()
+		_ = b.Close()
+	}()
+	go func() {
+		_, _ = io.Copy(b, a)
+		done <- struct{}{}
+		_ = a.Close()
+		_ = b.Close()
+	}()
+	<-done
+}
+
 // fail tears the whole tunnel down after a read/write error.
 func (m *Multiplexer) fail(err error) {
 	m.mu.Lock()

@@ -202,7 +202,7 @@ func (a *Agent) handleRelay(s *tunnel.Stream, open []byte) {
 		left = tapRWC{rw: s, tap: a.cfg.Tap}
 		right = tapRWC{rw: outbound, tap: a.cfg.Tap}
 	}
-	bridge(left, right)
+	tunnel.Bridge(left, right)
 }
 
 // allows reports whether host is on the allowlist. Exact host:port match only:
@@ -231,26 +231,6 @@ func (a *Agent) dialTarget(host string) (net.Conn, error) {
 		return nil, fmt.Errorf("dial upstream %s: %w", host, err)
 	}
 	return conn, nil
-}
-
-// bridge copies bytes in both directions until either side closes. The first
-// direction to finish closes both ends, which unblocks the other goroutine: a
-// half-open relay would otherwise pin a stream pair forever.
-func bridge(a, b io.ReadWriteCloser) {
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(a, b)
-		done <- struct{}{}
-		_ = a.Close()
-		_ = b.Close()
-	}()
-	go func() {
-		_, _ = io.Copy(b, a)
-		done <- struct{}{}
-		_ = a.Close()
-		_ = b.Close()
-	}()
-	<-done
 }
 
 // ioReadWriteCloser narrows a full ReadWriteCloser to the surface bridge needs,

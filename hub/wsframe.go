@@ -18,7 +18,9 @@ const (
 // Otherwise the provider's own parser rejects them ("bad MASK", "bad opcode"),
 // which is exactly the failure this fixes.
 func MaskClientFrame(opcode byte, payload []byte) []byte {
-	buf := make([]byte, 0, len(payload)+10)
+	// Header is at most 2 (FIN+opcode+length) + 8 (64-bit length) + 4 (mask key)
+	// = 14 bytes; the extra body always fits without a realloc.
+	buf := make([]byte, 0, len(payload)+14)
 	buf = append(buf, 0x80|opcode) // FIN + opcode
 	n := len(payload)
 	switch {
