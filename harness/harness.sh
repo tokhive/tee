@@ -44,7 +44,7 @@ sleep 0.3
 # --- build ---------------------------------------------------------------
 echo "==> building simulation binaries"
 mkdir -p "$BIN"
-for pkg in mockprovider faketee hub verify tee agent streamer; do
+for pkg in mockprovider faketee hub verify tee agent streamer sessiondriver; do
   echo "    building $pkg"
   go build -o "$BIN/$pkg" "./tokenhive/cmd/$pkg" || { echo "build failed for $pkg"; exit 1; }
 done
@@ -496,6 +496,72 @@ else
 fi
 
 kill "$TEE_D16_PID" "$HUB_API16_PID" 2>/dev/null; wait "$TEE_D16_PID" "$HUB_API16_PID" 2>/dev/null
+
+# =====================================================================
+# S17: STREAMING SESSION THROUGH THE HUB USER API (C5).
+# A user opens /v1/session, the Hub learns the model from the first frame,
+# picks the cheapest provider, and relays the full-duplex session through a
+# real TEE to /v1/realtime. The sessiondriver proves the byte round trip;
+# the Hub log proves it chose cheap-sim and settled a charge. The session
+# bounds (wall-clock timeout, downlink byte cap, stall watchdog) are each
+# per-Hub config, so they are exercised in-process in hub/realtime_test.go
+# rather than by a dedicated running Hub here.
+# =====================================================================
+TEE_G=18091
+section "17. streaming session via the Hub user API (C5): select + settle + duplex"
+
+echo "    (fresh tee + store so the receipt count is unambiguous)"
+rm -rf "$SIM/receipts"
+"$BIN/tee" -addr "127.0.0.1:$TEE_G" -agents "$SIM/agents15.json" \
+  -seq "$SIM/seqstore-t17.json" > "$SIM/teeG.log" 2>&1 &
+TEE_G_PID=$!
+wait_for_port 127.0.0.1 "$TEE_G"
+
+echo "    starting the hub user-facing API on :$HUB_API_PORT (10% commission)"
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_G" -serve "127.0.0.1:$HUB_API_PORT" \
+  -host "127.0.0.1:$MP_PORT" -commission 1000 \
+  -session-timeout 30s -session-max 1048576 -session-idle 5s > "$SIM/hub-serve17.log" 2>&1 &
+HUB_API17_PID=$!
+wait_for_port 127.0.0.1 "$HUB_API_PORT"
+
+echo "    a streaming session for model sim-mock-0.5b (cheapest provider = cheap-sim):"
+"$BIN/sessiondriver" -url "ws://127.0.0.1:$HUB_API_PORT/v1/session" \
+  -model sim-mock-0.5b -marker "session-marker-17" > "$SIM/session17.log" 2>&1
+cat "$SIM/session17.log"
+
+echo "    assertion: session relay verified end to end (duplex round trip):"
+if grep -q "SESSION-ROUTE OK" "$SIM/session17.log"; then
+  echo "      OK: user WS -> Hub -> TEE -> provider -> back (frames echoed)"
+else
+  echo "      !! FAIL: sessiondriver did not verify (see above)"
+fi
+
+echo "    assertion: Hub picked cheap-sim (0.30) for the session, not openai-sim:"
+cheap=$(grep -c 'provider="cheap-sim"' "$SIM/hub-serve17.log" || true)
+dear=$(grep -c 'provider="openai-sim"' "$SIM/hub-serve17.log" || true)
+if [ "$cheap" -ge 1 ] && [ "$dear" -eq 0 ]; then
+  echo "      OK: session on cheap-sim, none on openai-sim (scheduler picked the lowest price)"
+else
+  echo "      !! FAIL: cheap-sim=$cheap openai-sim=$dear, want cheap>=1 dear==0"
+fi
+
+echo "    assertion: session was settled with a charge (10% commission on the buyer bill):"
+if grep -q 'provider="cheap-sim".*charged=0.30' "$SIM/hub-serve17.log" \
+   && grep -q 'buyer=0.33' "$SIM/hub-serve17.log"; then
+  echo "      OK: charged 0.30, buyer 0.33 at 10% commission"
+else
+  echo "      !! FAIL: expected charged=0.30 / buyer=0.33 in the session log"
+fi
+
+echo "    assertion: exactly 1 session receipt stored under cheap-sim:"
+sess_receipts=$(ls "$SIM/receipts/cheap-sim"/*.cbor 2>/dev/null | wc -l | tr -d ' ')
+if [ "$sess_receipts" -eq 1 ]; then
+  echo "      OK: $sess_receipts receipt stored under cheap-sim"
+else
+  echo "      !! FAIL: expected 1 receipt, got $sess_receipts"
+fi
+
+kill "$TEE_G_PID" "$HUB_API17_PID" 2>/dev/null; wait "$TEE_G_PID" "$HUB_API17_PID" 2>/dev/null
 
 # --- cleanup -------------------------------------------------------------
 echo

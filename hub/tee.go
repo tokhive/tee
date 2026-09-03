@@ -35,7 +35,7 @@ type Result struct {
 	Receipt proof.SignedReceipt
 }
 
-// TEE is the entire Hub↔TEE seam: one method.
+// TEE is the entire Hub↔TEE seam.
 //
 // The narrowness is the point. Every piece of Hub business — pricing, quota,
 // ledger, scheduling — sits behind this interface, so all of it can be
@@ -49,13 +49,43 @@ type TEE interface {
 	// produce one: a job that failed mid-flight has something to prove, and
 	// the Hub needs it to show it did not get what it was paying for.
 	Execute(ctx context.Context, spec jobs.Spec, body []byte, onChunk func([]byte) error) (Result, error)
+
+	// OpenSession establishes a streaming session to a provider through the
+	// TEE and returns an opaque, metered tunnel (read = downlink, write =
+	// uplink). The tunnel's Receipt is the terminal session receipt. A TEE
+	// that does not support sessions returns ErrSessionUnsupported.
+	OpenSession(ctx context.Context, spec jobs.Spec) (SessionConn, error)
 }
+
+// SessionConn is a transparent streaming tunnel to a provider. It deliberately
+// exposes only byte movement and the terminal receipt: WebSocket frame
+// semantics, JSON payloads and close handshakes are the Hub's business, and the
+// TEE never interprets any of them.
+//
+// Read returns provider downlink bytes. Write sends uplink bytes, which are
+// relayed verbatim into the provider tunnel. After the provider closes, Read
+// returns io.EOF and Receipt returns the signed session receipt.
+type SessionConn interface {
+	io.Reader
+	io.Writer
+	io.Closer
+	// Receipt returns the signed session receipt once the tunnel has ended.
+	// Before the provider has closed it returns an error.
+	Receipt() (proof.SignedReceipt, error)
+}
+
+// ErrSessionUnsupported is returned when the TEE behind the Hub cannot open
+// streaming sessions.
+var ErrSessionUnsupported = errors.New("tee does not support streaming sessions")
 
 // HTTPTEE calls a TEE's /v1/execute over HTTP. It is the production
 // implementation of TEE.
 type HTTPTEE struct {
-	// URL is the full endpoint, e.g. http://127.0.0.1:18090/v1/execute.
+	// URL is the full execute endpoint, e.g. http://127.0.0.1:18090/v1/execute.
 	URL string
+	// SessionURL is the full WebSocket session endpoint, e.g.
+	// ws://127.0.0.1:18090/v1/session. Empty means sessions are unsupported.
+	SessionURL string
 	// Client is the HTTP client to use. Defaults to http.DefaultClient.
 	Client *http.Client
 }

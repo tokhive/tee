@@ -92,6 +92,17 @@ type Config struct {
 	// execution and check that gap detection still catches it. A Hub that
 	// wants to be trusted leaves it nil.
 	Withhold func(seq uint64) bool
+
+	// SessionTimeout bounds a streaming session's wall-clock lifetime; zero
+	// means no time bound. SessionMaxDownBytes caps the bytes relayed downlink;
+	// zero means no byte bound. SessionIdle is the downlink-stall watchdog — if
+	// the provider streams nothing for this long the session is torn down; zero
+	// disables the stall watchdog. These three are the Hub's own bounds: the TEE
+	// deliberately applies none to a session (it is a transparent relay), so
+	// unbounded consumption stays on the Hub's side of the wire.
+	SessionTimeout      time.Duration
+	SessionMaxDownBytes uint64
+	SessionIdle         time.Duration
 }
 
 // Hub turns a job into a settled charge and an auditable receipt.
@@ -105,6 +116,10 @@ type Hub struct {
 	commission CommissionRate
 	clock      func() time.Time
 	withhold   func(uint64) bool
+
+	sessionTimeout      time.Duration
+	sessionMaxDownBytes uint64
+	sessionIdle         time.Duration
 }
 
 // New builds a Hub, refusing to construct one that would settle incorrectly.
@@ -137,8 +152,12 @@ func New(cfg Config) (*Hub, error) {
 		ledger:     ledger,
 		quota:      cfg.Quota,
 		commission: CommissionRate{BasisPoints: cfg.Commission},
-		clock:      clock,
-		withhold:   cfg.Withhold,
+		clock:        clock,
+		withhold:     cfg.Withhold,
+
+		sessionTimeout:      cfg.SessionTimeout,
+		sessionMaxDownBytes: cfg.SessionMaxDownBytes,
+		sessionIdle:         cfg.SessionIdle,
 	}, nil
 }
 
@@ -165,12 +184,18 @@ type Outcome struct {
 
 // Execute runs one job: check quota, dispatch, verify, price, settle, store.
 //
+// model is the Hub's own pricing key. It was historically carried inside the
+// job spec; it is deliberately out-of-band now: the TEE only establishes and
+// holds the provider connection, so it neither reads nor attests a model, and
+// the spec stays a pure "what HTTP request to perform". The Hub selects and
+// prices providers from the model it resolved locally.
+//
 // The ordering is load-bearing in two places. Quota is checked before
 // dispatch, so a refused request never consumes a ProviderSeq — if it did,
 // ordinary rate limiting would punch holes in the provider's sequence and be
 // indistinguishable from the Hub hiding executions. And the receipt is
 // verified before anything is charged, so a forged receipt cannot move money.
-func (h *Hub) Execute(ctx context.Context, tenant string, spec jobs.Spec, body []byte, onChunk func([]byte) error) (Outcome, error) {
+func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec, body []byte, onChunk func([]byte) error) (Outcome, error) {
 	if h.quota != nil && !h.quota.Allow(tenant, h.clock()) {
 		return Outcome{}, fmt.Errorf("%w: tenant %q", ErrQuotaExceeded, tenant)
 	}
@@ -196,7 +221,7 @@ func (h *Hub) Execute(ctx context.Context, tenant string, spec jobs.Spec, body [
 		return Outcome{Chunks: res.Chunks}, ErrStreamMismatch
 	}
 
-	charged, err := Price(card, spec.DeclaredModel, res.Receipt.Receipt)
+	charged, err := Price(card, model, res.Receipt.Receipt)
 	if err != nil {
 		return Outcome{Chunks: res.Chunks}, err
 	}

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
@@ -51,6 +52,9 @@ func main() {
 	drop := flag.Int("drop", 0, "withhold the receipt with this ProviderSeq from the store (0 = none)")
 	quotaLimit := flag.Int64("quota", 0, "max requests per tenant per window (0 = unlimited)")
 	quotaWindow := flag.Duration("window", time.Minute, "quota window")
+	sessionTimeout := flag.Duration("session-timeout", 10*time.Minute, "max wall-clock lifetime of a streaming session (0 = unlimited)")
+	sessionMax := flag.Uint64("session-max", 1<<20, "max downlink bytes a streaming session may relay (0 = unlimited)")
+	sessionIdle := flag.Duration("session-idle", 30*time.Second, "tear a session down if the provider streams nothing this long (0 = no watchdog)")
 	audit := flag.Bool("audit", false, "audit the receipt store for gaps and verify signatures")
 	flag.Parse()
 
@@ -78,13 +82,16 @@ func main() {
 	}
 
 	h, err := hub.New(hub.Config{
-		TEE:        &hub.HTTPTEE{URL: *teeURL + "/v1/execute"},
-		Rates:      rates,
-		Store:      store,
-		Verify:     verifyReceipt,
-		Quota:      quota,
-		Commission: uint64(*commission),
-		Withhold:   withholdSeq(*drop),
+		TEE:                 &hub.HTTPTEE{URL: *teeURL + "/v1/execute", SessionURL: wsEndpoint(*teeURL, "/v1/session")},
+		Rates:               rates,
+		Store:               store,
+		Verify:              verifyReceipt,
+		Quota:               quota,
+		Commission:          uint64(*commission),
+		Withhold:            withholdSeq(*drop),
+		SessionTimeout:      *sessionTimeout,
+		SessionMaxDownBytes: *sessionMax,
+		SessionIdle:         *sessionIdle,
 	})
 	if err != nil {
 		log.Fatalf("build hub: %v", err)
@@ -107,12 +114,12 @@ func main() {
 
 	for i := 1; i <= *n; i++ {
 		fmt.Printf("\n=== request %d/%d ===\n", i, *n)
-		spec, err := buildSpec(*provider, *host, "/v1/chat/completions", *model, *query, body, *maxBytes, *tenant)
+		spec, err := buildSpec(*provider, *host, "/v1/chat/completions", *query, body, *maxBytes)
 		if err != nil {
 			logf("build spec: %v", err)
 			continue
 		}
-		outcome, err := h.Execute(ctx, *tenant, spec, body, func(chunk []byte) error {
+		outcome, err := h.Execute(ctx, *tenant, *model, spec, body, func(chunk []byte) error {
 			fmt.Printf("[user sees] %s\n", chunk)
 			return nil
 		})
@@ -123,6 +130,17 @@ func main() {
 		printOutcome(outcome)
 	}
 	printLedger(h.Ledger())
+}
+
+// wsEndpoint rewrites the TEE's http(s) base into the ws(s) WebSocket URL its
+// /v1/session endpoint needs. The user passes one teeURL; keeping the session
+// endpoint derived from it (rather than a second flag) means the two can never
+// drift, and the scheme swap is the only difference gorilla/websocket rejects.
+func wsEndpoint(base, path string) string {
+	if strings.HasPrefix(base, "https://") {
+		return "wss://" + strings.TrimPrefix(base, "https://") + path
+	}
+	return "ws://" + strings.TrimPrefix(base, "http://") + path
 }
 
 func printOutcome(outcome hub.Outcome) {
@@ -239,7 +257,7 @@ func withholdSeq(seq int) func(uint64) bool {
 	return func(seq uint64) bool { return seq == target }
 }
 
-func buildSpec(provider, host, path, model, query string, body []byte, maxBytes uint64, tenant string) (jobs.Spec, error) {
+func buildSpec(provider, host, path, query string, body []byte, maxBytes uint64) (jobs.Spec, error) {
 	jobID := make([]byte, jobs.JobIDLength)
 	if _, err := rand.Read(jobID); err != nil {
 		return jobs.Spec{}, err
@@ -262,8 +280,6 @@ func buildSpec(provider, host, path, model, query string, body []byte, maxBytes 
 		ExpiresAt:        time.Now().Add(time.Hour).Unix(),
 		MaxResponseBytes: maxBytes,
 		Stream:           true,
-		DeclaredModel:    model,
-		TenantRef:        []byte(tenant),
 	}, nil
 }
 

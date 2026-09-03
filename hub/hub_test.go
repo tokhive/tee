@@ -73,13 +73,12 @@ func ratesTable(cards map[string]RateCard) map[string]RateCard {
 
 func testSpec(provider, model string) jobs.Spec {
 	return jobs.Spec{
-		Version:       jobs.VersionV1,
-		Provider:      provider,
-		Method:        "POST",
-		Host:          "provider.test:443",
-		Path:          "/v1/chat/completions",
-		Stream:        true,
-		DeclaredModel: model,
+		Version:  jobs.VersionV1,
+		Provider: provider,
+		Method:   "POST",
+		Host:     "provider.test:443",
+		Path:     "/v1/chat/completions",
+		Stream:   true,
 	}
 }
 
@@ -238,11 +237,11 @@ func TestHubChargesTheProvidersPrice(t *testing.T) {
 
 	h := mustHub(t, Config{TEE: fake, Rates: set})
 
-	cheap, err := h.Execute(context.Background(), "tenant", testSpec("cheap", "m"), nil, nil)
+	cheap, err := h.Execute(context.Background(), "tenant", "m", testSpec("cheap", "m"), nil, nil)
 	if err != nil {
 		t.Fatalf("execute cheap: %v", err)
 	}
-	dear, err := h.Execute(context.Background(), "tenant", testSpec("dear", "m"), nil, nil)
+	dear, err := h.Execute(context.Background(), "tenant", "m", testSpec("dear", "m"), nil, nil)
 	if err != nil {
 		t.Fatalf("execute dear: %v", err)
 	}
@@ -264,7 +263,7 @@ func TestUnknownProviderIsRefusedBeforeDispatch(t *testing.T) {
 	}}
 	h := mustHub(t, Config{TEE: fake})
 
-	_, err := h.Execute(context.Background(), "tenant", testSpec("nobody", "m"), nil, nil)
+	_, err := h.Execute(context.Background(), "tenant", "m", testSpec("nobody", "m"), nil, nil)
 	if !errors.Is(err, ErrUnknownProvider) {
 		t.Fatalf("error = %v, want ErrUnknownProvider", err)
 	}
@@ -286,11 +285,11 @@ func TestQuotaBlocksBeforeDispatch(t *testing.T) {
 	}}
 	h := mustHub(t, Config{TEE: fake, Quota: quota})
 
-	if _, err := h.Execute(context.Background(), "tenant", testSpec(testProvider, "m"), nil, nil); err != nil {
+	if _, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil); err != nil {
 		t.Fatalf("first request: %v", err)
 	}
 
-	_, err = h.Execute(context.Background(), "tenant", testSpec(testProvider, "m"), nil, nil)
+	_, err = h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil)
 	if !errors.Is(err, ErrQuotaExceeded) {
 		t.Fatalf("second request error = %v, want ErrQuotaExceeded", err)
 	}
@@ -314,7 +313,7 @@ func TestQuotaIsPerTenant(t *testing.T) {
 	h := mustHub(t, Config{TEE: fake, Quota: quota})
 
 	for _, tenant := range []string{"alice", "bob"} {
-		if _, err := h.Execute(context.Background(), tenant, testSpec(testProvider, "m"), nil, nil); err != nil {
+		if _, err := h.Execute(context.Background(), tenant, "m", testSpec(testProvider, "m"), nil, nil); err != nil {
 			t.Fatalf("%s: %v", tenant, err)
 		}
 	}
@@ -337,7 +336,7 @@ func TestQuotaWindowRollsOver(t *testing.T) {
 	}}
 	h := mustHub(t, Config{TEE: fake, Quota: quota, Clock: clock})
 
-	if _, err := h.Execute(context.Background(), "tenant", testSpec(testProvider, "m"), nil, nil); err != nil {
+	if _, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil); err != nil {
 		t.Fatalf("first: %v", err)
 	}
 	if quota.Remaining("tenant", now) != 0 {
@@ -345,7 +344,7 @@ func TestQuotaWindowRollsOver(t *testing.T) {
 	}
 
 	now = now.Add(2 * time.Minute)
-	if _, err := h.Execute(context.Background(), "tenant", testSpec(testProvider, "m"), nil, nil); err != nil {
+	if _, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil); err != nil {
 		t.Fatalf("after window: %v", err)
 	}
 	if fake.Calls() != 2 {
@@ -374,7 +373,7 @@ func TestUnverifiedReceiptIsNotCharged(t *testing.T) {
 		Verify: func(proof.SignedReceipt) error { return errors.New("bad signature") },
 	})
 
-	_, err := h.Execute(context.Background(), "tenant", testSpec(testProvider, "m"), nil, nil)
+	_, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil)
 	if err == nil {
 		t.Fatal("expected verification failure")
 	}
@@ -397,7 +396,7 @@ func TestStreamMismatchIsRejected(t *testing.T) {
 	}}
 	h := mustHub(t, Config{TEE: fake})
 
-	_, err := h.Execute(context.Background(), "tenant", testSpec(testProvider, "m"), nil, nil)
+	_, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil)
 	if !errors.Is(err, ErrStreamMismatch) {
 		t.Fatalf("error = %v, want ErrStreamMismatch", err)
 	}
@@ -495,7 +494,7 @@ func TestWithholdingAReceiptLeavesADetectableGap(t *testing.T) {
 	})
 
 	for i := 0; i < 3; i++ {
-		if _, err := h.Execute(context.Background(), "tenant", testSpec(testProvider, "m"), nil, nil); err != nil {
+		if _, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil); err != nil {
 			t.Fatalf("execute %d: %v", i, err)
 		}
 	}
@@ -693,7 +692,7 @@ func TestScriptedTEEForwardsBeforeFailing(t *testing.T) {
 	h := mustHub(t, Config{TEE: fake})
 
 	var forwarded [][]byte
-	_, err := h.Execute(context.Background(), "tenant", testSpec(testProvider, "m"), nil, func(chunk []byte) error {
+	_, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, func(chunk []byte) error {
 		forwarded = append(forwarded, chunk)
 		return nil
 	})

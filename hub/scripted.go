@@ -29,8 +29,15 @@ type ScriptedTEE struct {
 	// run against an empty script and pass by doing nothing.
 	Reply func(call int, spec jobs.Spec) (Result, error)
 
-	mu    sync.Mutex
-	calls int
+	// OpenReply, if set, returns a session tunnel for the nth session open.
+	// When nil, OpenSession returns ErrSessionUnsupported. The two call
+	// counters are independent so request/response and session tests can be
+	// scripted without cross-talk.
+	OpenReply func(call int, spec jobs.Spec) (SessionConn, error)
+
+	mu       sync.Mutex
+	calls    int
+	openCalls int
 }
 
 // Execute implements TEE.
@@ -66,6 +73,32 @@ func (s *ScriptedTEE) Calls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.calls
+}
+
+// OpenSession implements TEE. It dispatches to OpenReply if set, otherwise it
+// reports sessions as unsupported — a Hub wired to a scripted (request/response
+// only) stand-in must not silently gain a session it cannot back.
+func (s *ScriptedTEE) OpenSession(_ context.Context, spec jobs.Spec) (SessionConn, error) {
+	s.mu.Lock()
+	s.openCalls++
+	call := s.openCalls
+	s.mu.Unlock()
+
+	if s.OpenReply == nil {
+		return nil, ErrSessionUnsupported
+	}
+	conn, err := s.OpenReply(call, spec)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
+// OpenCalls reports how many times OpenSession has been invoked.
+func (s *ScriptedTEE) OpenCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.openCalls
 }
 
 // ScriptReceipt fills in the StreamHash that commits a receipt to chunks, so

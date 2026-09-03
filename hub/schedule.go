@@ -109,7 +109,7 @@ func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []
 			return Outcome{}, fmt.Errorf("build spec for %q: %w", provider, berr)
 		}
 		ran = true
-		last, err = h.Execute(ctx, tenant, spec, body, relay)
+		last, err = h.Execute(ctx, tenant, model, spec, body, relay)
 		if err != nil {
 			if relayed {
 				// The user saw this provider's bytes before it failed. There is

@@ -15,15 +15,28 @@ const mebibyte = uint64(1) << 20
 // card: treat it as a misconfiguration, not a transient failure.
 var ErrPriceOverflow = errors.New("rate card prices this receipt out of range")
 
+// sessionStatus is the sentinel StatusCode a streaming-session receipt carries.
+// The Hub dedicates 101 — the HTTP "Switching Protocols" upgrade that a session
+// begins with — to sessions, so a receipt's status alone distinguishes a
+// session from an ordinary request. Billable honors it for that exact reason.
+const sessionStatus = 101
+
 // Billable reports whether a receipt earned the provider anything.
 //
-// Only a completed 2xx counts. The TEE signs receipts for failures too — a
-// 401, a 429, a stream cut off mid-body are all attested exactly like a
-// success — because those receipts are what let the Hub prove it did not
-// receive what it was asked to pay for. That they exist does not make them
-// worth money.
+// Only a completed success counts. For requests that is a 2xx; for streaming
+// sessions the provider's handshake receipt carries StatusCode 101, which is
+// the success marker for that shape. A 401, a 429, or a stream cut off mid-body
+// are all attested exactly like a success — because those receipts are what let
+// the Hub prove it did not receive what it was asked to pay for — but they are
+// not worth money.
 func Billable(r proof.Receipt) bool {
-	return r.Completion == proof.CompletionComplete && r.StatusCode >= 200 && r.StatusCode < 300
+	if r.Completion != proof.CompletionComplete {
+		return false
+	}
+	if r.StatusCode >= 200 && r.StatusCode < 300 {
+		return true
+	}
+	return r.StatusCode == sessionStatus
 }
 
 // Price computes what a receipt earns under a seller's rate card, in the

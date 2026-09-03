@@ -507,8 +507,6 @@ func buildSpec(host, query string, body []byte, maxBytes uint64) (jobs.Spec, err
 		ExpiresAt:        time.Now().Add(time.Hour).Unix(),
 		MaxResponseBytes: maxBytes,
 		Stream:           true,
-		DeclaredModel:    "sim-mock-0.5b",
-		TenantRef:        []byte("tenant-demo-001"),
 	}, nil
 }
 

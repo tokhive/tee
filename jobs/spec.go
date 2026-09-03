@@ -103,23 +103,19 @@ type Spec struct {
 	MaxResponseBytes uint64            `cbor:"12,keyasint"`
 	Stream           bool              `cbor:"13,keyasint"`
 
-	// DeclaredModel is a Hub-supplied declaration of which model handled the
-	// request. The TEE does not validate it; it exists for pricing and audit
-	// and is covered by JobSpecHash, so a tampered declaration breaks the
-	// receipt's spec binding. Key 14 is retired (was UserKeyID); 15/16 are
-	// Hub-supplied metadata, and 17 marks a streaming session.
-	DeclaredModel string `cbor:"15,keyasint,omitempty"`
-
-	// TenantRef is an opaque, non-PII reference the Hub attaches for provider
-	// reconciliation. The TEE never interprets it.
-	TenantRef []byte `cbor:"16,keyasint,omitempty"`
-
 	// Session marks a streaming WebSocket-style session request. When set, the
 	// TEE performs an HTTP Upgrade handshake to the provider instead of a plain
 	// exchange, then relays an opaque bidirectional byte pipe. All frame and
 	// content semantics (WebSocket frames, JSON payloads, close handshakes) are
 	// the Hub's business: the TEE only moves, metes, and digests bytes. The
 	// body of a session job must be empty — it has a handshake, not a payload.
+	//
+	// Key 14 was UserKeyID, retired with the User signature. Keys 15 and 16 were
+	// DeclaredModel and TenantRef — billing metadata the Hub kept in the spec.
+	// The TEE neither reads nor needs them (it only establishes and holds the
+	// provider connection; pricing is purely a Hub concern), so they were removed
+	// rather than renumbered or reused. No future field may use 14, 15, or 16 in
+	// VersionV1; all three are permanently retired.
 	Session bool `cbor:"17,keyasint,omitempty"`
 }
 

@@ -136,7 +136,6 @@ func buildSpec(provider, host, path string) jobs.Spec {
 		MaxResponseBytes: 1 << 20,
 		Stream:           true,
 		Session:          true,
-		DeclaredModel:    "stream-sim",
 	}
 }
 
