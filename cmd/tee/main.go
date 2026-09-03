@@ -117,6 +117,9 @@ func main() {
 	mux.HandleFunc("/v1/execute", func(w http.ResponseWriter, r *http.Request) {
 		tee.ServeExecute(svc, w, r)
 	})
+	mux.HandleFunc("/v1/session", func(w http.ResponseWriter, r *http.Request) {
+		tee.ServeSession(svc, w, r)
+	})
 	log.Printf("tee (sim TEE, real service) listening on http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }

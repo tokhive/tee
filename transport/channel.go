@@ -6,7 +6,9 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -187,6 +189,71 @@ func (m *ChannelManager) Close() error {
 	m.mu.Unlock()
 	for _, p := range pools {
 		p.close()
+	}
+	return nil
+}
+
+// OpenSession establishes a transparent, long-lived provider session via an
+// HTTP Upgrade (e.g. WebSocket) and returns it as an opaque byte pipe. It
+// implements tee.SessionOpener.
+//
+// Unlike Do, this connection is NOT pooled: a session is consumed by whoever
+// opened it and is closed when they are done. It still egresses through the
+// provider's Agent and TLS terminates inside the TEE, so the isolation is
+// identical to any other provider traffic. After the upgrade the connection is
+// pure transport — bytes in, bytes out — with every frame of the upstream
+// protocol left to the caller.
+func (m *ChannelManager) OpenSession(ctx context.Context, req tee.Request) (tee.SessionConn, error) {
+	if req.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, req.Timeout)
+		defer cancel()
+	}
+
+	endpoint, ok := m.cfg.Endpoints.Endpoint(req.Provider)
+	if !ok {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownEndpoint, req.Provider)
+	}
+	conn, err := m.dialTCP(ctx, endpoint, req.Host)
+	if err != nil {
+		return nil, err
+	}
+
+	// Bound the handshake by the caller's deadline, then lift it so the session
+	// can live arbitrarily long once established.
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+		defer func() { _ = conn.SetDeadline(time.Time{}) }()
+	}
+
+	br := bufio.NewReader(conn)
+	if err := m.upgrade(ctx, conn, br, req); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return &Session{conn: conn, br: br}, nil
+}
+
+// upgrade writes the HTTP Upgrade request and verifies the provider answered
+// 101 Switching Protocols. On any other status the connection is refused.
+func (m *ChannelManager) upgrade(ctx context.Context, conn net.Conn, br *bufio.Reader, req tee.Request) error {
+	requestBytes, err := buildUpgradeBytes(req)
+	if err != nil {
+		return err
+	}
+	n, err := conn.Write(requestBytes)
+	if err != nil {
+		return fmt.Errorf("write upgrade request: %w", err)
+	}
+	if n != len(requestBytes) {
+		return io.ErrShortWrite
+	}
+	resp, err := http.ReadResponse(br, &http.Request{Method: req.Method})
+	if err != nil {
+		return fmt.Errorf("read upgrade response: %w", err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return fmt.Errorf("provider refused upgrade: %s", resp.Status)
 	}
 	return nil
 }

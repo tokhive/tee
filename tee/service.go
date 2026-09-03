@@ -46,7 +46,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
@@ -72,6 +74,17 @@ var (
 // concurrent executions having their payloads crossed, and against a body
 // truncated in transit being sent under a spec that described the whole thing.
 var ErrBodyMismatch = errors.New("request body does not match the hash committed in the job spec")
+
+// ErrNoSessionSupport means the configured transport can run request/response
+// exchanges but not streaming sessions. It is a wiring mismatch surfaced lazily
+// when a session is requested, because a request/response-only transport is
+// legitimate and a Hub may simply never need streaming.
+var ErrNoSessionSupport = errors.New("transport does not support streaming sessions")
+
+// ErrSessionBody means a streaming session job carried a request body. A
+// session is opened by a handshake, not a payload: it commits to an empty body,
+// and the body hash must be the digest of zero bytes.
+var ErrSessionBody = errors.New("streaming session must carry an empty body")
 
 // Job is a request to execute: the spec plus the body it commits to.
 //
@@ -471,4 +484,208 @@ func headerSet(headers map[string]string, name string) bool {
 		}
 	}
 	return false
+}
+
+// Session is a metered, attested transparent tunnel to a provider, opened by
+// Service.OpenSession. It runs the same refusal checks a normal execution does,
+// then turns the transport's session connection into a byte pipe whose every
+// byte is counted (uplink → RequestBytes, downlink → ResponseBytes) and whose
+// downlink plaintext is streamed into the receipt digest. Frame and payload
+// semantics are never touched here — the caller owns them, which is the whole
+// point of the design: the TEE only moves, counts, and digests bytes.
+type Session struct {
+	svc      *Service
+	spec     jobs.Spec
+	specHash [32]byte
+	decision policy.Decision
+	seq      uint64
+	conn     SessionConn
+
+	hasher  *proof.StreamingHasher
+	started int64
+
+	mu             sync.Mutex
+	requestBytes   uint64
+	responseBytes  uint64
+	chunkCount     uint64
+	finishedAt     int64
+	truncated      bool
+	receiptEmitted bool
+	cachedRes      *Result
+	cachedErr      error
+}
+
+// OpenSession establishes a streaming session to the provider. It runs the same
+// refusal checks as Execute — submitter, spec structure and expiry, body
+// binding, policy authorisation, credential resolution, sequence allocation —
+// then performs the Upgrade handshake and returns a Session the caller drives
+// with Read/Write and finishes with Receipt.
+//
+// A session job must carry an empty body and set Spec.Session. The body hash
+// binding still applies: the writer commits to a hash of zero bytes, which is
+// how a session and a stray request are told apart even before the transport
+// sees them.
+func (s *Service) OpenSession(ctx context.Context, job Job) (*Session, error) {
+	now := s.clock()
+
+	if s.submitterVerify != nil {
+		if err := s.submitterVerify(ctx, job.Spec); err != nil {
+			return nil, fmt.Errorf("submitter rejected: %w", err)
+		}
+	}
+	if err := job.Spec.ValidateAt(now); err != nil {
+		return nil, err
+	}
+	if !job.Spec.MatchesBody(job.Body) {
+		return nil, ErrBodyMismatch
+	}
+	if len(job.Body) != 0 {
+		return nil, fmt.Errorf("%w: got %d bytes", ErrSessionBody, len(job.Body))
+	}
+	if !job.Spec.Session {
+		return nil, fmt.Errorf("%w: Spec.Session is false", ErrSessionBody)
+	}
+
+	decision, err := s.policies.AuthorizeAt(job.Spec, now)
+	if err != nil {
+		return nil, err
+	}
+	headers, err := s.injectCredential(ctx, job.Spec, decision)
+	if err != nil {
+		return nil, err
+	}
+	specHash, err := job.Spec.Hash()
+	if err != nil {
+		return nil, err
+	}
+	seq, err := s.seq.Next([]byte(job.Spec.Provider))
+	if err != nil {
+		return nil, fmt.Errorf("allocate provider sequence: %w", err)
+	}
+
+	opener, ok := s.transport.(SessionOpener)
+	if !ok {
+		return nil, ErrNoSessionSupport
+	}
+
+	// A session is a GET handshake with no body; the transport adds the
+	// Upgrade headers itself. MaxResponseBytes is deliberately not applied to
+	// the tunnel: it is bidirectional and unbounded, so the only honest metering
+	// is counting and digesting everything the provider sends.
+	request := Request{
+		Method:   job.Spec.Method,
+		Provider: job.Spec.Provider,
+		Host:     job.Spec.Host,
+		Path:     job.Spec.Path,
+		Query:    job.Spec.Query,
+		Headers:  headers,
+		Stream:   true,
+		Timeout:  s.requestTimeout,
+	}
+	conn, err := opener.OpenSession(ctx, request)
+	if err != nil {
+		return nil, fmt.Errorf("open session: %w", err)
+	}
+
+	return &Session{
+		svc:      s,
+		spec:     job.Spec,
+		specHash: specHash,
+		decision: decision,
+		seq:      seq,
+		conn:     conn,
+		hasher:   proof.NewStreamingHasher(job.Spec.JobID),
+		started:  now.Unix(),
+	}, nil
+}
+
+// Write sends bytes uplink to the provider and counts them toward RequestBytes
+// in the eventual receipt.
+func (s *Session) Write(p []byte) (int, error) {
+	n, err := s.conn.Write(p)
+	if n > 0 {
+		s.mu.Lock()
+		s.requestBytes += uint64(n)
+		s.mu.Unlock()
+	}
+	return n, err
+}
+
+// Read receives downlink bytes from the provider, counts them toward
+// ResponseBytes, and digests them into the receipt's StreamHash. The bytes are
+// opaque — frame interpretation is entirely the caller's.
+func (s *Session) Read(p []byte) (int, error) {
+	n, err := s.conn.Read(p)
+	if n > 0 {
+		s.hasher.WriteChunk(p[:n])
+		s.mu.Lock()
+		s.responseBytes += uint64(n)
+		s.chunkCount++
+		// A provider that drops the socket mid-session — anything but a clean
+		// EOF — leaves the transcript partial, and the receipt must say so.
+		if err != nil && !errors.Is(err, io.EOF) {
+			s.truncated = true
+		}
+		s.mu.Unlock()
+	}
+	return n, err
+}
+
+// Close tears down the underlying provider connection. Pending Reads on the
+// same Session return once the socket is closed.
+func (s *Session) Close() error { return s.conn.Close() }
+
+// Receipt signs the session's execution receipt. It is idempotent: the first
+// call signs, and later calls return the same result. Call it once the session
+// is over. The receipt carries StatusCode 101 (the successful upgrade),
+// RequestBytes equal to the uplink total, and ResponseBytes/ChunkCount/
+// StreamHash describing the downlink — the same response-digest contract a
+// normal execution receipt uses.
+func (s *Session) Receipt() (*Result, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.receiptEmitted {
+		return s.cachedRes, s.cachedErr
+	}
+	s.finishedAt = s.svc.clock().Unix()
+
+	completion := proof.CompletionComplete
+	if s.truncated {
+		completion = proof.CompletionTruncated
+	}
+	streamHash := s.hasher.Sum()
+	receipt := proof.Receipt{
+		Version:       proof.VersionV1,
+		JobID:         s.spec.JobID,
+		JobSpecHash:   s.specHash[:],
+		Provider:      s.spec.Provider,
+		Method:        s.spec.Method,
+		Host:          s.spec.Host,
+		Path:          s.spec.Path,
+		StatusCode:    101,
+		StreamHash:    streamHash[:],
+		ChunkCount:    s.chunkCount,
+		ResponseBytes: s.responseBytes,
+		Completion:    completion,
+		StartedAt:     s.started,
+		FinishedAt:    s.finishedAt,
+		PolicyHash:    s.decision.PolicyHash,
+		RequestBytes:  s.requestBytes,
+		ProviderSeq:   s.seq,
+	}
+	signed, err := s.svc.signer.Sign(receipt)
+	result := &Result{
+		Receipt:       signed,
+		StatusCode:    101,
+		ChunkCount:    s.chunkCount,
+		ResponseBytes: s.responseBytes,
+		StreamHash:    streamHash,
+		Truncated:     completion == proof.CompletionTruncated,
+		PolicyHash:    s.decision.PolicyHash,
+		ProviderSeq:   s.seq,
+	}
+	s.receiptEmitted = true
+	s.cachedRes = result
+	s.cachedErr = err
+	return result, err
 }

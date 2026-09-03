@@ -42,7 +42,7 @@ sleep 0.3
 # --- build ---------------------------------------------------------------
 echo "==> building simulation binaries"
 mkdir -p "$BIN"
-for pkg in mockprovider faketee hub verify tee agent; do
+for pkg in mockprovider faketee hub verify tee agent streamer; do
   echo "    building $pkg"
   go build -o "$BIN/$pkg" "./tokenhive/cmd/$pkg" || { echo "build failed for $pkg"; exit 1; }
 done
@@ -303,6 +303,39 @@ else
   echo "      !! FAIL: expected a normal complete receipt"
 fi
 kill "$TEE_C_PID" 2>/dev/null; wait "$TEE_C_PID" 2>/dev/null
+
+# =====================================================================
+# S14: STREAMING SESSION (C3) — WebSocket upgrade tunnel + session receipt.
+# A real TEE egresses through agent A and upgrades to the provider's
+# /v1/realtime WebSocket; the streamer drives a full-duplex exchange and
+# verifies the terminal 101 session receipt offline against the exact bytes.
+# =====================================================================
+TEE_E=18099
+section "14. streaming session (C3): WebSocket upgrade tunnel + session receipt"
+
+echo "    starting real tee E on :$TEE_E, egress via agent A"
+"$BIN/tee" -addr "127.0.0.1:$TEE_E" -agent "127.0.0.1:$AGENT_A" \
+  -seq "$SIM/seqstore-t14.json" > "$SIM/teeE.log" 2>&1 &
+TEE_E_PID=$!
+wait_for_port 127.0.0.1 "$TEE_E"
+
+echo "    driving a full-duplex session (uplink marker -> provider echo -> receipt):"
+"$BIN/streamer" -tee "ws://127.0.0.1:$TEE_E/v1/session" \
+  -provider openai-sim -host "127.0.0.1:$MP_PORT" -path /v1/realtime \
+  -marker "streamtest-marker-14" > "$SIM/streamer.log" 2>&1
+cat "$SIM/streamer.log"
+
+echo "    assertion: session verified end-to-end (101, byte counts, stream hash, echo):"
+if grep -q "SESSION OK" "$SIM/streamer.log"; then
+  echo "      OK: streaming session verified offline"
+else
+  echo "      !! FAIL: streamer did not verify the session receipt"
+fi
+if grep -q "STREAM FAIL" "$SIM/streamer.log"; then
+  echo "      !! FAIL: streamer reported a failure (see above)"
+fi
+
+kill "$TEE_E_PID" 2>/dev/null; wait "$TEE_E_PID" 2>/dev/null
 
 # =====================================================================
 # S15: LOWEST-PRICE SCHEDULING + COMMISSION (C2).

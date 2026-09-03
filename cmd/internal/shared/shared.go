@@ -147,6 +147,10 @@ func providerPolicy(provider string) policy.Policy {
 	hosts := []string{providerHost}
 	rules := []policy.Rule{
 		{Methods: []string{"POST"}, Path: providerPath, AllowStream: true, QueryKeys: []string{"fault"}},
+		// The streaming-session endpoint: a WebSocket upgrade, so it is a GET
+		// with no body whose whole framing is the Hub's business. AllowStream is
+		// set because the tunnel is unbounded by definition.
+		{Methods: []string{"GET"}, Path: "/v1/realtime", AllowStream: true, AllowAnyQuery: true},
 	}
 	credential := policy.Credential{Header: "Authorization", Scheme: "Bearer"}
 	limits := policy.Limits{

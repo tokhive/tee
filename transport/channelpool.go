@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -246,4 +248,68 @@ func buildRequestBytes(req tee.Request) ([]byte, error) {
 	buf.WriteString("\r\n")
 	buf.Write(req.Body)
 	return buf.Bytes(), nil
+}
+
+// Session is a transparent byte pipe to a provider after an Upgrade handshake.
+// The buffered reader that consumed the 101 may already hold the provider's
+// first downstream bytes, so Read drains it before touching the socket. It does
+// no framing of its own — its only job is to carry bytes between the TEE's
+// relay and the provider, exactly as the plan's "transparent byte pipe" after
+// the handshake.
+type Session struct {
+	conn net.Conn
+	br   *bufio.Reader
+}
+
+// Read returns the provider's next bytes, preferring anything the handshake
+// already buffered.
+func (s *Session) Read(p []byte) (int, error) {
+	if s.br.Buffered() > 0 {
+		return s.br.Read(p)
+	}
+	return s.conn.Read(p)
+}
+
+// Write sends bytes uplink to the provider verbatim.
+func (s *Session) Write(p []byte) (int, error) { return s.conn.Write(p) }
+
+// Close closes the underlying provider connection.
+func (s *Session) Close() error { return s.conn.Close() }
+
+// buildUpgradeBytes renders a tee.Request as an HTTP/1.1 Upgrade (WebSocket)
+// handshake. Unlike buildRequestBytes it sends no body and adds the protocol's
+// own handshake headers; the Host and the caller's headers — which include the
+// injected provider credential — are carried through unchanged. The handshake
+// bytes are not counted toward RequestBytes; only post-upgrade writes are.
+func buildUpgradeBytes(req tee.Request) ([]byte, error) {
+	var buf bytes.Buffer
+
+	target := req.Path
+	if req.Query != "" {
+		target += "?" + req.Query
+	}
+
+	fmt.Fprintf(&buf, "%s %s HTTP/1.1\r\n", req.Method, target)
+	fmt.Fprintf(&buf, "Host: %s\r\n", req.Host)
+	fmt.Fprintf(&buf, "Connection: Upgrade\r\n")
+	fmt.Fprintf(&buf, "Upgrade: websocket\r\n")
+	fmt.Fprintf(&buf, "Sec-WebSocket-Version: 13\r\n")
+	fmt.Fprintf(&buf, "Sec-WebSocket-Key: %s\r\n", newWebSocketKey())
+	for name, value := range req.Headers {
+		fmt.Fprintf(&buf, "%s: %s\r\n", name, value)
+	}
+	buf.WriteString("\r\n")
+	return buf.Bytes(), nil
+}
+
+// newWebSocketKey returns a fresh Sec-WebSocket-Key: the base64 of 16 random
+// bytes, which is exactly what the WebSocket handshake spec prescribes.
+func newWebSocketKey() string {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		// crypto/rand never fails on this platform; if it somehow does, a stale
+		// but well-formed key keeps the upgrade parseable rather than panicking.
+		return base64.StdEncoding.EncodeToString([]byte("00000000000000000000"))
+	}
+	return base64.StdEncoding.EncodeToString(nonce[:])
 }

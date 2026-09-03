@@ -3,6 +3,7 @@ package tee
 import (
 	"context"
 	"errors"
+	"io"
 	"time"
 )
 
@@ -79,3 +80,29 @@ type Transport interface {
 // ChunkFunc is the shape of the per-chunk callback. It exists so that callers
 // can name the type in signatures without restating the closure form.
 type ChunkFunc func(chunk []byte) error
+
+// SessionConn is the transparent bidirectional byte pipe to a provider after an
+// Upgrade handshake. It is deliberately just Read/Write/Close: the transport
+// accepts raw bytes on Write and surfaces raw provider bytes on Read, doing no
+// application framing of its own. Anything a session carries — WebSocket
+// frames, JSON payloads, close handshakes — is the Hub's business, not the
+// TEE's, which is exactly the boundary that keeps the TEE's work to a minimum.
+type SessionConn interface {
+	io.Reader
+	io.Writer
+	io.Closer
+}
+
+// SessionOpener is a Transport that can additionally establish a streaming
+// session. Not every transport supports this — a strict request/response relay
+// has nothing to upgrade to — so it is asserted with a type assertion rather
+// than folded into Transport, keeping request/response transports valid.
+type SessionOpener interface {
+	// OpenSession dials the provider (through its Agent when configured),
+	// completes TLS, writes the Upgrade request, and verifies the 101
+	// Switching Protocols response. Once it returns, the SessionConn is a
+	// transparent byte pipe in both directions. Only bytes the caller writes
+	// through the pipe are counted as uplink; the handshake's own bytes are not
+	// metered.
+	OpenSession(ctx context.Context, req Request) (SessionConn, error)
+}

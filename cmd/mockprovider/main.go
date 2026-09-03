@@ -30,6 +30,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 )
 
@@ -110,11 +112,12 @@ func main() {
 	flag.Parse()
 
 	// The provider's one HTTP server, whose connections are the thing being
-	// counted. Only /v1/chat/completions lives here: a stats query dials a
-	// connection too, so it must share the counter with neither the count it
-	// reports nor the message traffic it observes.
+	// counted. /v1/chat/completions is the fixed SSE endpoint; /v1/realtime is
+	// the streaming-session (WebSocket) endpoint whose frames scenario 14
+	// exercises.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", handleChat)
+	mux.HandleFunc("/v1/realtime", handleRealtime)
 	srv := &http.Server{Addr: *addr, Handler: mux, ConnState: trackConn}
 
 	// A separate, untracked listener for the observability endpoints. Reading
@@ -204,4 +207,60 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// realtimeUpgrader turns /v1/realtime into a WebSocket for streaming sessions.
+// Origin is unrestricted — the "client" here is an opaque provider tunnel, not
+// a browser, so there is no Origin to police.
+var realtimeUpgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+
+// realtimeFrames is the fixed, deterministic frame sequence a session produces.
+// The first element is echoed back to the client's uplink marker, so scenario 14
+// can prove the full-duplex byte relay works in both directions and that the
+// session receipt digests exactly these bytes.
+func realtimeFrames(echo string) []string {
+	return []string{
+		`{"event":"session.updated","seq":1,"echo":` + jsonString(echo) + `}`,
+		`{"event":"response.created","seq":2,"echo":` + jsonString(echo) + `}`,
+		`{"event":"response.done","seq":3,"echo":` + jsonString(echo) + `}`,
+	}
+}
+
+// handleRealtime serves one streaming session: it reads a single client text
+// message (the uplink marker), replies with the fixed frame sequence, then
+// closes the WebSocket normally. Frame order is fixed so the Hub-side driver can
+// assert it, and the echoed marker proves the uplink reached the provider.
+func handleRealtime(w http.ResponseWriter, r *http.Request) {
+	conn, err := realtimeUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	echo := "realtime"
+	// Uplink direction: the relay wrote one masked client text frame; read it to
+	// echo. We are permissive — if it fails we still stream the fixed frames.
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, data, rerr := conn.ReadMessage(); rerr == nil {
+		if s := strings.TrimSpace(string(data)); s != "" {
+			echo = s
+		}
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	for _, frame := range realtimeFrames(echo) {
+		if werr := conn.WriteMessage(websocket.TextMessage, []byte(frame)); werr != nil {
+			return
+		}
+	}
+	_ = conn.WriteMessage(websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bye"))
+}
+
+// jsonString renders a string as a JSON string literal, safe for embedding in a
+// frame. The echo markers the simulation uses are plain, but escaping here keeps
+// the endpoint honest for any payload.
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
