@@ -121,6 +121,54 @@ func TestExecuteForModelFallsBackFromFailingCheapest(t *testing.T) {
 	}
 }
 
+func TestExecuteForModelCommitsAfterFirstRelayedByte(t *testing.T) {
+	// The cheapest provider streams one chunk then truncates. Its bytes already
+	// reached the user, so the Hub must NOT fall back to the next provider:
+	// splicing a second provider's transcript onto the first would corrupt the
+	// user's stream and match no single receipt.
+	set := policySet(t, map[string]policy.RateCard{
+		"cheap": {PerRequestMicros: 100},
+		"dear":  {PerRequestMicros: 900},
+	})
+	fake := &ScriptedTEE{Reply: func(call int, spec jobs.Spec) (Result, error) {
+		stream := chunks("partial")
+		if spec.Provider == "cheap" {
+			r := makeReceipt(uint64(call), stream, func(r *proof.Receipt) {
+				r.Provider = spec.Provider
+				r.Completion = proof.CompletionTruncated
+			})
+			return Result{Chunks: stream, Receipt: r}, nil
+		}
+		// The dear provider would have completed fine — the test's point is
+		// that it must never be asked once cheap's bytes are on the wire.
+		return Result{Chunks: stream, Receipt: makeReceipt(uint64(call), stream, func(r *proof.Receipt) {
+			r.Provider = spec.Provider
+		})}, nil
+	}}
+	h, _ := New(Config{TEE: fake, Policies: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
+
+	var relayed int
+	out, err := h.ExecuteForModel(context.Background(), "tenant", "m", nil, buildFor, func([]byte) error {
+		relayed++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := out.Receipt.Receipt.Provider; got != "cheap" {
+		t.Fatalf("chosen provider = %q, want %q (committed once bytes relayed)", got, "cheap")
+	}
+	if out.Receipt.Receipt.Completion != proof.CompletionTruncated {
+		t.Fatalf("completion = %v, want truncated (the committed outcome is the partial one)", out.Receipt.Receipt.Completion)
+	}
+	if relayed != 1 {
+		t.Errorf("user saw %d chunks, want exactly 1 (no second provider's bytes may follow)", relayed)
+	}
+	if fake.Calls() != 1 {
+		t.Errorf("TEE calls = %d, want 1 (dear must not be tried after cheap relayed bytes)", fake.Calls())
+	}
+}
+
 func TestExecuteForModelFallsBackFromNonBillableCheapest(t *testing.T) {
 	set := policySet(t, map[string]policy.RateCard{
 		"cheap": {PerRequestMicros: 100},

@@ -64,6 +64,13 @@ func (h *Hub) providersForModel(model string) []string {
 // is returned: the Hub still has to be able to show what it received, and the
 // receipt store records every attempt so no credential use is ever invisible.
 //
+// Fallback stops the moment the first byte has been relayed. Once the user has
+// seen content from provider A, switching to provider B would splice two
+// providers' transcripts into one response — a stream no client could parse
+// and no receipt would cover. A provider that fails mid-stream is therefore
+// committed to: its (truncated) outcome is returned as final, and the caller
+// reports what it got rather than silently switching horses mid-response.
+//
 // build produces the job spec for a given provider: the Hub decides who to ask,
 // but the caller supplies how to phrase the ask (host, headers, body binding)
 // once, since that framing is identical across providers.
@@ -76,25 +83,47 @@ func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []
 	}
 
 	var (
-		last Outcome
-		err  error
-		ran  bool
+		last    Outcome
+		err     error
+		ran     bool
+		relayed bool
 	)
+	// Count the bytes that reached the user. The relayed flag is what tells the
+	// fallback loop that the response is already committed to a provider.
+	relay := onChunk
+	if relay != nil {
+		relay = func(chunk []byte) error {
+			if len(chunk) > 0 {
+				relayed = true
+			}
+			return onChunk(chunk)
+		}
+	}
+
 	for _, provider := range providers {
 		spec, berr := build(provider)
 		if berr != nil {
 			return Outcome{}, fmt.Errorf("build spec for %q: %w", provider, berr)
 		}
 		ran = true
-		last, err = h.Execute(ctx, tenant, spec, body, onChunk)
+		last, err = h.Execute(ctx, tenant, spec, body, relay)
 		if err != nil {
+			if relayed {
+				// The user saw this provider's bytes before it failed. There is
+				// no honest way to continue with another provider: return the
+				// attempt's outcome as final.
+				return last, err
+			}
 			continue
 		}
 		if Billable(last.Receipt.Receipt) {
 			return last, nil
 		}
 		// Completed but not billable — a provider that declined or errored.
-		// Try the next candidate.
+		// Try the next candidate, unless its bytes already reached the user.
+		if relayed {
+			return last, nil
+		}
 	}
 	if !ran {
 		return Outcome{}, fmt.Errorf("%w: model %q", ErrNoProviderForModel, model)

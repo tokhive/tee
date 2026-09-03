@@ -91,6 +91,26 @@ type ChannelManager struct {
 
 	mu    sync.Mutex
 	pools map[string]*channelPool
+
+	// stopReaper halts the background idle sweeper, which reaps idle
+	// connections whose window has elapsed even when no new request ever comes
+	// to prod them. Guarded by stopReaperDo so Close is safe to call twice.
+	stopReaper   chan struct{}
+	stopReaperDo sync.Once
+}
+
+// reapInterval is how often the idle sweeper runs. It is a fraction of the
+// idle window so that a connection is closed no later than ~1.5 windows after
+// its last use, without the sweeper itself being busy.
+func (m *ChannelManager) reapInterval() time.Duration {
+	interval := m.idleTimeout / 2
+	if interval < 100*time.Millisecond {
+		return 100 * time.Millisecond
+	}
+	if interval > 30*time.Second {
+		return 30 * time.Second
+	}
+	return interval
 }
 
 // pairKey identifies one pool: a provider's egress plus one upstream host.
@@ -124,14 +144,50 @@ func NewChannelManager(cfg ChannelConfig) (*ChannelManager, error) {
 	if maxConns <= 0 {
 		maxConns = defaultMaxConns
 	}
-	return &ChannelManager{
+	m := &ChannelManager{
 		cfg:         cfg,
 		scheme:      scheme,
 		maxConns:    maxConns,
 		idleTimeout: idle,
 		readBufSize: defaultReadBufferSize,
 		pools:       make(map[string]*channelPool),
-	}, nil
+	}
+	m.startReaper()
+	return m, nil
+}
+
+// startReaper launches the background idle sweeper. It exists so the IdleTimeout
+// is honoured even when a pool is never asked for a connection again: without
+// it, an idle resident connection would live until process exit, which is
+// precisely the resource leak the window exists to prevent.
+func (m *ChannelManager) startReaper() {
+	m.stopReaper = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(m.reapInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-m.stopReaper:
+				return
+			case <-ticker.C:
+				m.reapIdle()
+			}
+		}
+	}()
+}
+
+// reapIdle walks every pool and closes connections idle past the window. The
+// pool snapshot is taken under m.mu; each pool is swept under its own lock.
+func (m *ChannelManager) reapIdle() {
+	m.mu.Lock()
+	pools := make([]*channelPool, 0, len(m.pools))
+	for _, p := range m.pools {
+		pools = append(pools, p)
+	}
+	m.mu.Unlock()
+	for _, p := range pools {
+		p.expireIdle()
+	}
 }
 
 // Do performs one provider exchange on a pooled connection, relaying body
@@ -177,9 +233,12 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 	return status, err
 }
 
-// Close closes every pooled connection and stops future pooling. In-flight
-// exchanges are unaffected.
+// Close stops the idle sweeper, closes every pooled connection, and stops
+// future pooling. In-flight exchanges are unaffected.
 func (m *ChannelManager) Close() error {
+	if m.stopReaper != nil {
+		m.stopReaperDo.Do(func() { close(m.stopReaper) })
+	}
 	m.mu.Lock()
 	pools := make([]*channelPool, 0, len(m.pools))
 	for _, p := range m.pools {
@@ -223,8 +282,18 @@ func (m *ChannelManager) OpenSession(ctx context.Context, req tee.Request) (tee.
 	// can live arbitrarily long once established.
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
-		defer func() { _ = conn.SetDeadline(time.Time{}) }()
 	}
+	// A plain cancellation (no deadline) must still abort a handshake that is
+	// blocked on a silent peer. The poke is stopped once the session is
+	// established — from then on the session's own idle watchdog governs, not
+	// the request context that opened it. The clear runs after the stop so a
+	// poke that fired at the worst moment cannot leave a stale deadline on a
+	// healthy session.
+	stopOnCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer func() {
+		stopOnCancel()
+		_ = conn.SetDeadline(time.Time{})
+	}()
 
 	br := bufio.NewReader(conn)
 	if err := m.upgrade(ctx, conn, br, req); err != nil {
@@ -328,13 +397,25 @@ func (m *ChannelManager) dialTCP(ctx context.Context, endpoint Endpoint, host st
 
 	tlsCfg := &tls.Config{
 		ServerName: serverName(host),
-		RootCAs:    m.cfg.TLSClientConfig.RootCAs,
-		MinVersion: m.cfg.TLSClientConfig.MinVersion,
+		// The caller's TLS config is optional: nil means the platform defaults,
+		// which in production is the system trust store — the C4 checklist's
+		// "Channel TLS roots = system roots" requirement is simply the default
+		// here. Only tests and the local simulation supply a custom root pool.
+		MinVersion: tls.VersionTLS12,
 		// Explicit connection-resident model: ALPN locked to HTTP/1.1 so one
 		// connection carries exactly one in-flight request and is reusable
 		// frame-to-frame. HTTP/2 multiplexing would blur the "one connection =
 		// one job" boundary that the pool relies on.
 		NextProtos: []string{"http/1.1"},
+	}
+	if m.cfg.TLSClientConfig != nil {
+		tlsCfg.RootCAs = m.cfg.TLSClientConfig.RootCAs
+		if m.cfg.TLSClientConfig.MinVersion != 0 {
+			tlsCfg.MinVersion = m.cfg.TLSClientConfig.MinVersion
+		}
+		if len(m.cfg.TLSClientConfig.ServerName) > 0 {
+			tlsCfg.ServerName = m.cfg.TLSClientConfig.ServerName
+		}
 	}
 	tconn := tls.Client(conn, tlsCfg)
 	if err := tconn.HandshakeContext(ctx); err != nil {

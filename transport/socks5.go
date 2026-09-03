@@ -90,8 +90,17 @@ func socks5Connect(ctx context.Context, conn net.Conn, auth *SOCKS5Auth, target 
 		if err := conn.SetDeadline(deadline); err != nil {
 			return fmt.Errorf("socks5: set deadline: %w", err)
 		}
-		defer func() { _ = conn.SetDeadline(time.Time{}) }()
 	}
+	// A cancellation without a deadline must still abort a handshake blocked on
+	// a silent agent: poking the deadline turns the agent's silence into a
+	// timeout error. The poke is stopped before the deadline is lifted, so a
+	// poke that fired at the worst moment cannot leave a stale deadline on a
+	// healthy tunnel.
+	stopOnCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer func() {
+		stopOnCancel()
+		_ = conn.SetDeadline(time.Time{})
+	}()
 
 	if auth != nil {
 		if len(auth.Username) > 255 || len(auth.Password) > 255 {

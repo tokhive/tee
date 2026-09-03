@@ -304,6 +304,75 @@ func serveRawConn(conn net.Conn) {
 	}
 }
 
+func TestChannelIdleConnectionsAreReaped(t *testing.T) {
+	// A server that records both new connections and connection closes, so the
+	// test can observe the socket going away while it is merely idle — the
+	// property only the background sweeper provides.
+	var newConns, closes atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			newConns.Add(1)
+		}
+		if state == http.StateClosed || state == http.StateHijacked {
+			closes.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	reg := NewRegistry()
+	reg.Set("p", Endpoint{})
+	cm, err := NewChannelManager(ChannelConfig{
+		Scheme:         "http",
+		AllowPlaintext: true,
+		Endpoints:      reg,
+		IdleTimeout:    150 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewChannelManager: %v", err)
+	}
+	defer func() { _ = cm.Close() }()
+
+	do := func() error {
+		_, err := cm.Do(context.Background(),
+			testReq(tee.Request{Method: "POST", Host: hostOf(srv), Path: "/v1/x", Body: []byte("{}")}),
+			func([]byte) error { return nil })
+		return err
+	}
+
+	if err := do(); err != nil {
+		t.Fatalf("request 1: %v", err)
+	}
+	if n := newConns.Load(); n != 1 {
+		t.Fatalf("after request 1: server saw %d new connections, want 1", n)
+	}
+
+	// Wait for the background sweeper to close the now-idle connection, without
+	// sending another request. A manager that only reaps lazily on the next
+	// acquisition would leave this socket open forever.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if closes.Load() >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if closes.Load() == 0 {
+		t.Fatal("idle connection was never closed by the background sweeper")
+	}
+
+	if err := do(); err != nil {
+		t.Fatalf("request 2: %v", err)
+	}
+	if n := newConns.Load(); n != 2 {
+		t.Errorf("after re-dial: server saw %d new connections, want 2 (a fresh dial after the reap)", n)
+	}
+}
+
 func TestChannelMidStreamDisconnect(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

@@ -160,6 +160,12 @@ echo "    starting REAL tee.Service A on :$TEE_A, egress via agent A"
 TEE_A_PID=$!
 wait_for_port 127.0.0.1 "$TEE_A"
 
+# This TEE's seqstore starts at 1, so the receipt store must start clean too:
+# receipts left over from scenarios 1-8 carry ProviderSeq 1..N for the same
+# provider, and a fresh sequence colliding with them would suppress the very
+# "[receipt]" lines scenarios 9-12 assert on.
+rm -rf "$SIM/receipts"
+
 echo "    one normal request over the real path:"
 "$BIN/hub" -tee "http://127.0.0.1:$TEE_A" -n 1
 
@@ -257,6 +263,10 @@ TEE_C=18097
 section "13. connection residency (C1): N requests, ONE upstream TCP connection"
 curl -s --noproxy '*' "http://127.0.0.1:$STATS_PORT/reset" > /dev/null   # clean baseline
 echo "    starting fresh real tee C on :$TEE_C, egress via agent A (no pooled conn)"
+# Fresh TEE, fresh seqstore, so the shared receipt store must be isolated too —
+# otherwise tee C's seq 1..N collide with tee A's receipts from scenarios 9-12
+# and the "[receipt]" lines below never print.
+rm -rf "$SIM/receipts"
 "$BIN/tee" -addr "127.0.0.1:$TEE_C" -agent "127.0.0.1:$AGENT_A" -seq "$SIM/seqstore-teec.json" > "$SIM/teeC.log" 2>&1 &
 TEE_C_PID=$!
 wait_for_port 127.0.0.1 "$TEE_C"

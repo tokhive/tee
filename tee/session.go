@@ -28,6 +28,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -36,6 +37,14 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 )
+
+// SessionIdleTimeout is how long a streaming session may go without any byte
+// moving in either direction before the TEE tears it down. A session is
+// otherwise unbounded: a Realtime-style conversation can legitimately run for
+// many minutes, so a total-duration cap would kill healthy sessions — the
+// watchdog exists only to stop a peer that vanished mid-conversation from
+// wedging the tunnel forever.
+const SessionIdleTimeout = 5 * time.Minute
 
 // SessionAck is the success reply to a SessionRequest.
 const SessionAck = `{"ok":true}`
@@ -84,8 +93,14 @@ func ServeSession(svc *Service, w http.ResponseWriter, r *http.Request) {
 
 	conn.SetReadLimit(64 << 20)
 
-	// 建连段: one Binary message carrying the SessionRequest.
+	// 建连段: one Binary message carrying the SessionRequest. The handshake is
+	// bounded by a deadline so a Hub that connects and then never sends its
+	// SessionRequest cannot pin the goroutine forever; once the request has
+	// been acknowledged the deadline is lifted and the session may run as long
+	// as bytes keep flowing (the idle watchdog in relaySession takes over).
+	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	mt, first, err := conn.ReadMessage()
+	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
 		writeSessionClose(conn, websocket.ClosePolicyViolation, "no session request")
 		return
@@ -123,16 +138,37 @@ func ServeSession(svc *Service, w http.ResponseWriter, r *http.Request) {
 // does no framing work of its own — the receipt therefore always reaches the
 // Hub as the terminal marker, exactly as the 收尾段 of §5.2 promises.
 func relaySession(conn *websocket.Conn, ss *Session) {
-	// A watchdog bounds the whole session so a client that stops reading cannot
-	// wedge it forever. In the normal path the provider closes promptly and the
-	// pump closes the conn on its own, which stops the watchdog in time.
-	watchdog := time.AfterFunc(30*time.Second, func() { _ = conn.Close() })
-	defer watchdog.Stop()
+	// An idle watchdog bounds the session so a peer that stops moving bytes
+	// cannot wedge it forever. It is reset by every successful relay in either
+	// direction — see note on SessionIdleTimeout: only silence kills a session,
+	// not age. In the normal path the provider closes promptly and the pump
+	// closes the conn on its own, which stops the watchdog in time.
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+	stopWatchdog := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopWatchdog:
+				return
+			case <-ticker.C:
+				last := time.Unix(0, lastActivity.Load())
+				if time.Since(last) > SessionIdleTimeout {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+	}()
+	touch := func() { lastActivity.Store(time.Now().UnixNano()) }
+	defer close(stopWatchdog)
 
 	pumpDone := make(chan struct{})
 	go func() {
 		defer close(pumpDone)
-		_ = pumpDownlink(conn, ss)
+		_ = pumpDownlink(conn, ss, touch)
 		// Whatever the outcome, the session is over: sign and send the receipt
 		// as the terminal Text marker, then close so the main goroutine's
 		// pending ReadMessage unwedges.
@@ -154,6 +190,7 @@ func relaySession(conn *websocket.Conn, ss *Session) {
 		if err != nil {
 			break
 		}
+		touch()
 		if mt != websocket.BinaryMessage {
 			continue
 		}
@@ -171,13 +208,19 @@ func relaySession(conn *websocket.Conn, ss *Session) {
 // the provider finishes. A clean EOF ends the relay with no error; any other
 // provider error is surfaced so the terminal message can say so. A Hub that
 // vanished mid-stream aborts the relay silently.
-func pumpDownlink(conn *websocket.Conn, ss *Session) error {
+//
+// touch is invoked after every successfully relayed frame so the session's
+// idle watchdog can tell "quiet but alive" from "abandoned".
+func pumpDownlink(conn *websocket.Conn, ss *Session, touch func()) error {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := ss.Read(buf)
 		if n > 0 {
 			if werr := conn.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil {
 				return nil
+			}
+			if touch != nil {
+				touch()
 			}
 		}
 		if err != nil {

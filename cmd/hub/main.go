@@ -93,7 +93,6 @@ func main() {
 		runServe(h, serveConfig{
 			Addr:  *serveAddr,
 			Host:  *host,
-			Path:  "/v1/chat/completions",
 			Query: *query,
 			Max:   *maxBytes,
 		})
@@ -105,7 +104,7 @@ func main() {
 
 	for i := 1; i <= *n; i++ {
 		fmt.Printf("\n=== request %d/%d ===\n", i, *n)
-		spec, err := buildSpec(*provider, *host, *model, *query, body, *maxBytes, *tenant)
+		spec, err := buildSpec(*provider, *host, "/v1/chat/completions", *model, *query, body, *maxBytes, *tenant)
 		if err != nil {
 			logf("build spec: %v", err)
 			continue
@@ -204,7 +203,7 @@ func withholdSeq(seq int) func(uint64) bool {
 	return func(seq uint64) bool { return seq == target }
 }
 
-func buildSpec(provider, host, model, query string, body []byte, maxBytes uint64, tenant string) (jobs.Spec, error) {
+func buildSpec(provider, host, path, model, query string, body []byte, maxBytes uint64, tenant string) (jobs.Spec, error) {
 	jobID := make([]byte, jobs.JobIDLength)
 	if _, err := rand.Read(jobID); err != nil {
 		return jobs.Spec{}, err
@@ -219,7 +218,7 @@ func buildSpec(provider, host, model, query string, body []byte, maxBytes uint64
 		Provider:         provider,
 		Method:           "POST",
 		Host:             host,
-		Path:             "/v1/chat/completions",
+		Path:             path,
 		Query:            query,
 		Headers:          map[string]string{"Content-Type": "application/json"},
 		BodyHash:         hashBodyBytes(body),

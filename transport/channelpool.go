@@ -118,6 +118,14 @@ func (p *channelPool) drop(ch *channel) {
 	p.mu.Unlock()
 }
 
+// expireIdle closes idle connections past the idle window. It is the lock-taking
+// entry point for the manager's background sweeper.
+func (p *channelPool) expireIdle() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.expireIdleLocked()
+}
+
 // expireIdleLocked closes idle connections past the idle window. Caller holds
 // p.mu.
 func (p *channelPool) expireIdleLocked() {
@@ -165,17 +173,34 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 		return false, tee.Response{}, err
 	}
 
-	// Bound the whole exchange by the caller's deadline (already wrapped into
-	// ctx by Do). The socket deadline must not survive into the pool, so it is
-	// cleared before a reusable connection is returned.
+	// Clear any deadline a previous exchange's cancellation poke may have left,
+	// then bound this exchange by the caller's deadline. The socket deadline
+	// must not survive into the pool, so it is cleared again before a reusable
+	// connection is returned — after the cancellation poke is stopped, so a
+	// poke that fired at the worst moment cannot poison the pooled socket.
+	_ = ch.conn.SetDeadline(time.Time{})
+	clearOnReturn := false
 	if dl, ok := ctx.Deadline(); ok {
 		_ = ch.conn.SetDeadline(dl)
-		defer func() {
-			if keep {
-				_ = ch.conn.SetDeadline(time.Time{})
-			}
-		}()
+		clearOnReturn = true
 	}
+
+	// A cancellation without a deadline (a caller hanging up, a Hub request
+	// aborted) must still interrupt a blocked read: there is no way to unblock
+	// a socket Read except closing it or expiring its deadline, and neither the
+	// provider nor the caller may send another byte. Poke the deadline the
+	// instant the context is done so the exchange fails promptly and the pool
+	// discards the connection instead of pinning a goroutine on a dead peer.
+	stopOnCancel := context.AfterFunc(ctx, func() { _ = ch.conn.SetDeadline(time.Now()) })
+	defer func() {
+		// Stop the poke first: if the context was already done, stop returns
+		// false but the poke has run (or is running), so the clear below is what
+		// keeps a reusable connection clean.
+		stopOnCancel()
+		if clearOnReturn && keep {
+			_ = ch.conn.SetDeadline(time.Time{})
+		}
+	}()
 
 	n, werr := ch.conn.Write(requestBytes)
 	ch.wrote = n

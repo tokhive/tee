@@ -621,11 +621,16 @@ func (s *Session) Read(p []byte) (int, error) {
 		s.mu.Lock()
 		s.responseBytes += uint64(n)
 		s.chunkCount++
-		// A provider that drops the socket mid-session — anything but a clean
-		// EOF — leaves the transcript partial, and the receipt must say so.
-		if err != nil && !errors.Is(err, io.EOF) {
-			s.truncated = true
-		}
+		s.mu.Unlock()
+	}
+	// A provider that drops the socket mid-session — anything but a clean EOF —
+	// leaves the transcript partial, and the receipt must say so. This includes
+	// a read that returns zero bytes with a non-EOF error (e.g. an RST): the
+	// session was still open when the wire vanished, so it is truncated, not
+	// complete. The flag is checked even when n == 0 for exactly that case.
+	if err != nil && !errors.Is(err, io.EOF) {
+		s.mu.Lock()
+		s.truncated = true
 		s.mu.Unlock()
 	}
 	return n, err
