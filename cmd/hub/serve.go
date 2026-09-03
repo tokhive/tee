@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -96,7 +97,7 @@ type userHandler struct {
 func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
 	if err != nil {
-		http.Error(w, `{"error":{"message":"read body"}}`, http.StatusBadRequest)
+		writeJSONError(w, http.StatusBadRequest, "read body")
 		return
 	}
 	var req struct {
@@ -114,10 +115,23 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tenant = "tenant-api"
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
-	w.WriteHeader(http.StatusOK)
+
+	// The 200 + SSE headers are committed on the first relayed byte, not
+	// before dispatch. A dispatch that fails before anything was relayed
+	// (unknown model, quota, no serving provider) can therefore return a
+	// proper JSON error with a meaningful status — an SSE error frame under a
+	// 200 would leave SDKs guessing.
+	var started bool
+	start := func() {
+		if started {
+			return
+		}
+		started = true
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+	}
 
 	var chunks int
 	outcome, err := c.h.ExecuteForModel(r.Context(), tenant, req.Model, body,
@@ -129,6 +143,7 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// frames `data: {…}` and the data path relays raw body bytes, so
 			// re-wrapping here would emit `data: data: {…}` and break every
 			// OpenAI SDK. The Hub's only job is byte-pass-through.
+			start()
 			if _, werr := w.Write(chunk); werr != nil {
 				return werr
 			}
@@ -140,17 +155,25 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 
 	if err != nil {
-		// OpenAI-compatible APIs report upstream failures as an SSE error frame.
+		if !started {
+			writeJSONError(w, apiErrorStatus(err), err.Error())
+			log.Printf("api model=%q path=%s tenant=%q err=%v", req.Model, c.route.Path, tenant, err)
+			return
+		}
+		// Streaming had already begun: the status is committed, so the failure
+		// is reported as an SSE error frame instead.
 		fmt.Fprintf(w, "event: error\ndata: %s\n\n", sseError(err))
 	}
 	if c.route.Done {
 		// OpenAI-compatible chat streams terminate with an explicit done marker,
 		// which the mock upstream does not emit. Appended after an error frame
 		// too, so a client that started reading a stream is never left waiting
-		// for a terminator that cannot come.
+		// for a terminator that cannot come. An upstream that completed with an
+		// empty body still needs the marker, hence the start() here.
+		start()
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}
-	if flusher != nil {
+	if started && flusher != nil {
 		flusher.Flush()
 	}
 
@@ -158,6 +181,20 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		req.Model, c.route.Path, tenant, outcome.Receipt.Receipt.Provider, chunks,
 		float64(outcome.Charged)/microsPerUnit, float64(outcome.Commission)/microsPerUnit,
 		float64(outcome.Buyer)/microsPerUnit, err)
+}
+
+// apiErrorStatus maps a dispatch failure to an HTTP status. A provider that
+// simply cannot serve the model is a 404; quota exhaustion is a 429; anything
+// else is a 502 upstream failure.
+func apiErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, hub.ErrNoProviderForModel), errors.Is(err, hub.ErrUnknownProvider):
+		return http.StatusNotFound
+	case errors.Is(err, hub.ErrQuotaExceeded):
+		return http.StatusTooManyRequests
+	default:
+		return http.StatusBadGateway
+	}
 }
 
 func writeJSONError(w http.ResponseWriter, code int, msg string) {

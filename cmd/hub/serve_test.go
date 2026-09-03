@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,6 +25,13 @@ import (
 // the supplied upstream SSE bytes (the fixed frames mockprovider serves).
 func newServeTestHub(t *testing.T, upstream []byte) *hub.Hub {
 	t.Helper()
+	return newServeTestHubReply(t, upstream, nil)
+}
+
+// newServeTestHubReply is newServeTestHub with a TEE whose Reply may fail, so
+// a test can exercise the pre-dispatch error path (every provider refuses).
+func newServeTestHubReply(t *testing.T, upstream []byte, fail error) *hub.Hub {
+	t.Helper()
 
 	// The sim fixtures (providers.json, signed policies for openai-sim and
 	// cheap-sim) are generated into a private temp dir so the test never
@@ -40,6 +48,9 @@ func newServeTestHub(t *testing.T, upstream []byte) *hub.Hub {
 
 	stream := [][]byte{upstream}
 	fake := &hub.ScriptedTEE{Reply: func(call int, spec jobs.Spec) (hub.Result, error) {
+		if fail != nil {
+			return hub.Result{}, fail
+		}
 		r := hub.ScriptReceipt(stream, proof.Receipt{
 			Provider:      spec.Provider,
 			StatusCode:    200,
@@ -68,15 +79,18 @@ func newServeTestHub(t *testing.T, upstream []byte) *hub.Hub {
 // response bytes.
 func postBody(t *testing.T, route userRoute, body string) (string, string) {
 	t.Helper()
+	return serveRequest(t, newServeTestHub(t, []byte("data: {\"id\":\"chatcmpl-sim1\"}\n\n")), route, body)
+}
+
+// serveRequest runs one route against a ready hub.
+func serveRequest(t *testing.T, h *hub.Hub, route userRoute, body string) (string, string) {
+	t.Helper()
 
 	// Fixture policy hosts point at 127.0.0.1:18080, which is also what the
 	// route config passes upstream. cheap-sim (0.30) must win over openai-sim
 	// (1.00) for every model, exactly as in harness scenario 15.
 	cfg := serveConfig{Host: "127.0.0.1:18080", Query: "", Max: 1 << 20}
-	// A realistic upstream frame: SSE bytes end with a blank line, so the
-	// chat route's [DONE] append lands on its own frame boundary.
-	upstream := "data: {\"id\":\"chatcmpl-sim1\"}\n\n"
-	handler := &userHandler{h: newServeTestHub(t, []byte(upstream)), cfg: cfg, route: route}
+	handler := &userHandler{h: h, cfg: cfg, route: route}
 
 	req := httptest.NewRequest(http.MethodPost, route.Path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -134,5 +148,21 @@ func TestUserRoutesServeStreamingContentType(t *testing.T) {
 		if body == "" {
 			t.Errorf("%s returned an empty stream", route.Path)
 		}
+	}
+}
+
+// TestPreDispatchFailureIsAJSONError locks the deferred-header behaviour: a
+// dispatch that fails before any byte is relayed (here: every provider
+// refuses) must return a proper JSON error with a non-2xx status, not an SSE
+// error frame smuggled under a 200.
+func TestPreDispatchFailureIsAJSONError(t *testing.T) {
+	route := userRoutes[0]
+	failing := newServeTestHubReply(t, []byte("data: {\"id\":\"chatcmpl-sim1\"}\n\n"), errors.New("tee refused"))
+	body, ctype := serveRequest(t, failing, route, `{"model":"sim-mock-0.5b"}`)
+	if strings.Contains(ctype, "text/event-stream") {
+		t.Fatalf("error response used SSE content-type %q; want application/json", ctype)
+	}
+	if !strings.Contains(body, "error") {
+		t.Fatalf("error body is not JSON: %q", body)
 	}
 }
