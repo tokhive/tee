@@ -53,9 +53,7 @@ const defaultPlatform = "simulated"
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:18090", "listen address")
-	relay := flag.String("relay", "", "Hub TeeRelay WebSocket URL; when set, every provider connection egresses as a stream over the Hub's reverse tunnel instead of a direct agent dial")
-	agentAddr := flag.String("agent", "", "Provider Agent address applied to every provider; empty means use -agents")
-	agentsFile := flag.String("agents", "", "per-provider endpoint map (JSON: {provider: {agent_addr,...}})")
+	relay := flag.String("relay", "", "Hub TeeRelay WebSocket URL: every provider connection egresses as a stream over the Hub's reverse tunnel")
 	seqPath := flag.String("seq", "", "ProviderSeq store file (default <simdir>/seqstore.json)")
 	platformName := flag.String("platform", defaultPlatform, "attestation platform: simulated or sevsnp")
 	includeEvidence := flag.Bool("evidence", true, "embed attestation evidence in every receipt (false = resolve EvidenceHash via evidence retrieval)")
@@ -93,41 +91,26 @@ func main() {
 	}
 	log.Printf("policy set hash bound into attestation evidence: %x", policySetHash)
 
-	creds := tee.NewStaticCredentials()
-	providers, err := shared.LoadProviders()
+	// The credential inbox: the TEE's own keypair for accepting agent-registered
+	// tokens. The private half never leaves this process and nothing about it is
+	// persisted, so a restart rotates the key and agents re-register with the
+	// fresh public half. The TEE stores no access token at all: each job brings
+	// its provider's token sealed to this key, and the private half is the only
+	// way to open it.
+	inbox, err := tee.GenerateInboxKey()
 	if err != nil {
-		log.Fatalf("load providers: %v", err)
-	}
-	for p, tok := range providers {
-		creds.Set(p, tok)
+		log.Fatalf("generate inbox key: %v", err)
 	}
 
-	// Endpoint registry: which provider egresses through which companionship Agent.
-	// The connection-resident data path keys its pool by (provider, host) and
-	// dials through this table, so "provider P's source IP" is pinned to P's own
-	// Agent regardless of how many other providers share the same upstream.
-	registry := transport.NewRegistry()
-	if *agentsFile != "" {
-		if err := registry.LoadEndpointsFile(*agentsFile); err != nil {
-			log.Fatalf("load agent endpoints: %v", err)
-		}
-	} else if *agentAddr != "" {
-		// Legacy single-agent mode: route every provider through this one Agent.
-		for _, p := range policies.Providers() {
-			registry.Set(p, transport.Endpoint{AgentAddr: *agentAddr})
-		}
-	}
-
-	// Data path: real TLS to the provider through explicitly-managed resident
-	// connections. The TLS session terminates inside the TEE either way, so the
-	// credential never exists on a wire the agent controls.
+	// Data path: real TLS to the provider over the Hub's reverse tunnel. The TLS
+	// session terminates inside the TEE, so the credential never exists on a
+	// wire the agent controls.
 	upstreamTLS, err := upstreamTLSConfig(*platformName, *caFile)
 	if err != nil {
 		log.Fatalf("upstream TLS config: %v", err)
 	}
 	cm, err := transport.NewChannelManager(transport.ChannelConfig{
 		Scheme:          "https",
-		Endpoints:       registry,
 		RelayURL:        *relay,
 		TLSClientConfig: upstreamTLS,
 	})
@@ -148,11 +131,11 @@ func main() {
 	signer.IncludeEvidence = *includeEvidence
 
 	svc, err := tee.NewService(tee.Config{
-		Policies:    policies,
-		Credentials: creds,
-		Transport:   cm,
-		Signer:      signer,
-		Seq:         store,
+		Policies:  policies,
+		Transport: cm,
+		Signer:    signer,
+		Seq:       store,
+		InboxKey:  inbox,
 	})
 	if err != nil {
 		log.Fatalf("build service: %v", err)
@@ -164,6 +147,14 @@ func main() {
 	})
 	mux.HandleFunc("/v1/session", func(w http.ResponseWriter, r *http.Request) {
 		tee.ServeSession(svc, w, r)
+	})
+	// Credential plane: GET /v1/credential-key publishes the TEE's inbox public
+	// key, which provider agents fetch (through the Hub) to encrypt their tokens
+	// to. There is nothing else here — the TEE stores no token, so it has no
+	// set/drop endpoints; envelopes live in the Hub's credential store and ride
+	// onto each job.
+	mux.HandleFunc("/v1/credential-key", func(w http.ResponseWriter, r *http.Request) {
+		tee.ServeCredentialKey(inbox, w, r)
 	})
 	log.Printf("tee (platform=%s, includeEvidence=%t) listening on http://%s",
 		*platformName, *includeEvidence, *addr)

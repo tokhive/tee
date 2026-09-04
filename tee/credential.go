@@ -1,71 +1,141 @@
 package tee
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"sync"
+	"strings"
 )
 
-// ErrCredentialUnavailable means no credential is loaded for a provider, so the
-// job cannot be executed. It is distinct from a policy refusal: the policy
-// admitted the request, the TEE simply has nothing to authenticate it with.
-var ErrCredentialUnavailable = errors.New("no credential available for provider")
+// ErrInvalidSecret means a resolved credential is structurally unusable: an
+// empty token behind a declared header, an unsafe header name, or control
+// characters that could smuggle a header line. Such a credential must never
+// reach the wire — it is validated as the envelope is opened, before the
+// request is sent.
+var ErrInvalidSecret = errors.New("invalid credential secret")
 
-// CredentialSource resolves the secret for a provider.
+// Secret is everything the TEE needs to authenticate one provider's upstream
+// request: the token itself plus the header it is presented in. It arrives on
+// every job inside spec.Credential — sealed to the TEE's inbox key by the
+// provider's agent, relayed as ciphertext by the Hub, decrypted here per
+// request — and never lives in the TEE between jobs.
 //
-// The secret is the one value in the system that must never leave the enclave.
-// It is deliberately not part of the policy (which is signed, distributed,
-// and logged) and not part of the receipt (which is published). This interface
-// exists so that the storage behind it — an in-memory map today, a sealed
-// vault later — can change without the execution path noticing.
-type CredentialSource interface {
-	// Credential returns the secret for a provider. The second return value is
-	// false when the provider has no credential loaded.
-	Credential(ctx context.Context, provider string) (string, bool)
-}
-
-// StaticCredentials is an in-memory credential store.
+// The three fields cover every major AI service's auth shape:
 //
-// It is the first-version implementation: the TEE is provisioned with the
-// secrets it needs and they live only in its memory. A production deployment
-// should replace it with something that unseals from the platform's sealing
-// key, but the shape of the interface is the same.
-type StaticCredentials struct {
-	mu    sync.RWMutex
-	store map[string]string
+//   - OpenAI and most others: Header "authorization", Scheme "Bearer" →
+//     "Authorization: Bearer <token>".
+//   - Anthropic:              Header "x-api-key", Scheme "" →
+//     "x-api-key: <token>".
+//   - Anything custom:        any header name, optional scheme prefix.
+//
+// A zero Secret (empty header, token, scheme) means the provider needs no
+// authentication: nothing is injected. A declared header with an empty token
+// is invalid — a header that would carry nothing is a misconfiguration, and
+// silently sending it would make a later 401 look like a provider problem.
+type Secret struct {
+	// Token is the raw credential value (e.g. the API key).
+	Token string
+	// Header names the request header the token is placed in, e.g.
+	// "authorization" or "x-api-key". Empty means no authentication.
+	Header string
+	// Scheme is a prefix such as "Bearer". Empty means the token is the whole
+	// header value (e.g. Anthropic's "x-api-key").
+	Scheme string
 }
 
-// NewStaticCredentials returns an empty in-memory store.
-func NewStaticCredentials() *StaticCredentials {
-	return &StaticCredentials{store: make(map[string]string)}
+// Validate checks the shape of a credential secret. It runs inside the TEE as
+// an envelope is opened, so an unsafe header can never reach the wire.
+func (s Secret) Validate() error {
+	if s.Header == "" {
+		if s.Token != "" || s.Scheme != "" {
+			return fmt.Errorf("%w: token or scheme without a header", ErrInvalidSecret)
+		}
+		return nil // no authentication
+	}
+	if !isHeaderToken(s.Header) {
+		return fmt.Errorf("%w: %q is not a valid header name", ErrInvalidSecret, s.Header)
+	}
+	if isReservedInjectionHeader(s.Header) {
+		return fmt.Errorf("%w: %q must not be injected", ErrInvalidSecret, s.Header)
+	}
+	if s.Scheme != "" && !isHeaderToken(s.Scheme) {
+		return fmt.Errorf("%w: %q is not a valid scheme", ErrInvalidSecret, s.Scheme)
+	}
+	if s.Token == "" {
+		return fmt.Errorf("%w: empty token behind header %q", ErrInvalidSecret, s.Header)
+	}
+	if err := validateTokenValue(s.Token); err != nil {
+		return err
+	}
+	return nil
 }
 
-// Set installs or replaces a provider's credential.
-func (s *StaticCredentials) Set(provider, secret string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.store[provider] = secret
+// Render returns the header name and value to put on the wire.
+func (s Secret) Render() (string, string, error) {
+	if err := s.Validate(); err != nil {
+		return "", "", err
+	}
+	if s.Scheme == "" {
+		return s.Header, s.Token, nil
+	}
+	return s.Header, s.Scheme + " " + s.Token, nil
 }
 
-// Remove drops a provider's credential, immediately making its jobs
-// unexecutable.
-func (s *StaticCredentials) Remove(provider string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.store, provider)
+// validateTokenValue rejects a token that could tamper with the request
+// framing: control characters would smuggle a header line, and surrounding
+// whitespace would change the header value the upstream parses.
+func validateTokenValue(token string) error {
+	if strings.ContainsAny(token, "\r\n\x00") {
+		return fmt.Errorf("%w: token contains a control character", ErrInvalidSecret)
+	}
+	if strings.TrimSpace(token) != token {
+		return fmt.Errorf("%w: token has surrounding whitespace", ErrInvalidSecret)
+	}
+	return nil
 }
 
-// Credential returns the secret for a provider.
-func (s *StaticCredentials) Credential(_ context.Context, provider string) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	secret, ok := s.store[provider]
-	return secret, ok
+// reservedInjectionHeaders are headers a secret must never be injected into.
+// They either describe the framing the TEE itself controls (host,
+// content-length, transfer-encoding, connection, upgrade, te) or they change
+// how the proxy-hop is interpreted (proxy-authorization, trailer). The
+// regular job headers the caller may set are a separate list enforced by jobs;
+// this list only bounds the credential's own placement.
+var reservedInjectionHeaders = []string{
+	"host",
+	"content-length",
+	"transfer-encoding",
+	"connection",
+	"upgrade",
+	"te",
+	"trailer",
+	"proxy-authorization",
 }
 
-// missingCredential is the error returned when a provider has no secret loaded
-// and the job therefore cannot be executed.
-func missingCredential(provider string) error {
-	return fmt.Errorf("%w: %q", ErrCredentialUnavailable, provider)
+func isReservedInjectionHeader(name string) bool {
+	for _, reserved := range reservedInjectionHeaders {
+		if strings.EqualFold(name, reserved) {
+			return true
+		}
+	}
+	return false
+}
+
+func isHeaderToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r > 127 {
+			return false
+		}
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') {
+			continue
+		}
+		switch r {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
 }

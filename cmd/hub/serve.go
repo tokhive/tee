@@ -72,8 +72,9 @@ var userRoutes = []userRoute{
 // dials to carry egress across those tunnels. Mounting them is what turns the
 // Hub into the rendezvous point for NAT-trapped contributors.
 const (
-	agentGatePath = "/v1/agent"
-	teeRelayPath  = "/v1/relay"
+	agentGatePath     = "/v1/agent"
+	teeRelayPath      = "/v1/relay"
+	credentialKeyPath = "/v1/credential-key"
 )
 
 var relayUpgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -92,9 +93,11 @@ func runServe(h *hub.Hub, cfg serveConfig) {
 	mux.Handle(sessionPath, &sessionHandler{h: h, cfg: cfg})
 	mux.Handle(agentGatePath, h.AgentGate(relayUpgrader))
 	mux.Handle(teeRelayPath, h.TeeRelay(relayUpgrader))
+	mux.HandleFunc(credentialKeyPath, h.CredentialKeyHandler)
 	log.Printf("hub user-facing API listening on http://%s%v (sessions at %s)",
 		cfg.Addr, routePaths(), sessionPath)
-	log.Printf("hub reverse-tunnel endpoints: agent gate %s, tee relay %s", agentGatePath, teeRelayPath)
+	log.Printf("hub reverse-tunnel endpoints: agent gate %s, tee relay %s, credential key %s",
+		agentGatePath, teeRelayPath, credentialKeyPath)
 	log.Fatal(http.ListenAndServe(cfg.Addr, mux))
 }
 

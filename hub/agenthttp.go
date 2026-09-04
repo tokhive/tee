@@ -6,14 +6,16 @@ import (
 	"net/http"
 
 	"github.com/gorilla/websocket"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tunnel"
 )
 
 // AgentGate is the HTTP gateway a Provider Agent dials to come online. It
 // enforces the shared-key gate, then serves the agent's control stream: the
-// first stream the agent opens must be an AgentRegister, and while that stream
-// stays open the agent counts as online. The returned handler is stateless and
-// safe to mount on a ServeMux (e.g. cmd/hub's resident service).
+// first stream the agent opens must be an AgentRegister (which carries the
+// provider's token sealed to the TEE), and while that stream stays open the
+// agent counts as online. The returned handler is stateless and safe to mount
+// on a ServeMux (e.g. cmd/hub's resident service).
 func (h *Hub) AgentGate(upgrader websocket.Upgrader) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !agentKeyMatches([]byte(r.Header.Get(AgentKeyHeader)), h.agentSecret) {
@@ -26,6 +28,24 @@ func (h *Hub) AgentGate(upgrader websocket.Upgrader) http.Handler {
 		}
 		go h.serveAgentTunnel(conn)
 	})
+}
+
+// CredentialKeyHandler serves the TEE's inbox public key to provider agents:
+// GET /v1/credential-key. Agents fetch it (through the Hub, over ordinary
+// HTTP) and encrypt their tokens to it, so the Hub relays only ciphertext.
+func (h *Hub) CredentialKeyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	key, err := h.CredentialKey(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.Header().Set("Content-Type", tee.CredentialKeyContentType)
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(key)
 }
 
 // serveAgentTunnel runs one agent's dialed-in tunnel to its end. The agent's
@@ -54,11 +74,23 @@ func (h *Hub) serveAgentTunnel(conn *websocket.Conn) {
 			_ = control.Close()
 			return
 		}
+		// The token must be in the TEE before the agent counts as online:
+		// making a credential-less agent schedulable would route jobs straight
+		// into a refusal. The envelope is ciphertext to the Hub.
+		if err := h.deliverCredential(reg); err != nil {
+			_ = control.Close()
+			return
+		}
 		h.agents.register(&agentConn{provider: reg.Provider, price: price, mux: mux})
 		// The control stream is the agent's lease on being online: drain it until
-		// it closes, then drop the tunnel from the scheduler.
+		// it closes, then drop the tunnel from the scheduler and revoke the token
+		// so it is never used while its agent is offline. Revoking is gated on the
+		// tunnel having been the current one: a stale agent that lost a race to a
+		// replacement must not delete the replacement's freshly-registered token.
 		_, _ = io.Copy(io.Discard, control)
-		h.agents.deregister(reg.Provider, mux)
+		if h.agents.deregister(reg.Provider, mux) {
+			h.revokeCredential(reg.Provider)
+		}
 	})
 	<-done
 	_ = mux.Close()

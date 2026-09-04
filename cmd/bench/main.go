@@ -3,7 +3,7 @@
 // two configurations and comparing them:
 //
 //	direct  -> client talks straight to the mock provider over real TLS
-//	tee     -> client -> simulated TEE -> SOCKS5 Provider Agent -> provider
+//	tee     -> client -> simulated TEE -> Hub relay -> Agent -> provider
 //
 // The delta between the two is the cost of the trusted layer (TEE + Agent):
 //
@@ -86,6 +86,7 @@ func main() {
 	teeURL := flag.String("tee", "http://127.0.0.1:18090", "TEE base URL")
 	model := flag.String("model", "sim-mock-0.5b", "declared model")
 	baselineRTT := flag.Duration("baseline-rtt", 0, "nominal production first-byte latency; enables §9 relative TTFT gate")
+	credential := flag.String("credential", "", "provider access token; when set it is sealed to the TEE and carried on every tee-mode job, as a dialing agent would deliver it through a Hub")
 	gate := flag.Bool("gate", true, "exit non-zero if a hard gate fails")
 	out := flag.String("out", "", "write the combined JSON report to this path")
 	flag.Parse()
@@ -97,6 +98,28 @@ func main() {
 
 	body := []byte(`{"model":"` + *model + `","messages":[{"role":"user","content":"你是谁？"}],"stream":true}`)
 
+	// The TEE stores no token: every tee-mode job carries the provider's token
+	// sealed to the TEE's inbox key, exactly as a Hub dispatcher would attach the
+	// envelope a dialing agent registered. null when no token is supplied (a job
+	// the TEE will refuse — the flag exists so the harness can be explicit).
+	var cred []byte
+	if *credential != "" {
+		env, err := shared.SealCredential(*teeURL, "openai-sim", tee.Secret{
+			Token:  *credential,
+			Header: "authorization",
+			Scheme: "Bearer",
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bench: seal credential: %v\n", err)
+			os.Exit(2)
+		}
+		cred, err = env.EncodeCanonical()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bench: encode credential: %v\n", err)
+			os.Exit(2)
+		}
+	}
+
 	var direct, teeRep *report
 	var dErr, tErr error
 
@@ -107,7 +130,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "bench: direct mode: %v\n", dErr)
 		}
 	case "tee":
-		teeRep, tErr = runTEE(*n, *provider, *query, *maxBytes, body, *teeURL)
+		teeRep, tErr = runTEE(*n, *provider, *query, *maxBytes, body, *teeURL, cred)
 		if tErr != nil {
 			fmt.Fprintf(os.Stderr, "bench: tee mode: %v\n", tErr)
 		}
@@ -116,7 +139,7 @@ func main() {
 		if dErr != nil {
 			fmt.Fprintf(os.Stderr, "bench: direct mode: %v\n", dErr)
 		}
-		teeRep, tErr = runTEE(*n, *provider, *query, *maxBytes, body, *teeURL)
+		teeRep, tErr = runTEE(*n, *provider, *query, *maxBytes, body, *teeURL, cred)
 		if tErr != nil {
 			fmt.Fprintf(os.Stderr, "bench: tee mode: %v\n", tErr)
 		}
@@ -201,9 +224,9 @@ func oneDirect(client *http.Client, url string, body []byte, maxBytes uint64) (s
 }
 
 // ---------------------------------------------------------------------------
-// TEE mode: client -> simulated TEE -> SOCKS5 Agent -> provider.
+// TEE mode: client -> simulated TEE -> Hub relay -> Agent -> provider.
 // ---------------------------------------------------------------------------
-func runTEE(n int, host, query string, maxBytes uint64, body []byte, teeURL string) (*report, error) {
+func runTEE(n int, host, query string, maxBytes uint64, body []byte, teeURL string, cred []byte) (*report, error) {
 	client := &http.Client{} // plain HTTP to the local TEE
 	samples := make([]sample, 0, n)
 	totalWall := time.Duration(0)
@@ -213,6 +236,7 @@ func runTEE(n int, host, query string, maxBytes uint64, body []byte, teeURL stri
 		if err != nil {
 			return nil, err
 		}
+		spec.Credential = cred
 		s, err := oneTEE(client, teeURL, spec, body)
 		if err != nil {
 			return nil, err

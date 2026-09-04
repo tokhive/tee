@@ -33,9 +33,11 @@ func newServeTestHub(t *testing.T, upstream []byte) *hub.Hub {
 func newServeTestHubReply(t *testing.T, upstream []byte, fail error) *hub.Hub {
 	t.Helper()
 
-	// The sim fixtures (providers.json, seller rate table for openai-sim and
-	// cheap-sim) are generated into a private temp dir so the test never
-	// touches the working tree's .sim.
+	// The sim fixtures (seller rate table for openai-sim and cheap-sim, plus
+	// the per-provider whitelist policies) are generated into a private temp
+	// dir so the test never touches the working tree's .sim. Credentials are
+	// deliberately absent: they arrive at runtime through agent registration,
+	// which these route tests do not exercise (they use a scripted TEE).
 	simDir := t.TempDir()
 	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
 	if err := shared.EnsureDefaults(); err != nil {

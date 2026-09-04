@@ -37,7 +37,7 @@ func (c *fakeSessionConn) Close() error                { return nil }
 func newSessionForTest(t *testing.T, conn SessionConn) *Session {
 	t.Helper()
 	env := newTestEnv(t)
-	spec := testSpec(t, nil)
+	spec := env.spec(t, nil)
 	spec.Session = true
 	spec.Method = "GET"
 	hash, err := spec.Hash()

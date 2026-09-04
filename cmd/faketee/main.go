@@ -138,13 +138,14 @@ func main() {
 		log.Fatalf("write tee identity: %v", err)
 	}
 
-	creds := tee.NewStaticCredentials()
-	providers, err := shared.LoadProviders()
+	// The A-layer fake never egresses: its transport answers with canned bytes,
+	// so the execution path only needs to decrypt a job's envelope. Like the real
+	// TEE it stores no credential — it holds an inbox key, and each job brings its
+	// provider's token sealed to it. The credential-key endpoint is served so the
+	// agent-registration/one-shot sealing path can be exercised end to end.
+	inbox, err := tee.GenerateInboxKey()
 	if err != nil {
-		log.Fatalf("load providers: %v", err)
-	}
-	for p, tok := range providers {
-		creds.Set(p, tok)
+		log.Fatalf("generate inbox key: %v", err)
 	}
 
 	signer := proof.NewSigner(epoch)
@@ -161,11 +162,11 @@ func main() {
 	}
 
 	svc, err := tee.NewService(tee.Config{
-		Policies:    policies,
-		Credentials: creds,
-		Transport:   scriptedTransport{},
-		Signer:      signer,
-		Seq:         store,
+		Policies:  policies,
+		Transport: scriptedTransport{},
+		Signer:    signer,
+		Seq:       store,
+		InboxKey:  inbox,
 	})
 	if err != nil {
 		log.Fatalf("build service: %v", err)
@@ -174,6 +175,11 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/execute", func(w http.ResponseWriter, r *http.Request) {
 		tee.ServeExecute(svc, w, r)
+	})
+	// Credential plane, mirroring cmd/tee: agents (or one-shot tools) fetch the
+	// inbox key, seal their token to it, and present the envelope on each job.
+	mux.HandleFunc("/v1/credential-key", func(w http.ResponseWriter, r *http.Request) {
+		tee.ServeCredentialKey(inbox, w, r)
 	})
 	log.Printf("faketee (in-memory A-layer TEE, real service) listening on http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))

@@ -1,7 +1,9 @@
 // Package shared holds the small, reusable pieces the simulation binaries
 // (mockprovider, tee, faketee, hub, verify, agent) share: the .sim working
-// directory, the provider-credential fixtures, the provider-signed policy the
-// TEE loads, and a throwaway test CA.
+// directory, the provider-signed policy the TEE loads, the Hub's seller rate
+// table, a throwaway test CA, and the one-shot credential registration the
+// simulation-only CLI tools (hub -n, streamer) use when they talk to a TEE
+// directly instead of through a resident Hub with dialing agents.
 //
 // Nothing here is production code. It exists so the simulation runs end to end
 // on a laptop with zero external dependencies and zero real credentials, while
@@ -11,6 +13,7 @@
 package shared
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -24,12 +27,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
 // Default fixtures. The provider's own key signs the policy; the TEE only ever
@@ -50,23 +55,14 @@ func ConfigDir() string {
 	return ".sim"
 }
 
-// Providers maps a provider name to the credential (API token) the TEE must
-// keep secret. The Hub never sees these values.
-type Providers map[string]string
-
-// EnsureDefaults writes the fixture files if they are missing: the provider
-// credentials, a Hub-predefined whitelist policy per provider (NO provider
-// signature — it is deployment config, not a provider-authored document), and
-// the Hub's seller-reported rate table.
+// EnsureDefaults writes the fixture files if they are missing: a
+// Hub-predefined whitelist policy per provider (NO provider signature — it is
+// deployment config, not a provider-authored document), and the Hub's
+// seller-reported rate table. Credentials are intentionally NOT written: they
+// arrive at runtime through agent registration (see the package comment).
 func EnsureDefaults() error {
 	dir := ConfigDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	if err := writeIfAbsent(filepath.Join(dir, "providers.json"), Providers{
-		providerName:  "sk-sim-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-		providerCheap: "sk-sim-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
-	}); err != nil {
 		return err
 	}
 	if err := writeIfAbsent(filepath.Join(dir, "rates.json"), DefaultRates()); err != nil {
@@ -108,6 +104,28 @@ func LoadRates() (Rates, error) {
 		return nil, err
 	}
 	return rates, nil
+}
+
+// SealCredential fetches a TEE's inbox public key and seals a provider's token
+// to it, returning the envelope a caller can carry into a job's spec.Credential.
+// It is the sender half of agent registration for a caller that talks to a TEE
+// directly (no dialing agent): the token travels sealed, and only the TEE
+// holding the matching private key can open it. The TEE itself stores nothing —
+// the sealed token lives wherever the caller puts it, and is presented on each
+// job.
+//
+// teeBase is the TEE's root URL, e.g. http://127.0.0.1:18095.
+func SealCredential(teeBase, provider string, secret tee.Secret) (tee.Envelope, error) {
+	keyURL := strings.TrimSuffix(teeBase, "/") + "/v1/credential-key"
+	pub, err := tee.CredentialKeyRequest(context.Background(), nil, keyURL)
+	if err != nil {
+		return tee.Envelope{}, fmt.Errorf("fetch inbox key: %w", err)
+	}
+	envelope, err := tee.EncryptCredential(pub, provider, secret)
+	if err != nil {
+		return tee.Envelope{}, fmt.Errorf("seal credential: %w", err)
+	}
+	return envelope, nil
 }
 
 // writePolicy encodes and writes a Hub-predefined whitelist policy to its
@@ -166,7 +184,6 @@ func providerPolicy(provider string) policy.Policy {
 		// set because the tunnel is unbounded by definition.
 		{Methods: []string{"GET"}, Path: "/v1/realtime", AllowStream: true, AllowAnyQuery: true},
 	}
-	credential := policy.Credential{Header: "Authorization", Scheme: "Bearer"}
 	limits := policy.Limits{
 		MaxResponseBytes: 1 << 20,
 		MaxBodyBytes:     1 << 20,
@@ -174,14 +191,13 @@ func providerPolicy(provider string) policy.Policy {
 	}
 
 	return policy.Policy{
-		Version:    policy.VersionV1,
-		Provider:   provider,
-		Hosts:      hosts,
-		Rules:      rules,
-		Credential: credential,
-		Limits:     limits,
-		IssuedAt:   now.Unix(),
-		ExpiresAt:  now.Add(365 * 24 * time.Hour).Unix(),
+		Version:   policy.VersionV1,
+		Provider:  provider,
+		Hosts:     hosts,
+		Rules:     rules,
+		Limits:    limits,
+		IssuedAt:  now.Unix(),
+		ExpiresAt: now.Add(365 * 24 * time.Hour).Unix(),
 	}
 }
 
@@ -237,15 +253,6 @@ func LoadPolicySetAll() (*policy.Set, error) {
 		return nil, fmt.Errorf("install policies: %w", err)
 	}
 	return set, nil
-}
-
-// LoadProviders reads the provider-credential fixture.
-func LoadProviders() (Providers, error) {
-	var p Providers
-	if err := readJSON(filepath.Join(ConfigDir(), "providers.json"), &p); err != nil {
-		return nil, err
-	}
-	return p, nil
 }
 
 // WriteTEEIdentity persists the public identity of a sim epoch so the verifier

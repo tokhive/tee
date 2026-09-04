@@ -26,15 +26,12 @@ func hostOf(srv *httptest.Server) string {
 }
 
 // newTestManager builds a ChannelManager that dials the provider directly (no
-// agent), using the plain-text scheme so the tests can inspect bytes.
+// relay), using the plain-text scheme so the tests can inspect bytes.
 func newTestManager(t *testing.T) *ChannelManager {
 	t.Helper()
-	reg := NewRegistry()
-	reg.Set("p", Endpoint{})
 	cm, err := NewChannelManager(ChannelConfig{
 		Scheme:         "http",
 		AllowPlaintext: true,
-		Endpoints:      reg,
 	})
 	if err != nil {
 		t.Fatalf("NewChannelManager: %v", err)
@@ -189,13 +186,9 @@ func TestChannelProviderIsolation(t *testing.T) {
 		fmt.Fprint(w, "ok")
 	})
 
-	reg := NewRegistry()
-	reg.Set("a", Endpoint{})
-	reg.Set("b", Endpoint{})
 	cm, err := NewChannelManager(ChannelConfig{
 		Scheme:         "http",
 		AllowPlaintext: true,
-		Endpoints:      reg,
 	})
 	if err != nil {
 		t.Fatalf("NewChannelManager: %v", err)
@@ -244,12 +237,9 @@ func TestChannelDeadConnectionReDialsOnce(t *testing.T) {
 		}
 	}()
 
-	reg := NewRegistry()
-	reg.Set("p", Endpoint{})
 	cm, err := NewChannelManager(ChannelConfig{
 		Scheme:         "http",
 		AllowPlaintext: true,
-		Endpoints:      reg,
 	})
 	if err != nil {
 		t.Fatalf("NewChannelManager: %v", err)
@@ -324,12 +314,9 @@ func TestChannelIdleConnectionsAreReaped(t *testing.T) {
 	srv.Start()
 	defer srv.Close()
 
-	reg := NewRegistry()
-	reg.Set("p", Endpoint{})
 	cm, err := NewChannelManager(ChannelConfig{
 		Scheme:         "http",
 		AllowPlaintext: true,
-		Endpoints:      reg,
 		IdleTimeout:    150 * time.Millisecond,
 	})
 	if err != nil {
@@ -535,38 +522,11 @@ func TestChannelCompressedBodyPassesThroughVerbatim(t *testing.T) {
 	}
 }
 
-func TestChannelUnknownEndpoint(t *testing.T) {
-	reg := NewRegistry()
-	cm, err := NewChannelManager(ChannelConfig{
-		Scheme:         "http",
-		AllowPlaintext: true,
-		Endpoints:      reg,
-	})
-	if err != nil {
-		t.Fatalf("NewChannelManager: %v", err)
-	}
-	defer func() { _ = cm.Close() }()
-
-	_, err = cm.Do(context.Background(),
-		tee.Request{Method: "GET", Provider: "nobody", Host: "127.0.0.1:1", Path: "/v1/x"},
-		func([]byte) error { return nil })
-	if !errors.Is(err, ErrUnknownEndpoint) {
-		t.Fatalf("error = %v, want ErrUnknownEndpoint", err)
-	}
-}
-
 func TestChannelSchemeValidation(t *testing.T) {
-	reg := NewRegistry()
-	if _, err := NewChannelManager(ChannelConfig{Scheme: "ftp", Endpoints: reg}); !errors.Is(err, ErrUnsupportedScheme) {
+	if _, err := NewChannelManager(ChannelConfig{Scheme: "ftp"}); !errors.Is(err, ErrUnsupportedScheme) {
 		t.Fatalf("error = %v, want ErrUnsupportedScheme", err)
 	}
-	if _, err := NewChannelManager(ChannelConfig{Scheme: "http", Endpoints: reg}); !errors.Is(err, ErrPlaintextNotAllowed) {
+	if _, err := NewChannelManager(ChannelConfig{Scheme: "http"}); !errors.Is(err, ErrPlaintextNotAllowed) {
 		t.Fatalf("error = %v, want ErrPlaintextNotAllowed", err)
-	}
-}
-
-func TestChannelNoRegistry(t *testing.T) {
-	if _, err := NewChannelManager(ChannelConfig{Scheme: "https"}); err == nil {
-		t.Fatal("expected an error for a missing endpoint registry")
 	}
 }

@@ -34,7 +34,6 @@ var (
 type Decision struct {
 	Provider         string
 	Rule             Rule
-	Credential       Credential
 	MaxResponseBytes uint64
 	MaxBodyBytes     uint64
 
@@ -124,7 +123,6 @@ func (p Policy) authorize(spec jobs.Spec) (Decision, error) {
 	return Decision{
 		Provider:         p.Provider,
 		Rule:             rule,
-		Credential:       p.Credential,
 		MaxResponseBytes: maxResponseBytes,
 		MaxBodyBytes:     p.Limits.MaxBodyBytes,
 		PolicyHash:       hash[:],

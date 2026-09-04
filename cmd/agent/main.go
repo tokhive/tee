@@ -22,6 +22,7 @@ import (
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/provider"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
 func main() {
@@ -32,6 +33,9 @@ func main() {
 	price := flag.Int64("price", 0, "per-request price in micro-units; 0 accepts the Hub's platform default for this provider")
 	targets := flag.String("targets", "127.0.0.1:18080", "comma-separated host:port the agent may dial (the AI provider endpoint)")
 	tap := flag.String("tap", "", "file to mirror every relayed byte into (test/demo: proves the agent only sees ciphertext)")
+	token := flag.String("token", "", "the provider's access token (API key). Required; sealed to the TEE at registration — the Hub never sees it")
+	authScheme := flag.String("auth-scheme", "auto", "prefix before the token in the auth header: auto, a literal scheme (e.g. Bearer), or empty for a raw-token header")
+	authHeader := flag.String("auth-header", "authorization", "request header the token travels in (e.g. authorization, x-api-key)")
 	timeout := flag.Duration("connect-timeout", 10*time.Second, "bounds dialing the Hub and each upstream")
 	reconnect := flag.Duration("reconnect", time.Second, "pause between reconnect attempts after the tunnel drops")
 	flag.Parse()
@@ -42,10 +46,27 @@ func main() {
 	if *providerName == "" {
 		log.Fatal("agent requires -provider")
 	}
+	if *token == "" {
+		log.Fatal("agent requires -token (the provider's access token)")
+	}
 	allowed := make([]string, 0, 4)
 	for _, t := range strings.Split(*targets, ",") {
 		if t = strings.TrimSpace(t); t != "" {
 			allowed = append(allowed, t)
+		}
+	}
+
+	// Resolve the token's presentation shape. "auto" picks the convention that
+	// matches the header the seller named, so the common cases need no config at
+	// all: OpenAI and most services want "Authorization: Bearer <token>" (the
+	// whole header is the token's home), while an x-api-key-style header carries
+	// the raw token with no prefix (Anthropic, and most key-in-header services).
+	scheme := *authScheme
+	if strings.EqualFold(scheme, "auto") {
+		if strings.EqualFold(*authHeader, "authorization") {
+			scheme = "Bearer"
+		} else {
+			scheme = ""
 		}
 	}
 
@@ -58,6 +79,11 @@ func main() {
 		Self: hub.AgentRegister{
 			Provider:    *providerName,
 			DisplayName: *name,
+		},
+		Credential: tee.Secret{
+			Token:  *token,
+			Scheme: scheme,
+			Header: *authHeader,
 		},
 	}
 	if *price > 0 {
@@ -79,8 +105,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("provider agent %s online via %s (allowlist: %v, price: %s)",
-		*providerName, *gate, allowed, priceLabel(*price))
+	log.Printf("provider agent %s online via %s (allowlist: %v, price: %s, auth: %s%s)",
+		*providerName, *gate, allowed, priceLabel(*price), *authHeader, schemeLabel(scheme))
 	if err := agent.Run(ctx); err != nil {
 		log.Fatalf("agent: %v", err)
 	}
@@ -91,4 +117,11 @@ func priceLabel(micros int64) string {
 		return "platform default"
 	}
 	return strconv.FormatFloat(float64(micros)/1e6, 'f', -1, 64) + " units/request"
+}
+
+func schemeLabel(scheme string) string {
+	if scheme == "" {
+		return " (raw token)"
+	}
+	return " " + scheme
 }

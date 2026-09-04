@@ -147,7 +147,6 @@ func signedOpenAIPolicy(t *testing.T, key *ecdsa.PrivateKey) policy.SignedPolicy
 			Path:        "/v1/chat/completions",
 			AllowStream: true,
 		}},
-		Credential: policy.Credential{Header: "authorization", Scheme: "Bearer"},
 		Limits: policy.Limits{
 			MaxResponseBytes: 1 << 20,
 			MaxBodyBytes:     1 << 16,
@@ -218,14 +217,16 @@ func TestJobToReceipt(t *testing.T) {
 		t.Fatal("decision should permit streaming")
 	}
 
-	// 5. The credential is injected exactly as the policy describes. The secret
-	// never appears in the policy, only in the TEE's own store.
-	headerName, headerValue, err := decision.Credential.Inject("sk-integration-token")
-	if err != nil {
-		t.Fatalf("inject credential: %v", err)
+	// 5. The credential arrives at the TEE through agent registration: a secret
+	// whose header/scheme shape travels with the token, never in the policy. It
+	// is sealed by the agent, opened in-enclave, and injected at execution.
+	secret := tee.Secret{Token: "sk-integration-token", Header: "authorization", Scheme: "Bearer"}
+	if err := secret.Validate(); err != nil {
+		t.Fatalf("validate secret: %v", err)
 	}
-	if headerName != "authorization" || headerValue != "Bearer sk-integration-token" {
-		t.Fatalf("injected header = %q: %q", headerName, headerValue)
+	if headerName, headerValue, err := secret.Render(); err != nil ||
+		headerName != "authorization" || headerValue != "Bearer sk-integration-token" {
+		t.Fatalf("rendered header = %q: %q (err %v)", headerName, headerValue, err)
 	}
 
 	// 6. The TEE executes. The bytes it sends must be the bytes the spec
@@ -534,28 +535,42 @@ func (s *scriptedTransport) Do(_ context.Context, req tee.Request, onChunk func(
 	return tee.Response{StatusCode: s.statusCode}, nil
 }
 
-func newService(t *testing.T, epoch *fakeEpoch, transport tee.Transport) *tee.Service {
+func newService(t *testing.T, epoch *fakeEpoch, transport tee.Transport) (*tee.Service, []byte) {
 	t.Helper()
 
 	policies := policy.NewSet()
 	if err := policies.Add(signedOpenAIPolicy(t, generateKey(t)), now); err != nil {
 		t.Fatalf("install policy: %v", err)
 	}
-	credentials := tee.NewStaticCredentials()
-	credentials.Set("openai", "sk-integration-token")
+	inbox, err := tee.GenerateInboxKey()
+	if err != nil {
+		t.Fatalf("inbox key: %v", err)
+	}
 
 	service, err := tee.NewService(tee.Config{
-		Policies:    policies,
-		Credentials: credentials,
-		Transport:   transport,
-		Signer:      proof.NewSigner(epoch),
-		Clock:       func() time.Time { return now },
-		Seq:         tee.NewMemorySeqStore(),
+		Policies:  policies,
+		Transport: transport,
+		Signer:    proof.NewSigner(epoch),
+		Clock:     func() time.Time { return now },
+		Seq:       tee.NewMemorySeqStore(),
+		InboxKey:  inbox,
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}
-	return service
+
+	// The TEE stores no token: each test seals the shared secret to the inbox
+	// key below and must attach the envelope to every spec it runs.
+	env, err := tee.EncryptCredential(inbox.Public(), "openai",
+		tee.Secret{Token: "sk-integration-token", Header: "authorization", Scheme: "Bearer"})
+	if err != nil {
+		t.Fatalf("seal credential: %v", err)
+	}
+	cred, err := env.EncodeCanonical()
+	if err != nil {
+		t.Fatalf("encode credential: %v", err)
+	}
+	return service, cred
 }
 
 // TestServiceProducesAVerifiableReceipt drives the real tee.Service rather than
@@ -576,9 +591,10 @@ func TestServiceProducesAVerifiableReceipt(t *testing.T) {
 			[]byte("data: [DONE]\n\n"),
 		},
 	}
-	service := newService(t, epoch, transport)
+	service, cred := newService(t, epoch, transport)
 
 	spec, body := chatCompletion(t)
+	spec.Credential = cred
 
 	var relayed [][]byte
 	result, err := service.Execute(context.Background(), tee.Job{Spec: spec, Body: body}, func(chunk []byte) error {
@@ -631,10 +647,11 @@ func TestServiceProducesAVerifiableReceipt(t *testing.T) {
 func TestServiceRefusesWithoutDiallingTheProvider(t *testing.T) {
 	epoch := newEpoch(t)
 	transport := &scriptedTransport{statusCode: 200}
-	service := newService(t, epoch, transport)
+	service, cred := newService(t, epoch, transport)
 
 	spec, body := chatCompletion(t)
 	spec.Path = "/v1/account"
+	spec.Credential = cred
 
 	result, err := service.Execute(context.Background(), tee.Job{Spec: spec, Body: body}, nil)
 	if err == nil {
@@ -657,9 +674,10 @@ func TestServiceAttestsAFailedExchange(t *testing.T) {
 		statusCode: 0,
 		chunks:     [][]byte{[]byte("data: partial\n\n")},
 	}
-	service := newService(t, epoch, &failingTransport{inner: transport})
+	service, cred := newService(t, epoch, &failingTransport{inner: transport})
 
 	spec, body := chatCompletion(t)
+	spec.Credential = cred
 	result, err := service.Execute(context.Background(), tee.Job{Spec: spec, Body: body}, nil)
 	if err != nil {
 		t.Fatalf("execute: %v", err)

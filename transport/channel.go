@@ -17,9 +17,6 @@ import (
 
 // ChannelConfig assembles a ChannelManager.
 type ChannelConfig struct {
-	// Endpoints resolves a provider name to its egress Agent address. Required.
-	Endpoints *EndpointRegistry
-
 	// Scheme is "https" or "http" for provider requests. Defaults to "https".
 	Scheme string
 
@@ -46,11 +43,10 @@ type ChannelConfig struct {
 
 	// RelayURL, when set, is the Hub's TeeRelay WebSocket endpoint. The manager
 	// then dials every provider connection as a stream over one persistent hub
-	// relay tunnel (the Provider Agent dials the Hub in reverse), instead of
-	// dialing the provider's agent directly. TLS still terminates in the TEE over
-	// the stream, so the connection-resident split is unchanged. When empty, the
-	// legacy Endpoints path is used (a TEE co-located with the provider, or the
-	// embedded transport tests).
+	// relay tunnel (the Provider Agent dials the Hub in reverse). TLS still
+	// terminates in the TEE over the stream, so the connection-resident split is
+	// unchanged. When empty, the manager dials req.Host directly (used by the
+	// embedded transport tests and colocated simulation runs).
 	RelayURL string
 }
 
@@ -133,9 +129,6 @@ func (p pairKey) String() string { return p.provider + "\x00" + p.host }
 
 // NewChannelManager validates the configuration and returns a ready manager.
 func NewChannelManager(cfg ChannelConfig) (*ChannelManager, error) {
-	if cfg.Endpoints == nil && cfg.RelayURL == "" {
-		return nil, errors.New("channel manager: no endpoint registry and no relay URL")
-	}
 	scheme := cfg.Scheme
 	if scheme == "" {
 		scheme = DefaultScheme
@@ -390,24 +383,17 @@ func (m *ChannelManager) dial(ctx context.Context, pool *channelPool, req tee.Re
 
 // dialTCP opens the raw pipe to req.Host and wraps it in TLS when the scheme
 // needs it. Through the Hub relay the pipe is a stream over the provider's
-// reverse tunnel; otherwise it is a direct (or legacy SOCKS5) TCP connection. In
-// both cases TLS terminates here, inside the TEE.
+// reverse tunnel; without a relay it is a direct TCP connection (transport
+// tests and colocated simulation runs). In both cases TLS terminates here,
+// inside the TEE, and the provider name never appears on the wire.
 func (m *ChannelManager) dialTCP(ctx context.Context, req tee.Request) (net.Conn, error) {
 	var conn net.Conn
 	var err error
 	if m.relay != nil {
 		conn, err = m.relay.Dial(ctx, req.Provider, req.Host)
 	} else {
-		endpoint, ok := m.cfg.Endpoints.Endpoint(req.Provider)
-		if !ok {
-			return nil, fmt.Errorf("%w: %q", ErrUnknownEndpoint, req.Provider)
-		}
-		if endpoint.AgentAddr != "" {
-			conn, err = SOCKS5Dialer(endpoint.AgentAddr, endpoint.Auth())(ctx, "tcp", req.Host)
-		} else {
-			var d net.Dialer
-			conn, err = d.DialContext(ctx, "tcp", req.Host)
-		}
+		var d net.Dialer
+		conn, err = d.DialContext(ctx, "tcp", req.Host)
 	}
 	if err != nil {
 		return nil, err

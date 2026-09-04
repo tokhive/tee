@@ -31,6 +31,7 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
 // microsPerUnit converts the rate card's integer micro-units into the units
@@ -56,6 +57,7 @@ func main() {
 	sessionMax := flag.Uint64("session-max", 1<<20, "max downlink bytes a streaming session may relay (0 = unlimited)")
 	sessionIdle := flag.Duration("session-idle", 30*time.Second, "tear a session down if the provider streams nothing this long (0 = no watchdog)")
 	agentKey := flag.String("agent-key", "", "shared key Provider Agents must present to dial in (required to make the Hub schedulable-by-online)")
+	credential := flag.String("credential", "", "provider access token to register with the TEE before the request loop (simulation one-shot mode: the CLI holds the seller's token and delivers it sealed to -tee, as a dialing agent would through a resident Hub)")
 	audit := flag.Bool("audit", false, "audit the receipt store for gaps and verify signatures")
 	flag.Parse()
 
@@ -82,8 +84,13 @@ func main() {
 		}
 	}
 
+	teeClient := &hub.HTTPTEE{
+		URL:        *teeURL + "/v1/execute",
+		SessionURL: wsEndpoint(*teeURL, "/v1/session"),
+		BaseURL:    *teeURL,
+	}
 	h, err := hub.New(hub.Config{
-		TEE:                 &hub.HTTPTEE{URL: *teeURL + "/v1/execute", SessionURL: wsEndpoint(*teeURL, "/v1/session")},
+		TEE:                 teeClient,
 		Rates:               rates,
 		Store:               store,
 		Verify:              verifyReceipt,
@@ -94,9 +101,24 @@ func main() {
 		SessionMaxDownBytes: *sessionMax,
 		SessionIdle:         *sessionIdle,
 		AgentSecret:         []byte(*agentKey),
+		Credentials:         teeClient,
 	})
 	if err != nil {
 		log.Fatalf("build hub: %v", err)
+	}
+
+	// One-shot mode talks to the TEE directly, so it delivers the credential
+	// itself (the resident serve mode receives it through dialing agents
+	// instead). Defaults mirror what the provider agent applies: Bearer over
+	// the authorization header.
+	if *credential != "" && *serveAddr == "" {
+		if err := h.RegisterCredential(context.Background(), *provider, tee.Secret{
+			Token:  *credential,
+			Header: "authorization",
+			Scheme: "Bearer",
+		}); err != nil {
+			log.Fatalf("register credential: %v", err)
+		}
 	}
 
 	// Resident user-facing mode: one OpenAI-compatible HTTP endpoint that routes

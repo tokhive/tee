@@ -68,7 +68,6 @@ var (
 	ErrInvalidHost        = errors.New("invalid host in policy")
 	ErrInvalidPathRule    = errors.New("invalid path rule")
 	ErrInvalidMethods     = errors.New("invalid method list in policy")
-	ErrInvalidCredential  = errors.New("invalid credential injection")
 	ErrInvalidLimits      = errors.New("invalid policy limits")
 	ErrInvalidQueryKey    = errors.New("invalid query key in policy")
 	ErrInvalidHeaderName  = errors.New("invalid header name in policy")
@@ -85,16 +84,22 @@ var (
 // but the keys are part of the wire format and must never be renumbered or
 // reused once a version ships.
 type Policy struct {
-	Version     uint32     `cbor:"1,keyasint"`
-	Provider    string     `cbor:"2,keyasint"`
-	DisplayName string     `cbor:"3,keyasint,omitempty"`
-	Hosts       []string   `cbor:"4,keyasint"`
-	Rules       []Rule     `cbor:"5,keyasint"`
-	Credential  Credential `cbor:"6,keyasint"`
-	Limits      Limits     `cbor:"7,keyasint"`
-	IssuedAt    int64      `cbor:"8,keyasint"`
-	ExpiresAt   int64      `cbor:"9,keyasint"`
-	ProviderKey []byte     `cbor:"10,keyasint"`
+	Version     uint32   `cbor:"1,keyasint"`
+	Provider    string   `cbor:"2,keyasint"`
+	DisplayName string   `cbor:"3,keyasint,omitempty"`
+	Hosts       []string `cbor:"4,keyasint"`
+	Rules       []Rule   `cbor:"5,keyasint"`
+
+	// Credential (old CBOR key 6) is retired: since the agent-registration
+	// redesign, the credential's injection shape (header/scheme) is sealed
+	// inside the envelope that rides on each job's spec.Credential, decrypted
+	// by the TEE per request and never stored between jobs — so it has no place
+	// in a signed, distributed policy. The key is permanently retired, exactly
+	// like the old RateCard (key 12).
+	Limits      Limits `cbor:"7,keyasint"`
+	IssuedAt    int64  `cbor:"8,keyasint"`
+	ExpiresAt   int64  `cbor:"9,keyasint"`
+	ProviderKey []byte `cbor:"10,keyasint"`
 
 	// Nonce lets a provider reissue an otherwise identical policy so that
 	// rotations produce a different policy hash. Optional.
@@ -109,17 +114,6 @@ type Rule struct {
 	AllowStream   bool     `cbor:"3,keyasint,omitempty"`
 	QueryKeys     []string `cbor:"4,keyasint,omitempty"`
 	AllowAnyQuery bool     `cbor:"5,keyasint,omitempty"`
-}
-
-// Credential describes how the TEE injects the shared credential. The secret
-// itself never appears here: a policy is signed, distributed, and logged, so
-// it may only describe the shape of the header, not its value.
-type Credential struct {
-	// Header is the request header the credential is placed in.
-	Header string `cbor:"1,keyasint"`
-	// Scheme is a prefix such as "Bearer". Empty means the token is the entire
-	// header value.
-	Scheme string `cbor:"2,keyasint,omitempty"`
 }
 
 // Limits are the bounds a job must stay inside. The TEE applies the stricter
@@ -208,9 +202,6 @@ func (p Policy) Validate() error {
 		}
 	}
 
-	if err := p.Credential.Validate(); err != nil {
-		return err
-	}
 	if err := p.Limits.Validate(); err != nil {
 		return err
 	}
@@ -278,43 +269,6 @@ func (r Rule) Validate() error {
 	return nil
 }
 
-// Inject returns the header name and value that carry the credential.
-//
-// The token is validated rather than trusted: a credential that reaches the
-// header writer with a CR/LF would let a secret leak into the request as a
-// smuggled header line, and the TEE is the last component that can stop it.
-func (c Credential) Inject(token string) (string, string, error) {
-	if err := c.Validate(); err != nil {
-		return "", "", err
-	}
-	if token == "" {
-		return "", "", fmt.Errorf("%w: empty credential", ErrInvalidCredential)
-	}
-	if strings.ContainsAny(token, "\r\n\x00") {
-		return "", "", fmt.Errorf("%w: credential contains a control character", ErrInvalidCredential)
-	}
-	if strings.TrimSpace(token) != token {
-		return "", "", fmt.Errorf("%w: credential has surrounding whitespace", ErrInvalidCredential)
-	}
-	if c.Scheme == "" {
-		return c.Header, token, nil
-	}
-	return c.Header, c.Scheme + " " + token, nil
-}
-
-func (c Credential) Validate() error {
-	if !isToken(c.Header) {
-		return fmt.Errorf("%w: %q is not a valid header name", ErrInvalidCredential, c.Header)
-	}
-	if isReservedInjectionHeader(c.Header) {
-		return fmt.Errorf("%w: %q must not be injected", ErrInvalidCredential, c.Header)
-	}
-	if c.Scheme != "" && !isToken(c.Scheme) {
-		return fmt.Errorf("%w: %q is not a valid scheme", ErrInvalidCredential, c.Scheme)
-	}
-	return nil
-}
-
 func (l Limits) Validate() error {
 	if l.MaxResponseBytes == 0 {
 		return fmt.Errorf("%w: MaxResponseBytes must be greater than zero", ErrInvalidLimits)
@@ -361,29 +315,6 @@ func validateSigningKey(publicKeyDER []byte) error {
 		return fmt.Errorf("%w: curve %q, want P-256", ErrInvalidSigningKey, publicKey.Curve.Params().Name)
 	}
 	return nil
-}
-
-// reservedInjectionHeaders are headers the credential must never be injected
-// into. They either describe the framing the TEE itself controls, or they
-// change how the proxy-hop is interpreted.
-var reservedInjectionHeaders = []string{
-	"host",
-	"content-length",
-	"transfer-encoding",
-	"connection",
-	"upgrade",
-	"te",
-	"trailer",
-	"proxy-authorization",
-}
-
-func isReservedInjectionHeader(name string) bool {
-	for _, reserved := range reservedInjectionHeaders {
-		if strings.EqualFold(name, reserved) {
-			return true
-		}
-	}
-	return false
 }
 
 func validatePolicyHost(host string) error {

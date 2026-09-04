@@ -82,6 +82,10 @@ func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 		if berr != nil {
 			return nil, jobs.Spec{}, fmt.Errorf("build session spec for %q: %w", provider, berr)
 		}
+		spec, aerr := h.attachCredential(spec)
+		if aerr != nil {
+			return nil, jobs.Spec{}, fmt.Errorf("attach credential for %q: %w", provider, aerr)
+		}
 		conn, oerr := h.tee.OpenSession(ctx, spec)
 		if oerr != nil {
 			continue

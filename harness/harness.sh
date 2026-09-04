@@ -165,15 +165,25 @@ echo "        a ProviderSeq would show up here as a missing number."
 # =====================================================================
 
 AGENT_SECRET="sim-agent-secret"
+# The sellers' access tokens. They live only in the agent processes (and, for
+# the one-shot simulation tools that talk to a TEE directly, in their -credential
+# flag): the TEE receives them sealed, and the Hub never sees them in the clear.
+# providers.json is gone — the harness defines the tokens here instead.
+TOKEN_OAI="sk-sim-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+TOKEN_CHEAP="sk-sim-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
 RT_HUB_PORT=18094          # reverse-tunnel hub shared by scenarios 9-14
 RT_HUB_WS="ws://127.0.0.1:$RT_HUB_PORT"
 HUB_WS="ws://127.0.0.1:18085"   # user-facing Hub (scenarios 15-17)
 
 # --- start the reverse-tunnel Hub for scenarios 9-14 ----------------------
 # It mounts AgentGate (/v1/agent) and TeeRelay (/v1/relay) next to the user API.
+# -tee points at the A-layer faketee (:18090, already up) purely so agents can
+# fetch a publishable inbox key to encrypt to: the gate refuses credential-less
+# registrations, and the one-shot hubs in 9-13 supply their own token to their
+# real TEE directly, so the envelope agent A deposits here is never opened.
 echo "==> starting reverse-tunnel Hub on :$RT_HUB_PORT (agent gate /v1/agent, tee relay /v1/relay)"
 "$BIN/hub" -serve "127.0.0.1:$RT_HUB_PORT" -host "127.0.0.1:$MP_PORT" \
-  -agent-key "$AGENT_SECRET" > "$SIM/hub-rt.log" 2>&1 &
+  -tee "http://127.0.0.1:$TEE_PORT" -agent-key "$AGENT_SECRET" > "$SIM/hub-rt.log" 2>&1 &
 RT_HUB_PID=$!
 wait_for_port 127.0.0.1 "$RT_HUB_PORT"
 
@@ -187,7 +197,7 @@ section "9. real TEE -> tee relay -> agent reverse tunnel -> provider (TLS)"
 
 echo "    starting provider agent A (openai-sim) dialing the reverse-tunnel hub"
 "$BIN/agent" -hub "$RT_HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
-  -targets "127.0.0.1:$MP_PORT" -tap "$SIM/tap.log" > "$SIM/agentA.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -tap "$SIM/tap.log" > "$SIM/agentA.log" 2>&1 &
 AGENT_A_PID=$!
 # The agent registers asynchronously; give it a beat before the first request.
 sleep 1
@@ -204,13 +214,13 @@ wait_for_port 127.0.0.1 "$TEE_A"
 # "[receipt]" lines scenarios 9-12 assert on.
 rm -rf "$SIM/receipts"
 
-echo "    one normal request over the real path:"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_A" -n 1
+echo "    one normal request over the real path (one-shot mode: the hub registers"
+echo "    the token to this TEE directly, as a dialing agent would through a resident hub)"
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_A" -credential "$TOKEN_OAI" -n 1
 
 echo
 echo "    --> packet-capture assertion: the agent must only relay ciphertext"
-CRED=$(python3 -c "import json;print(json.load(open('$SIM/providers.json'))['openai-sim'])" 2>/dev/null \
-       || echo "sk-sim-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+CRED="$TOKEN_OAI"
 FAIL=0
 if grep -Fqa "$CRED" "$SIM/tap.log" 2>/dev/null; then echo "      !! FAIL: credential present in agent tap"; FAIL=1; fi
 for needle in Bearer Authorization; do
@@ -233,7 +243,7 @@ wait_for_port 127.0.0.1 "$TEE_B"
 rm -rf "$SIM/receipts"
 
 echo "    launching a slow request (provider sleeps 2s) in the background:"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_B" -query "fault=slow" > "$SIM/hub-slow.log" 2>&1 &
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_B" -credential "$TOKEN_OAI" -query "fault=slow" > "$SIM/hub-slow.log" 2>&1 &
 HUB_SLOW_PID=$!
 sleep 0.6
 echo "    killing the agent mid-request (pid $AGENT_A_PID)..."
@@ -261,7 +271,7 @@ kill "$TEE_B_PID" 2>/dev/null; wait "$TEE_B_PID" 2>/dev/null
 section "11. TEE restarts with a NEW signing key (epoch rotation)"
 echo "    (a fresh sim epoch => new key; restart agent A so openai-sim is back online)"
 "$BIN/agent" -hub "$RT_HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
-  -targets "127.0.0.1:$MP_PORT" -tap "$SIM/tap.log" > "$SIM/agentA2.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -tap "$SIM/tap.log" > "$SIM/agentA2.log" 2>&1 &
 AGENT_A_PID=$!
 sleep 1
 
@@ -272,14 +282,14 @@ kill "$TEE_A_PID" 2>/dev/null; wait "$TEE_A_PID" 2>/dev/null
 TEE_A_PID=$!
 wait_for_port 127.0.0.1 "$TEE_A"
 echo "    one request under the new key; the Hub must still verify it:"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_A" -n 1
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_A" -credential "$TOKEN_OAI" -n 1
 echo "    (verification uses the signer key embedded in each receipt, so a"
 echo "     rotated key is transparent — no trust-root redeploy needed)"
 
 # --- Scenario 12: oversize response --------------------------------------
 section "12. oversize provider response -> TEE truncates at the cap"
 echo "    provider streams ~3 MiB; Hub caps the TEE at 64 KiB:"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_A" -query "fault=big" -max 65536 > "$SIM/hub-big.log" 2>&1
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_A" -credential "$TOKEN_OAI" -query "fault=big" -max 65536 > "$SIM/hub-big.log" 2>&1
 cat "$SIM/hub-big.log"
 echo "    -> expect completion=truncated and a stream hash the Hub can verify:"
 if grep -E "^\[receipt\].*completion=truncated" "$SIM/hub-big.log"; then
@@ -318,7 +328,7 @@ conns() { curl -s --noproxy '*' "http://127.0.0.1:$STATS_PORT/stats" | python3 -
 
 base=$(conns)
 echo "    baseline new_conns=$base (expect 0)"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_C" -n 5 > "$SIM/hub-resident.log" 2>&1
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_C" -credential "$TOKEN_OAI" -n 5 > "$SIM/hub-resident.log" 2>&1
 after5=$(conns)
 echo "    after 5 requests new_conns=$after5 (expect exactly 1 resident TLS session)"
 if [ "$after5" -eq $((base+1)) ]; then
@@ -328,7 +338,7 @@ else
 fi
 
 echo "    injecting a mid-stream disconnect (fault=truncate); channel must be discarded:"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_C" -query "fault=truncate" > "$SIM/hub-trunc.log" 2>&1
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_C" -credential "$TOKEN_OAI" -query "fault=truncate" > "$SIM/hub-trunc.log" 2>&1
 if grep -q "completion=truncated" "$SIM/hub-trunc.log"; then
   echo "      OK: truncate receipt (completion=truncated)"
 else
@@ -342,7 +352,7 @@ else
   echo "      !! FAIL: expected $after5, got $aftertr"
 fi
 
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_C" -n 1 > "$SIM/hub-redial.log" 2>&1
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_C" -credential "$TOKEN_OAI" -n 1 > "$SIM/hub-redial.log" 2>&1
 afterred=$(conns)
 echo "    after the next request new_conns=$afterred (expect $((aftertr+1)): a fresh dial)"
 if [ "$afterred" -eq $((aftertr+1)) ]; then
@@ -375,7 +385,7 @@ wait_for_port 127.0.0.1 "$TEE_E"
 echo "    driving a full-duplex session (uplink marker -> provider echo -> receipt):"
 "$BIN/streamer" -tee "ws://127.0.0.1:$TEE_E/v1/session" \
   -provider openai-sim -host "127.0.0.1:$MP_PORT" -path /v1/realtime \
-  -marker "streamtest-marker-14" > "$SIM/streamer.log" 2>&1
+  -credential "$TOKEN_OAI" -marker "streamtest-marker-14" > "$SIM/streamer.log" 2>&1
 cat "$SIM/streamer.log"
 
 echo "    assertion: session verified end-to-end (101, byte counts, stream hash, echo):"
@@ -416,10 +426,10 @@ wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
 echo "    two provider agents come online: cheap-sim (0.30) and openai-sim (1.00)"
 "$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider cheap-sim \
-  -targets "127.0.0.1:$MP_PORT" > "$SIM/agent-cheap.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_CHEAP" > "$SIM/agent-cheap.log" 2>&1 &
 AGENT_CHEAP_PID=$!
 "$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
-  -targets "127.0.0.1:$MP_PORT" > "$SIM/agent-oai.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" > "$SIM/agent-oai.log" 2>&1 &
 AGENT_OAI_PID=$!
 sleep 1
 
@@ -428,6 +438,11 @@ echo "    starting real tee D on :$TEE_D with the two-provider egress"
   -seq "$SIM/seqstore-t15.json" > "$SIM/teeD.log" 2>&1 &
 TEE_D_PID=$!
 wait_for_port 127.0.0.1 "$TEE_D"
+# The agents dialed in before the TEE was up and had no inbox key to encrypt to,
+# so they retry every reconnect tick. Give them a beat to re-register now that
+# the TEE relays a key; firing a request earlier would dispatch without a
+# credential and be refused.
+sleep 2
 
 echo "    sending 3 chat requests for model sim-mock-0.5b:"
 for i in 1 2 3; do
@@ -491,10 +506,10 @@ wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
 echo "    bringing the two agents back online"
 "$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider cheap-sim \
-  -targets "127.0.0.1:$MP_PORT" > "$SIM/agent-cheap16.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_CHEAP" > "$SIM/agent-cheap16.log" 2>&1 &
 AGENT_CHEAP_PID=$!
 "$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
-  -targets "127.0.0.1:$MP_PORT" > "$SIM/agent-oai16.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" > "$SIM/agent-oai16.log" 2>&1 &
 AGENT_OAI_PID=$!
 sleep 1
 
@@ -502,6 +517,10 @@ sleep 1
   -seq "$SIM/seqstore-t16.json" > "$SIM/teeD16.log" 2>&1 &
 TEE_D16_PID=$!
 wait_for_port 127.0.0.1 "$TEE_D"
+
+# Same registration beat as scenario 15: agents re-register once the TEE relays
+# an inbox key, and the requests below must not race that.
+sleep 2
 
 echo "    POST /v1/messages (Anthropic format, model claude-sim):"
 curl -s --noproxy '*' -X POST "http://127.0.0.1:$HUB_API_PORT/v1/messages" \
@@ -578,10 +597,10 @@ wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
 echo "    two provider agents online (cheap-sim cheapest for the model)"
 "$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider cheap-sim \
-  -targets "127.0.0.1:$MP_PORT" > "$SIM/agent-cheap17.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_CHEAP" > "$SIM/agent-cheap17.log" 2>&1 &
 AGENT_CHEAP_PID=$!
 "$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
-  -targets "127.0.0.1:$MP_PORT" > "$SIM/agent-oai17.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" > "$SIM/agent-oai17.log" 2>&1 &
 AGENT_OAI_PID=$!
 sleep 1
 
@@ -589,6 +608,9 @@ sleep 1
   -seq "$SIM/seqstore-t17.json" > "$SIM/teeG.log" 2>&1 &
 TEE_G_PID=$!
 wait_for_port 127.0.0.1 "$TEE_G"
+
+# Same registration beat as scenario 15.
+sleep 2
 
 echo "    a streaming session for model sim-mock-0.5b (cheapest provider = cheap-sim):"
 "$BIN/sessiondriver" -url "ws://127.0.0.1:$HUB_API_PORT/v1/session" \

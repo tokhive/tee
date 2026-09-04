@@ -19,6 +19,7 @@ import (
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
 // Wiring errors. These are construction mistakes, not runtime conditions, and
@@ -108,6 +109,20 @@ type Config struct {
 	// through the reverse-tunnel gate. Nil disables agent registration, which is
 	// a deliberate stance for a Hub that only runs against scripted stand-ins.
 	AgentSecret []byte
+
+	// Credentials is the TEE's credential plane (see CredentialService): its
+	// only job is to publish the TEE's inbox public key, which provider agents
+	// fetch (through the Hub) to encrypt their tokens to. Required to host
+	// agents or to publish a key at all.
+	Credentials CredentialService
+
+	// CredentialStore persists the envelopes provider agents register on
+	// dial-in: the token sealed to the TEE's inbox key, never the plaintext.
+	// The Hub attaches the stored envelope to every job it dispatches to that
+	// provider (see Execute), so the TEE can decrypt it per request. Defaults
+	// to an in-memory store when nil; a resident Hub passes a file-backed store
+	// so envelopes survive restarts.
+	CredentialStore CredentialStore
 }
 
 // Hub turns a job into a settled charge and an auditable receipt.
@@ -126,8 +141,10 @@ type Hub struct {
 	sessionMaxDownBytes uint64
 	sessionIdle         time.Duration
 
-	agents      *agentRegistry
-	agentSecret []byte
+	agents          *agentRegistry
+	agentSecret     []byte
+	credentials     CredentialService
+	credentialStore CredentialStore
 }
 
 // New builds a Hub, refusing to construct one that would settle incorrectly.
@@ -152,6 +169,10 @@ func New(cfg Config) (*Hub, error) {
 	if clock == nil {
 		clock = time.Now
 	}
+	credentialStore := cfg.CredentialStore
+	if credentialStore == nil {
+		credentialStore = NewMemoryCredentialStore()
+	}
 	return &Hub{
 		tee:        cfg.TEE,
 		rates:      cfg.Rates,
@@ -167,13 +188,61 @@ func New(cfg Config) (*Hub, error) {
 		sessionMaxDownBytes: cfg.SessionMaxDownBytes,
 		sessionIdle:         cfg.SessionIdle,
 
-		agents:      newAgentRegistry(),
-		agentSecret: cfg.AgentSecret,
+		agents:          newAgentRegistry(),
+		agentSecret:     cfg.AgentSecret,
+		credentials:     cfg.Credentials,
+		credentialStore: credentialStore,
 	}, nil
 }
 
 // Ledger returns the Hub's ledger, so a caller can read what it owes.
 func (h *Hub) Ledger() *Ledger { return h.ledger }
+
+// CredentialKey returns the TEE's inbox public key, so provider agents can
+// encrypt their tokens to the TEE that will actually hold them. The Hub is
+// only a relay: it fetches the key on demand from its credential plane and
+// hands it back untouched.
+func (h *Hub) CredentialKey(ctx context.Context) (tee.InboxPublic, error) {
+	if h.credentials == nil {
+		return tee.InboxPublic{}, ErrNoCredentialService
+	}
+	return h.credentials.CredentialKey(ctx)
+}
+
+// RegisterCredential seals a provider's token to the TEE's inbox key and stores
+// the envelope where the dispatcher will attach it to every job for that
+// provider. It is how a one-shot Hub that talks to the TEE directly (with no
+// dialing agent) delivers the seller's token: the Hub stores ciphertext only,
+// exactly as it would for an agent registration, and never sees the plaintext.
+func (h *Hub) RegisterCredential(ctx context.Context, provider string, secret tee.Secret) error {
+	pub, err := h.CredentialKey(ctx)
+	if err != nil {
+		return err
+	}
+	env, err := tee.EncryptCredential(pub, provider, secret)
+	if err != nil {
+		return err
+	}
+	return h.credentialStore.Put(provider, env)
+}
+
+// attachCredential binds the provider's registered envelope onto a job before
+// it is dispatched, so the TEE can decrypt the token inside. The envelope is
+// whatever the provider's agent last registered (stored as ciphertext by the
+// Hub); a provider with none on record dispatches without one and relies on
+// the TEE to refuse gracefully.
+func (h *Hub) attachCredential(spec jobs.Spec) (jobs.Spec, error) {
+	env, ok := h.credentialStore.Get(spec.Provider)
+	if !ok {
+		return spec, nil
+	}
+	enc, err := env.EncodeCanonical()
+	if err != nil {
+		return spec, fmt.Errorf("canonical-encode credential for %q: %w", spec.Provider, err)
+	}
+	spec.Credential = enc
+	return spec, nil
+}
 
 // card returns the effective price card the Hub quotes for a provider: the live
 // agent's self-reported card when an agent is online for that provider, and the
@@ -226,6 +295,15 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 	card, ok := h.card(spec.Provider)
 	if !ok {
 		return Outcome{}, fmt.Errorf("%w: %q", ErrUnknownProvider, spec.Provider)
+	}
+
+	// Bind the provider's registered credential envelope onto the job so the
+	// TEE can authenticate the upstream request. This happens per dispatch,
+	// from the store, so the Hub never holds the token itself — only the
+	// ciphertext an agent registered.
+	spec, err := h.attachCredential(spec)
+	if err != nil {
+		return Outcome{}, err
 	}
 
 	h.ledger.NoteDispatch(spec.Provider)

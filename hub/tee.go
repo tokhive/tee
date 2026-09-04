@@ -74,18 +74,44 @@ type SessionConn interface {
 	Receipt() (proof.SignedReceipt, error)
 }
 
+// CredentialService is the optional credential plane of a Hub's TEE. In the
+// agent-registration design the TEE itself never stores a token — it holds only
+// the private half of its inbox key — so the only control-plane thing a Hub can
+// ask of it is its publishable inbox key, which provider agents encrypt to.
+//
+// It is deliberately a separate interface rather than more methods on TEE:
+// request/response execution is the one capability every Hub needs, while the
+// inbox key only matters when agents dial in at all. The AgentGate relays the
+// key (via CredentialKeyHandler) to agents that are about to register a token.
+type CredentialService interface {
+	// CredentialKey returns the TEE's inbox public key — the target provider
+	// agents encrypt their tokens to. Fetching it on demand (rather than
+	// caching it in the Hub) means a rotated TEE key is picked up on the
+	// agent's next registration.
+	CredentialKey(ctx context.Context) (tee.InboxPublic, error)
+}
+
+// ErrNoCredentialService is returned by the Hub's credential-key relay when the
+// configured TEE does not expose the credential plane. A Hub that cannot
+// publish a TEE key to its agents must not host agent registration.
+var ErrNoCredentialService = errors.New("tee does not support agent credential registration")
+
 // ErrSessionUnsupported is returned when the TEE behind the Hub cannot open
 // streaming sessions.
 var ErrSessionUnsupported = errors.New("tee does not support streaming sessions")
 
 // HTTPTEE calls a TEE's /v1/execute over HTTP. It is the production
-// implementation of TEE.
+// implementation of TEE (and of CredentialService, when BaseURL is set).
 type HTTPTEE struct {
 	// URL is the full execute endpoint, e.g. http://127.0.0.1:18090/v1/execute.
 	URL string
 	// SessionURL is the full WebSocket session endpoint, e.g.
 	// ws://127.0.0.1:18090/v1/session. Empty means sessions are unsupported.
 	SessionURL string
+	// BaseURL is the TEE's root, e.g. http://127.0.0.1:18090. It is what the
+	// credential-key plane is derived from (/v1/credential-key); without it the
+	// Hub cannot publish the TEE's inbox key to dialing agents.
+	BaseURL string
 	// Client is the HTTP client to use. Defaults to http.DefaultClient.
 	Client *http.Client
 }
@@ -120,6 +146,14 @@ func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onCh
 		return Result{}, fmt.Errorf("tee http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	return readSSE(resp.Body, onChunk)
+}
+
+// CredentialKey implements CredentialService.
+func (t *HTTPTEE) CredentialKey(ctx context.Context) (tee.InboxPublic, error) {
+	if t.BaseURL == "" {
+		return tee.InboxPublic{}, errors.New("hub: TEE BaseURL is empty")
+	}
+	return tee.CredentialKeyRequest(ctx, t.Client, t.BaseURL+"/v1/credential-key")
 }
 
 // readSSE parses the response stream, handing each chunk to onChunk and

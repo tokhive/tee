@@ -19,10 +19,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
@@ -35,9 +37,32 @@ func main() {
 	host := flag.String("host", "127.0.0.1:18080", "provider host:port (must be in the policy)")
 	path := flag.String("path", "/v1/realtime", "provider WebSocket endpoint path")
 	marker := flag.String("marker", "streamtest-marker-42", "uplink payload the provider should echo back")
+	credential := flag.String("credential", "", "provider access token; when set, it is registered with the TEE before the session (simulation one-shot mode — the streamer holds the seller's token and delivers it sealed, as a dialing agent would through a Hub)")
 	flag.Parse()
 
+	// The streamer talks to a TEE directly, so it seals the credential itself
+	// and carries it on the session spec; a real Hub would receive it from a
+	// dialing agent and attach it to the job instead.
+	var cred []byte
+	if *credential != "" {
+		httpBase := strings.Replace(strings.Replace(*teeURL, "ws://", "http://", 1), "wss://", "https://", 1)
+		httpBase = strings.TrimSuffix(httpBase, "/v1/session")
+		env, err := shared.SealCredential(httpBase, *provider, tee.Secret{
+			Token:  *credential,
+			Header: "authorization",
+			Scheme: "Bearer",
+		})
+		if err != nil {
+			fail("seal credential: %v", err)
+		}
+		cred, err = env.EncodeCanonical()
+		if err != nil {
+			fail("encode credential: %v", err)
+		}
+	}
+
 	spec := buildSpec(*provider, *host, *path)
+	spec.Credential = cred
 
 	req := tee.SessionRequest{Spec: spec}
 	first, err := req.EncodeCanonical()

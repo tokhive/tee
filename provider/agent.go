@@ -36,10 +36,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tunnel"
 )
 
@@ -66,6 +68,15 @@ type AgentConfig struct {
 	// wants to charge. A nil SelfPrice means the agent accepts the Hub's
 	// platform default. Required: Provider must be set.
 	Self hub.AgentRegister
+
+	// Credential is the provider's access token together with the header it is
+	// presented in. It is the one secret the seller owns; it never appears on
+	// the wire in plaintext. When set, each registration fetches the Hub's
+	// published TEE inbox key, seals this credential to it (tee.Envelope), and
+	// the Hub relays only the ciphertext onward. A zero Credential (no token)
+	// registers without an envelope — the Hub's gate refuses such registrations
+	// when it hosts agents, so this only matters for agent-only relay tests.
+	Credential tee.Secret
 
 	// AllowedTargets lists the exact "host:port" upstreams the agent will dial.
 	// Anything else is refused before a single byte egresses. It must be
@@ -112,6 +123,11 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 	if len(cfg.AllowedTargets) == 0 {
 		return nil, ErrEmptyAllowlist
 	}
+	if cfg.Credential.Token != "" {
+		if err := cfg.Credential.Validate(); err != nil {
+			return nil, err
+		}
+	}
 	if cfg.ConnectTimeout <= 0 {
 		cfg.ConnectTimeout = 10 * time.Second
 	}
@@ -127,9 +143,17 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 // Run keeps the agent online until ctx is cancelled, reconnecting after every
 // tunnel drop. register is one full connection cycle: dial, register, and relay
 // until the tunnel ends.
+//
+// The context also interrupts an in-flight cycle: without it, a graceful stop
+// would leave the tunnel open (runOnce blocks in io.Copy on the control
+// stream) and the Hub would keep the provider online. runOnce registers the
+// interrupt with the live tunnel so cancellation closes the connection, which
+// is exactly what a killed process does — the Hub sees the drop and revokes
+// the credential.
 func (a *Agent) Run(ctx context.Context) error {
 	for {
-		if err := a.runOnce(ctx); err != nil && ctx.Err() != nil {
+		err := a.runOnce(ctx)
+		if err != nil && ctx.Err() != nil {
 			return ctx.Err()
 		}
 		select {
@@ -157,7 +181,17 @@ func (a *Agent) runOnce(ctx context.Context) error {
 	defer mux.Close()
 	mux.Serve(a.handleRelay)
 
-	register, err := json.Marshal(a.cfg.Self)
+	// Interrupt this cycle when the run context is cancelled: closing the
+	// connection unblocks the control-stream copy below and tells the Hub the
+	// agent went offline (which revokes the credential).
+	stopOnCancel := context.AfterFunc(ctx, func() { _ = mux.Close() })
+	defer stopOnCancel()
+
+	reg, err := a.register()
+	if err != nil {
+		return err
+	}
+	register, err := json.Marshal(reg)
 	if err != nil {
 		return fmt.Errorf("encode registration: %w", err)
 	}
@@ -174,6 +208,57 @@ func (a *Agent) runOnce(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// register seals the credential to the current TEE inbox key and returns the
+// control-stream payload. Fetching and re-encrypting on every connection cycle
+// keeps registrations correct across TEE restarts: a fresh TEE generates a
+// fresh inbox key, and the agent's next dial picks it up.
+//
+// A configuration without a token skips the fetch entirely and registers
+// without an envelope (relay-only deployments, tests).
+func (a *Agent) register() (hub.AgentRegister, error) {
+	reg := a.cfg.Self
+	if a.cfg.Credential.Token == "" {
+		return reg, nil
+	}
+
+	pub, err := a.credentialKey()
+	if err != nil {
+		return reg, err
+	}
+	envelope, err := tee.EncryptCredential(pub, reg.Provider, a.cfg.Credential)
+	if err != nil {
+		return reg, fmt.Errorf("seal credential: %w", err)
+	}
+	reg.Credential = &envelope
+	return reg, nil
+}
+
+// credentialKey fetches the Hub's published TEE inbox public key. The Hub
+// relays it from its credential plane; the agent never needs the TEE's address
+// or its attestation — it encrypts to whatever key the Hub is currently
+// delivering credentials to.
+func (a *Agent) credentialKey() (tee.InboxPublic, error) {
+	keyURL := a.hubHTTPURL() + "/v1/credential-key"
+	pub, err := tee.CredentialKeyRequest(context.Background(), a.httpClient(), keyURL)
+	if err != nil {
+		return pub, fmt.Errorf("fetch inbox key: %w", err)
+	}
+	return pub, nil
+}
+
+// hubHTTPURL rewrites the dialed WebSocket gate URL into the Hub's HTTP base,
+// e.g. ws://hub:port/v1/agent -> http://hub:port.
+func (a *Agent) hubHTTPURL() string {
+	return strings.TrimSuffix(strings.Replace(a.cfg.HubGateURL, "ws://", "http://", 1), "/v1/agent")
+}
+
+// httpClient returns a bounded client for the control-plane HTTP calls the
+// agent makes (credential-key fetch). It is deliberately separate from the
+// WebSocket dialer: same server, different hop.
+func (a *Agent) httpClient() *http.Client {
+	return &http.Client{Timeout: a.cfg.ConnectTimeout}
 }
 
 // handleRelay bridges one Hub-opened relay stream to the named upstream. It runs

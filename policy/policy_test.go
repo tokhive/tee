@@ -38,8 +38,10 @@ func publicKeyDER(t *testing.T, key *ecdsa.PrivateKey) []byte {
 	return der
 }
 
-// openAIPolicy is a representative policy: chat and embeddings on one host,
-// credential injected as a bearer token.
+// openAIPolicy is a representative policy: chat and embeddings on one host.
+// The credential's injection shape no longer lives in the policy — it travels
+// with the token itself through agent registration and is stored only inside
+// the TEE (see tee.Secret), so the policy is purely a whitelist.
 func openAIPolicy(t *testing.T, key *ecdsa.PrivateKey) Policy {
 	t.Helper()
 	return Policy{
@@ -63,7 +65,6 @@ func openAIPolicy(t *testing.T, key *ecdsa.PrivateKey) Policy {
 				QueryKeys: []string{"include"},
 			},
 		},
-		Credential: Credential{Header: "authorization", Scheme: "Bearer"},
 		Limits: Limits{
 			MaxResponseBytes: 1 << 20,
 			MaxBodyBytes:     1 << 16,
@@ -228,26 +229,6 @@ func TestPolicyValidateRejectsMalformed(t *testing.T) {
 			name:   "no methods",
 			want:   ErrInvalidMethods,
 			change: func(p *Policy) { p.Rules[0].Methods = nil },
-		},
-		{
-			name:   "empty credential header",
-			want:   ErrInvalidCredential,
-			change: func(p *Policy) { p.Credential.Header = "" },
-		},
-		{
-			name:   "credential into host header",
-			want:   ErrInvalidCredential,
-			change: func(p *Policy) { p.Credential.Header = "Host" },
-		},
-		{
-			name:   "credential into content-length",
-			want:   ErrInvalidCredential,
-			change: func(p *Policy) { p.Credential.Header = "content-length" },
-		},
-		{
-			name:   "credential header with space",
-			want:   ErrInvalidCredential,
-			change: func(p *Policy) { p.Credential.Header = "x api key" },
 		},
 		{
 			name:   "zero response limit",
@@ -653,32 +634,6 @@ func TestHostMatches(t *testing.T) {
 	for _, tc := range cases {
 		if got := hostMatches(tc.allowed, tc.request); got != tc.expected {
 			t.Errorf("hostMatches(%q, %q) = %v, want %v", tc.allowed, tc.request, got, tc.expected)
-		}
-	}
-}
-
-func TestCredentialInject(t *testing.T) {
-	credential := Credential{Header: "authorization", Scheme: "Bearer"}
-
-	name, value, err := credential.Inject("sk-test")
-	if err != nil {
-		t.Fatalf("inject: %v", err)
-	}
-	if name != "authorization" || value != "Bearer sk-test" {
-		t.Fatalf("inject = (%q, %q), want (%q, %q)", name, value, "authorization", "Bearer sk-test")
-	}
-
-	// A raw API key header has no scheme.
-	raw := Credential{Header: "api-key"}
-	if _, value, err = raw.Inject("secret"); err != nil || value != "secret" {
-		t.Fatalf("raw inject = %q, err = %v", value, err)
-	}
-
-	// Header injection through the credential is the real risk: the secret is
-	// the one value the TEE must never let escape into a second header line.
-	for _, bad := range []string{"", "sk-\r\nx-evil: 1", "sk-\n", "sk-\x00", " sk-test "} {
-		if _, _, err := credential.Inject(bad); err == nil {
-			t.Errorf("Inject(%q) accepted an unsafe credential", bad)
 		}
 	}
 }

@@ -60,10 +60,11 @@ import (
 // than that a job was bad.
 var (
 	ErrNoPolicySet     = errors.New("no policy set configured")
-	ErrNoCredentials   = errors.New("no credential source configured")
+	ErrNoInboxKey      = errors.New("no inbox key configured")
 	ErrNoSigner        = errors.New("no receipt signer configured")
 	ErrCredentialClash = errors.New("job already sets the header the credential occupies")
 	ErrBodyTooLarge    = errors.New("request body exceeds the policy limit")
+	ErrNoCredential    = errors.New("job carries no credential")
 )
 
 // ErrBodyMismatch means the supplied request body does not hash to the digest
@@ -133,15 +134,12 @@ type Result struct {
 
 // Config assembles a Service.
 //
-// Every field but Clock and SubmitterVerifier is mandatory. A service that
-// cannot authorise, authenticate, execute, or attest must not be constructible
-// — the failure should surface at wiring time, not on the first job.
+// Every field but Clock, RequestTimeout and SubmitterVerifier is mandatory. A
+// service that cannot authorise, execute, or attest must not be constructible —
+// the failure should surface at wiring time, not on the first job.
 type Config struct {
 	// Policies decides whether a job may spend a provider's credential.
 	Policies *policy.Set
-
-	// Credentials supplies the secrets. Never logged, never signed.
-	Credentials CredentialSource
 
 	// Transport performs the outbound request.
 	Transport Transport
@@ -171,18 +169,25 @@ type Config struct {
 	// application-level scheme (a Hub signature over the spec) can be added
 	// later without changing the shape of Execute.
 	SubmitterVerifier func(ctx context.Context, spec jobs.Spec) error
+
+	// InboxKey decrypts the credential envelope carried on every job. The TEE
+	// stores no access token: each job brings its provider's token sealed to
+	// this key, and the private half of InboxKey is the only way to open it.
+	// Mandatory — a service that cannot decrypt its jobs' credentials cannot
+	// execute them.
+	InboxKey *InboxKey
 }
 
 // Service executes jobs inside the enclave. It is safe for concurrent use.
 type Service struct {
 	policies        *policy.Set
-	credentials     CredentialSource
 	transport       Transport
 	signer          *proof.Signer
 	seq             SeqStore
 	clock           func() time.Time
 	requestTimeout  time.Duration
 	submitterVerify func(ctx context.Context, spec jobs.Spec) error
+	inbox           *InboxKey
 }
 
 // NewService validates a configuration and returns a ready service.
@@ -190,8 +195,8 @@ func NewService(cfg Config) (*Service, error) {
 	if cfg.Policies == nil {
 		return nil, ErrNoPolicySet
 	}
-	if cfg.Credentials == nil {
-		return nil, ErrNoCredentials
+	if cfg.InboxKey == nil {
+		return nil, ErrNoInboxKey
 	}
 	if cfg.Transport == nil {
 		return nil, ErrNoTransport
@@ -208,13 +213,13 @@ func NewService(cfg Config) (*Service, error) {
 	}
 	return &Service{
 		policies:        cfg.Policies,
-		credentials:     cfg.Credentials,
 		transport:       cfg.Transport,
 		signer:          cfg.Signer,
 		seq:             cfg.Seq,
 		clock:           clock,
 		requestTimeout:  cfg.RequestTimeout,
 		submitterVerify: cfg.SubmitterVerifier,
+		inbox:           cfg.InboxKey,
 	}, nil
 }
 
@@ -266,7 +271,7 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc) (*Res
 			ErrBodyTooLarge, len(job.Body), decision.MaxBodyBytes)
 	}
 
-	headers, err := s.injectCredential(ctx, job.Spec, decision)
+	headers, err := s.injectCredential(job.Spec)
 	if err != nil {
 		return nil, err
 	}
@@ -308,17 +313,43 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc) (*Res
 	return s.perform(ctx, request, job.Spec, specHash, decision, seq, onChunk)
 }
 
-// injectCredential merges the caller's headers with the provider's secret,
-// returning the exact header set to put on the wire.
-func (s *Service) injectCredential(ctx context.Context, spec jobs.Spec, decision policy.Decision) (map[string]string, error) {
+// injectCredential decrypts the credential envelope carried on the job and
+// merges the provider's secret into the caller's headers, returning the exact
+// header set to put on the wire.
+//
+// The secret (token and its header/scheme shape) arrives on the job itself,
+// sealed to this service's inbox key by the provider's agent and relayed
+// verbatim by the Hub. The TEE stores nothing: the private half of InboxKey is
+// the only thing in the system that can reopen the envelope. A job with no
+// credential is refused — a schedulable provider always carries one, so an
+// empty envelope means the Hub sidestepped registration. A secret that declares
+// no header is one whose upstream needs no authentication: nothing is injected.
+func (s *Service) injectCredential(spec jobs.Spec) (map[string]string, error) {
 	headers := make(map[string]string, len(spec.Headers)+1)
 	for name, value := range spec.Headers {
 		headers[name] = value
 	}
 
-	// A policy with no credential header describes a provider that needs no
-	// authentication. Nothing to inject.
-	if decision.Credential.Header == "" {
+	if len(spec.Credential) == 0 {
+		return nil, fmt.Errorf("%w: provider %q", ErrNoCredential, spec.Provider)
+	}
+	env, err := DecodeEnvelope(spec.Credential)
+	if err != nil {
+		return nil, err
+	}
+	secret, declared, err := s.inbox.Open(env)
+	if err != nil {
+		return nil, err
+	}
+	if declared != spec.Provider {
+		return nil, fmt.Errorf("credential envelope is bound to provider %q, not %q", declared, spec.Provider)
+	}
+	if err := secret.Validate(); err != nil {
+		return nil, err
+	}
+	if secret.Header == "" {
+		// The registered secret declares no authentication header: this
+		// provider's upstream needs none, so nothing is injected.
 		return headers, nil
 	}
 
@@ -326,20 +357,11 @@ func (s *Service) injectCredential(ctx context.Context, spec jobs.Spec, decision
 	// jobs.Validate rejects the reserved headers, so reaching here means that
 	// check was bypassed — refuse rather than silently overwrite, which would
 	// turn a guard into a no-op and leave no trace.
-	if headerSet(headers, decision.Credential.Header) {
-		return nil, fmt.Errorf("%w: %q", ErrCredentialClash, decision.Credential.Header)
+	if headerSet(headers, secret.Header) {
+		return nil, fmt.Errorf("%w: %q", ErrCredentialClash, secret.Header)
 	}
 
-	secret, ok := s.credentials.Credential(ctx, spec.Provider)
-	if !ok {
-		return nil, missingCredential(spec.Provider)
-	}
-
-	// Rendering the header is the policy package's job. It owns the validation
-	// a secret must pass before it can be written — no control characters, no
-	// surrounding whitespace — and duplicating those rules here would give the
-	// two copies room to drift apart.
-	name, value, err := decision.Credential.Inject(secret)
+	name, value, err := secret.Render()
 	if err != nil {
 		return nil, err
 	}
@@ -550,7 +572,7 @@ func (s *Service) OpenSession(ctx context.Context, job Job) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	headers, err := s.injectCredential(ctx, job.Spec, decision)
+	headers, err := s.injectCredential(job.Spec)
 	if err != nil {
 		return nil, err
 	}

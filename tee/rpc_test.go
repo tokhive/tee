@@ -3,6 +3,8 @@ package tee
 import (
 	"bytes"
 	"testing"
+
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 )
 
 // TestWriteChunkFrame pins the exact bytes the server writes for one chunk.
@@ -42,7 +44,16 @@ func TestWriteChunkFrame(t *testing.T) {
 func TestExecuteRequestRoundTrip(t *testing.T) {
 	body := []byte(`{"model":"m","stream":true}`)
 	original := ExecuteRequest{
-		Spec: testSpec(t, body),
+		Spec: jobs.Spec{
+			Version:  jobs.VersionV1,
+			JobID:    make([]byte, jobs.JobIDLength),
+			Provider: "openai",
+			Method:   "POST",
+			Host:     "api.openai.com",
+			Path:     "/v1/chat/completions",
+			Headers:  map[string]string{"content-type": "application/json"},
+			Nonce:    make([]byte, jobs.MinNonceLength),
+		},
 		Body: body,
 	}
 	encoded, err := original.EncodeCanonical()

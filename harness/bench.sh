@@ -2,11 +2,14 @@
 # TokenHive S5 performance benchmark.
 #
 # Starts the same real components the S4 harness uses (mock provider over real
-# TLS, SOCKS5 Provider Agent, simulated TEE on the genuine tee.Service) and runs
-# tokenhive/cmd/bench in two configurations:
+# TLS, Provider Agent over the reverse tunnel, simulated TEE on the genuine
+# tee.Service) and runs tokenhive/cmd/bench in two configurations:
 #
 #   direct  -> client -> provider            (baseline, no TEE/Agent)
-#   tee     -> client -> TEE -> Agent -> provider
+#   tee     -> client -> TEE -> Hub relay -> Agent -> provider
+#
+# The provider's token is registered at runtime, as in production: the agent
+# dials the Hub's AgentGate and delivers the token sealed to the Hub's TEE.
 #
 # bench reports the four §9 acceptance metrics and gates the hard ones:
 #   proof volume   < 2 KB        (sim adapter must fit; non-negotiable)
@@ -46,8 +49,8 @@ sleep 0.3
 
 echo "==> repo: $REPO"
 mkdir -p "$BIN"
-echo "==> building: mockprovider agent tee bench"
-for pkg in mockprovider agent tee bench; do
+echo "==> building: mockprovider agent hub tee bench"
+for pkg in mockprovider agent hub tee bench; do
   go build -o "$BIN/$pkg" "./tokenhive/cmd/$pkg" || { echo "build failed for $pkg"; exit 1; }
 done
 
@@ -64,23 +67,34 @@ wait_for_port() {
 }
 
 MP_PORT=18080
-AGENT_PORT=18092
+HUB_PORT=18085
 TEE_PORT=18090
+AGENT_SECRET="sim-agent-secret"
+TOKEN="sk-sim-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 echo "==> starting mockprovider (TLS) on :$MP_PORT"
 "$BIN/mockprovider" -addr "127.0.0.1:$MP_PORT" -tls > "$SIM/mockprovider.log" 2>&1 &
 MP_PID=$!
 wait_for_port 127.0.0.1 "$MP_PORT"
 
-echo "==> starting provider agent on :$AGENT_PORT (allowlist -> provider)"
-"$BIN/agent" -addr "127.0.0.1:$AGENT_PORT" -targets "127.0.0.1:$MP_PORT" > "$SIM/agent.log" 2>&1 &
-AGENT_PID=$!
-wait_for_port 127.0.0.1 "$AGENT_PORT"
+echo "==> starting reverse-tunnel Hub on :$HUB_PORT (agent gate /v1/agent, tee relay /v1/relay)"
+"$BIN/hub" -serve "127.0.0.1:$HUB_PORT" -host "127.0.0.1:$MP_PORT" \
+  -tee "http://127.0.0.1:$TEE_PORT" -agent-key "$AGENT_SECRET" > "$SIM/hub.log" 2>&1 &
+HUB_PID=$!
+wait_for_port 127.0.0.1 "$HUB_PORT"
 
-echo "==> starting simulated TEE on :$TEE_PORT (egress via agent)"
-"$BIN/tee" -addr "127.0.0.1:$TEE_PORT" -agent "127.0.0.1:$AGENT_PORT" -seq "$SIM/seqstore.json" > "$SIM/tee.log" 2>&1 &
+echo "==> starting provider agent (openai-sim), token registered at the gate"
+"$BIN/agent" -hub "ws://127.0.0.1:$HUB_PORT/v1/agent" -key "$AGENT_SECRET" \
+  -provider openai-sim -targets "127.0.0.1:$MP_PORT" -token "$TOKEN" > "$SIM/agent.log" 2>&1 &
+AGENT_PID=$!
+sleep 1
+
+echo "==> starting simulated TEE on :$TEE_PORT (egress via the hub relay)"
+"$BIN/tee" -addr "127.0.0.1:$TEE_PORT" -relay "ws://127.0.0.1:$HUB_PORT/v1/relay" \
+  -seq "$SIM/seqstore.json" > "$SIM/tee.log" 2>&1 &
 TEE_PID=$!
 wait_for_port 127.0.0.1 "$TEE_PORT"
+sleep 1
 
 RTT_ARG=""
 if [ -n "$BASELINE_RTT" ]; then RTT_ARG="-baseline-rtt $BASELINE_RTT"; fi
@@ -99,7 +113,7 @@ section "S5b. throughput (fault=big, capped at 1 MiB, n=20)"
 
 echo
 echo "==> stopping services"
-kill "$MP_PID" "$AGENT_PID" "$TEE_PID" 2>/dev/null
+kill "$MP_PID" "$AGENT_PID" "$TEE_PID" "$HUB_PID" 2>/dev/null
 pkill -f "$BIN/" 2>/dev/null
 
 if [ "$FAIL" -eq 0 ]; then

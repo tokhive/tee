@@ -48,15 +48,21 @@ func (memStore) Put(string, proof.SignedReceipt) error { return nil }
 // Hub and the first job arriving: while no agent is registered yet, the Hub
 // closes the relay stream and the job fails at the TLS handshake, consuming
 // nothing. Once the agent is online the first attempt succeeds.
+//
+// A failed attempt surfaces in one of two ways: as an error (a refusal, before
+// the wire) or as a Result whose StatusCode is zero (a request put on the wire
+// that never got a response). Both are retried — the second because an empty
+// relay handshake is indistinguishable, from the result alone, from a provider
+// that is simply not reachable yet.
 func executeEventually(t *testing.T, service *tee.Service, spec jobs.Spec, body []byte,
 	onChunk func([]byte) error) (*tee.Result, error) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	var last *tee.Result
 	var err error
 	for {
 		last, err = service.Execute(context.Background(), tee.Job{Spec: spec, Body: body}, onChunk)
-		if err == nil {
+		if err == nil && last.StatusCode != 0 {
 			return last, nil
 		}
 		if time.Now().After(deadline) {
@@ -73,11 +79,15 @@ func executeEventually(t *testing.T, service *tee.Service, spec jobs.Spec, body 
 //
 // The path under test, in full:
 //
-//	tee.Service -> transport.HTTP -> SOCKS5 dialer -> provider.Agent -> mock provider
+//	tee.Service -> transport.ChannelManager -> Hub.TeeRelay
+//	          -> provider.Agent (reverse tunnel) -> mock provider
 //
-// The agent exists to prove the credential survives the extra hop untouched:
-// the TEE's request bytes reach the provider through a contributor's machine,
-// and the receipt still describes exactly the exchange that happened.
+// The provider's access token is not provisioned into the TEE at boot. It is
+// registered at runtime: the agent dials the Hub's AgentGate, fetches the
+// Hub-published TEE inbox key, seals the token to it, and registers; the Hub
+// stores the ciphertext envelope. The TEE holds no token — each spec in this
+// test carries the envelope (as spec.Credential) that an agent registered and
+// a Hub dispatcher would attach on its way out.
 
 var e2eEvents = [][]byte{
 	[]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n"),
@@ -99,7 +109,6 @@ func signedPolicyFor(t *testing.T, key *ecdsa.PrivateKey, host string) policy.Si
 			Path:        "/v1/chat/completions",
 			AllowStream: true,
 		}},
-		Credential: policy.Credential{Header: "authorization", Scheme: "Bearer"},
 		Limits: policy.Limits{
 			MaxResponseBytes: 1 << 20,
 			MaxBodyBytes:     1 << 16,
@@ -124,53 +133,72 @@ func localChatCompletion(t *testing.T, host string) (jobs.Spec, []byte) {
 	return spec, body
 }
 
-// The path under test is the reverse-tunnel topology the design mandates:
-// the agent lives behind a NAT, so it dials the Hub; the TEE dials the Hub's
-// TeeRelay and egresses over the agent's tunnel. No component dials the agent
-// directly.
-//
-//	tee.Service -> transport.ChannelManager -> Hub.TeeRelay
-//	          -> provider.Agent (reverse tunnel) -> mock provider
-//
-// The agent still proves the credential survives the extra hop untouched: the
-// TEE's request bytes reach the provider through a contributor's machine, and
-// the receipt still describes exactly the exchange that happened.
-
 // e2eStack assembles the full reverse-tunnel outbound path around a mock
-// provider and returns a service ready to execute jobs against it.
-func e2eStack(t *testing.T, target string, srv *httptest.Server) *tee.Service {
+// provider and returns a service ready to execute jobs against it, plus the
+// canonical-CBOR credential envelope the test must attach to every spec it
+// runs (the same envelope an agent registers and a Hub attaches on dispatch).
+//
+// The token travels exactly as the product would: the agent dials the Hub,
+// fetches the Hub-published TEE inbox key, seals the provider's secret to it,
+// and registers only ciphertext; the Hub — which only ever held the envelope —
+// stores it and would attach it to dispatched jobs. The test drives tee.Service
+// directly (bypassing the Hub's dispatcher), so it seals its own copy of the
+// secret to the same inbox key for the spec.
+func e2eStack(t *testing.T, target string, srv *httptest.Server) (*tee.Service, []byte) {
 	t.Helper()
 	const agentSecret = "s3cret-e2e-agent"
 
-	// A minimal Hub exposing only the two reverse-tunnel endpoints: the
-	// AgentGate the provider agent dials to come online, and the TeeRelay the
-	// TEE dials to carry egress across those tunnels. Its Execute seam is never
-	// reached here (the test drives tee.Service directly), so a stub that just
-	// refuses is enough.
+	// ---- the TEE's insides: whitelist and inbox key. It stores no credential.
+	policies := policy.NewSet()
+	if err := policies.Add(signedPolicyFor(t, generateKey(t), target), now); err != nil {
+		t.Fatalf("install policy: %v", err)
+	}
+	inbox, err := tee.GenerateInboxKey()
+	if err != nil {
+		t.Fatalf("inbox key: %v", err)
+	}
+
+	// ---- the TEE's HTTP surface, serving its inbox public key so agents can
+	// fetch it. The Hub relays that key to dialing agents.
+	var service *tee.Service
+	teeMux := http.NewServeMux()
+	teeMux.HandleFunc("/v1/credential-key", func(w http.ResponseWriter, r *http.Request) {
+		tee.ServeCredentialKey(inbox, w, r)
+	})
+	teeSrv := httptest.NewServer(teeMux)
+	t.Cleanup(teeSrv.Close)
+
+	// ---- the Hub: reverse-tunnel endpoints plus the credential relay. Its TEE
+	// seam is a stub (the test drives tee.Service directly); its credential
+	// plane is the real HTTP client against the TEE server above.
 	h, err := hub.New(hub.Config{
 		TEE:         refuseTEE{},
 		Rates:       map[string]hub.RateCard{"openai": {PerRequestMicros: 100}},
 		Store:       memStore{},
 		Verify:      func(proof.SignedReceipt) error { return nil },
 		AgentSecret: []byte(agentSecret),
+		Credentials: &hub.HTTPTEE{BaseURL: teeSrv.URL},
 	})
 	if err != nil {
 		t.Fatalf("new hub: %v", err)
 	}
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	mux := http.NewServeMux()
-	mux.Handle("/v1/agent", h.AgentGate(upgrader))
-	mux.Handle("/v1/relay", h.TeeRelay(upgrader))
-	hubsrv := httptest.NewServer(mux)
-	t.Cleanup(hubsrv.Close)
-	hubWS := "ws" + strings.TrimPrefix(hubsrv.URL, "http")
+	hubMux := http.NewServeMux()
+	hubMux.Handle("/v1/agent", h.AgentGate(upgrader))
+	hubMux.Handle("/v1/relay", h.TeeRelay(upgrader))
+	hubMux.HandleFunc("/v1/credential-key", h.CredentialKeyHandler)
+	hubSrv := httptest.NewServer(hubMux)
+	t.Cleanup(hubSrv.Close)
+	hubWS := "ws" + strings.TrimPrefix(hubSrv.URL, "http")
 
-	// The contributor's machine: an agent that dials the Hub and relays only to
-	// the mock provider.
+	// ---- the contributor's machine: an agent that dials the Hub, registers
+	// the provider's token (sealed to the TEE inbox key it fetches through the
+	// Hub), and relays only to the mock provider.
 	agent, err := provider.NewAgent(provider.AgentConfig{
 		HubGateURL:     hubWS + "/v1/agent",
 		SharedKey:      []byte(agentSecret),
 		Self:           hub.AgentRegister{Provider: "openai"},
+		Credential:     tee.Secret{Token: "sk-e2e-secret", Header: "authorization", Scheme: "Bearer"},
 		AllowedTargets: []string{target},
 	})
 	if err != nil {
@@ -180,10 +208,11 @@ func e2eStack(t *testing.T, target string, srv *httptest.Server) *tee.Service {
 	t.Cleanup(stopAgent)
 	go func() { _ = agent.Run(agentCtx) }()
 
-	// The TEE's connection-resident data path, egressing through the Hub's
+	// ---- the TEE's connection-resident data path, egressing through the Hub's
 	// TeeRelay and the agent's reverse tunnel. The provider name on the job
 	// ("openai") must match the registered agent's, which is how the Hub routes
-	// the stream.
+	// the stream. Built after the Hub server exists so the relay URL is known;
+	// the agent dials in on its own reconnect loop.
 	outbound, err := transport.NewChannelManager(transport.ChannelConfig{
 		Scheme:         "http",
 		AllowPlaintext: true,
@@ -192,27 +221,36 @@ func e2eStack(t *testing.T, target string, srv *httptest.Server) *tee.Service {
 	if err != nil {
 		t.Fatalf("new transport: %v", err)
 	}
+	t.Cleanup(func() { _ = outbound.Close() })
 
-	policies := policy.NewSet()
-	if err := policies.Add(signedPolicyFor(t, generateKey(t), target), now); err != nil {
-		t.Fatalf("install policy: %v", err)
-	}
-	credentials := tee.NewStaticCredentials()
-	credentials.Set("openai", "sk-e2e-secret")
-
-	service, err := tee.NewService(tee.Config{
-		Policies:    policies,
-		Credentials: credentials,
-		Transport:   outbound,
-		Signer:      proof.NewSigner(newEpoch(t)),
-		Clock:       func() time.Time { return now },
-		Seq:         tee.NewMemorySeqStore(),
+	service, err = tee.NewService(tee.Config{
+		Policies:  policies,
+		Transport: outbound,
+		Signer:    proof.NewSigner(newEpoch(t)),
+		Clock:     func() time.Time { return now },
+		Seq:       tee.NewMemorySeqStore(),
+		InboxKey:  inbox,
 	})
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}
-	_ = srv
-	return service
+
+	// The credential the tests must carry on their specs, sealed to the same
+	// inbox key the agent registered against.
+	env, err := tee.EncryptCredential(inbox.Public(), "openai",
+		tee.Secret{Token: "sk-e2e-secret", Header: "authorization", Scheme: "Bearer"})
+	if err != nil {
+		t.Fatalf("seal e2e credential: %v", err)
+	}
+	cred, err := env.EncodeCanonical()
+	if err != nil {
+		t.Fatalf("encode e2e credential: %v", err)
+	}
+
+	// Egress readiness is a race between the agent's reverse-tunnel dial and the
+	// first job: until the agent's tunnel is routed by the Hub, the job fails at
+	// the relay handshake (consuming nothing). executeEventually absorbs it.
+	return service, cred
 }
 
 // TestEndToEndSSEThroughProviderAgent runs one chat completion through every
@@ -234,7 +272,7 @@ func TestEndToEndSSEThroughProviderAgent(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		flusher := w.(http.Flusher)
 		for _, event := range e2eEvents {
-			w.Write(event)
+			_, _ = w.Write(event)
 			flusher.Flush()
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -242,8 +280,9 @@ func TestEndToEndSSEThroughProviderAgent(t *testing.T) {
 	defer srv.Close()
 	target := strings.TrimPrefix(srv.URL, "http://")
 
-	service := e2eStack(t, target, srv)
+	service, cred := e2eStack(t, target, srv)
 	spec, body := localChatCompletion(t, target)
+	spec.Credential = cred
 
 	var relayed [][]byte
 	result, err := executeEventually(t, service, spec, body, func(chunk []byte) error {
@@ -257,10 +296,9 @@ func TestEndToEndSSEThroughProviderAgent(t *testing.T) {
 		t.Fatalf("status = %d, want 200", result.StatusCode)
 	}
 
-	// The credential crossed the agent's tunnel and arrived as the policy
-	// described it — the agent proved it cannot tamper with what it relays,
-	// because TLS aside, this mock runs plain HTTP and would have shown any
-	// tampering as-is.
+	// The credential crossed the agent's tunnel and arrived as its registered
+	// shape described it. This mock runs plain HTTP, so the agent's relay
+	// would have shown any tampering (or the missing credential) as-is.
 	if got, _ := sawAuth.Load().(string); got != "Bearer sk-e2e-secret" {
 		t.Errorf("provider saw Authorization %q", got)
 	}
@@ -323,7 +361,7 @@ func TestEndToEndMidStreamDisconnect(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		flusher := w.(http.Flusher)
-		w.Write(e2eEvents[0])
+		_, _ = w.Write(e2eEvents[0])
 		flusher.Flush()
 		// Drop with the transcript unfinished: no further events, no clean
 		// terminator, through the agent's tunnel like any real outage.
@@ -335,8 +373,9 @@ func TestEndToEndMidStreamDisconnect(t *testing.T) {
 	defer srv.Close()
 	target := strings.TrimPrefix(srv.URL, "http://")
 
-	service := e2eStack(t, target, srv)
+	service, cred := e2eStack(t, target, srv)
 	spec, body := localChatCompletion(t, target)
+	spec.Credential = cred
 
 	var relayed [][]byte
 	result, err := executeEventually(t, service, spec, body, func(chunk []byte) error {
