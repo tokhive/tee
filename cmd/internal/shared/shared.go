@@ -1,9 +1,9 @@
 // Package shared holds the small, reusable pieces the simulation binaries
 // (mockprovider, tee, faketee, hub, verify, agent) share: the .sim working
-// directory, the provider-signed policy the TEE loads, the Hub's seller rate
-// table, a throwaway test CA, and the one-shot credential registration the
-// simulation-only CLI tools (hub -n, streamer) use when they talk to a TEE
-// directly instead of through a resident Hub with dialing agents.
+// directory, the Hub-predefined whitelist policy the TEE loads, the Hub's
+// seller rate table, a throwaway test CA, and the one-shot credential
+// registration the simulation-only CLI tools (hub -n, streamer) use when they
+// talk to a TEE directly instead of through a resident Hub with dialing agents.
 //
 // Nothing here is production code. It exists so the simulation runs end to end
 // on a laptop with zero external dependencies and zero real credentials, while
@@ -37,8 +37,7 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
-// Default fixtures. The provider's own key signs the policy; the TEE only ever
-// verifies it.
+// Default fixtures.
 const (
 	providerName  = "openai-sim"
 	providerCheap = "cheap-sim"
@@ -56,10 +55,9 @@ func ConfigDir() string {
 }
 
 // EnsureDefaults writes the fixture files if they are missing: a
-// Hub-predefined whitelist policy per provider (NO provider signature — it is
-// deployment config, not a provider-authored document), and the Hub's
-// seller-reported rate table. Credentials are intentionally NOT written: they
-// arrive at runtime through agent registration (see the package comment).
+// Hub-predefined whitelist policy per provider (deployment config) and the
+// Hub's seller-reported rate table. Credentials are intentionally NOT written:
+// they arrive at runtime through agent registration (see the package comment).
 func EnsureDefaults() error {
 	dir := ConfigDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {

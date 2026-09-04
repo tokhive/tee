@@ -3,7 +3,6 @@ package integration
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
 	"errors"
 	"io"
 	"net/http"
@@ -95,11 +94,10 @@ var e2eEvents = [][]byte{
 	[]byte("data: [DONE]\n\n"),
 }
 
-// signedPolicyFor is signedOpenAIPolicy with the host parameterised: the e2e
-// path targets a local mock provider, not api.openai.com.
-func signedPolicyFor(t *testing.T, key *ecdsa.PrivateKey, host string) policy.SignedPolicy {
-	t.Helper()
-	providerPolicy := policy.Policy{
+// policyFor is the Hub-predefined whitelist for the e2e path, with the host
+// parameterised: the path targets a local mock provider, not api.openai.com.
+func policyFor(host string) policy.Policy {
+	return policy.Policy{
 		Version:     policy.VersionV1,
 		Provider:    "openai",
 		DisplayName: "E2E quota",
@@ -114,15 +112,9 @@ func signedPolicyFor(t *testing.T, key *ecdsa.PrivateKey, host string) policy.Si
 			MaxBodyBytes:     1 << 16,
 			AllowedHeaders:   []string{"content-type"},
 		},
-		IssuedAt:    now.Unix() - 3600,
-		ExpiresAt:   now.Unix() + 3600,
-		ProviderKey: publicKeyDER(t, key),
+		IssuedAt:  now.Unix() - 3600,
+		ExpiresAt: now.Unix() + 3600,
 	}
-	signed, err := policy.SignPolicy(providerPolicy, key)
-	if err != nil {
-		t.Fatalf("sign policy: %v", err)
-	}
-	return signed
 }
 
 // localChatCompletion is chatCompletion pointed at the mock provider's host.
@@ -150,7 +142,7 @@ func e2eStack(t *testing.T, target string, srv *httptest.Server) (*tee.Service, 
 
 	// ---- the TEE's insides: whitelist and inbox key. It stores no credential.
 	policies := policy.NewSet()
-	if err := policies.Add(signedPolicyFor(t, generateKey(t), target), now); err != nil {
+	if err := policies.Install(policyFor(target), now); err != nil {
 		t.Fatalf("install policy: %v", err)
 	}
 	inbox, err := tee.GenerateInboxKey()

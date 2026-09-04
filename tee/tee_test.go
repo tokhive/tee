@@ -167,18 +167,8 @@ type envOption func(*Config)
 func newTestEnv(t *testing.T, opts ...envOption) *testEnv {
 	t.Helper()
 
-	providerKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate provider key: %v", err)
-	}
-
-	signedPolicy, err := policy.SignPolicy(defaultPolicy(), providerKey)
-	if err != nil {
-		t.Fatalf("sign policy: %v", err)
-	}
-
 	policies := policy.NewSet()
-	if err := policies.Add(signedPolicy, baseTime); err != nil {
+	if err := policies.Install(defaultPolicy(), baseTime); err != nil {
 		t.Fatalf("install policy: %v", err)
 	}
 
@@ -297,25 +287,18 @@ func defaultPolicy() policy.Policy {
 	}
 }
 
-// replacePolicy swaps in a modified policy under the same provider key.
+// replacePolicy swaps in a modified policy. It is used to exercise a policy
+// whose decision differs from the default.
 func replacePolicy(t *testing.T, env *testEnv, mutate func(*policy.Policy)) {
 	t.Helper()
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
 	next := defaultPolicy()
 	mutate(&next)
-	// Keep the issuance time moving forward or Set.Add will reject the update
-	// as a rollback.
+	// Keep the issuance time moving forward or Set.Install will reject the
+	// update as a rollback.
 	next.IssuedAt = baseTime.Unix()
 
-	signed, err := policy.SignPolicy(next, key)
-	if err != nil {
-		t.Fatalf("sign policy: %v", err)
-	}
-	if err := env.policies.Add(signed, baseTime); err != nil {
+	if err := env.policies.Install(next, baseTime); err != nil {
 		t.Fatalf("install policy: %v", err)
 	}
 }

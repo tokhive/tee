@@ -77,27 +77,6 @@ func (e *fakeEpoch) Sign(domain string, payload []byte) (platform.Signature, err
 	}, nil
 }
 
-func generateKey(t *testing.T) *ecdsa.PrivateKey {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	return key
-}
-
-func publicKeyDER(t *testing.T, key *ecdsa.PrivateKey) []byte {
-	t.Helper()
-	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	if err != nil {
-		t.Fatalf("marshal public key: %v", err)
-	}
-	return der
-}
-
-// slice32 adapts a fixed-size digest to a byte slice. Go will not take a
-// slice of a function's return value directly, so every digest flowing into a
-// struct field goes through here.
 func slice32(digest [32]byte) []byte { return digest[:] }
 
 func randomBytes(t *testing.T, length int) []byte {
@@ -133,11 +112,10 @@ func chatCompletion(t *testing.T) (jobs.Spec, []byte) {
 	return spec, body
 }
 
-// signedOpenAIPolicy is a policy that authorises exactly the chat completion
-// above and nothing else, signed by the credential owner.
-func signedOpenAIPolicy(t *testing.T, key *ecdsa.PrivateKey) policy.SignedPolicy {
-	t.Helper()
-	providerPolicy := policy.Policy{
+// openAIPolicy is the Hub-predefined whitelist that authorises exactly the
+// chat completion above and nothing else.
+func openAIPolicy() policy.Policy {
+	return policy.Policy{
 		Version:     policy.VersionV1,
 		Provider:    "openai",
 		DisplayName: "Integration test quota",
@@ -152,15 +130,9 @@ func signedOpenAIPolicy(t *testing.T, key *ecdsa.PrivateKey) policy.SignedPolicy
 			MaxBodyBytes:     1 << 16,
 			AllowedHeaders:   []string{"content-type"},
 		},
-		IssuedAt:    now.Unix() - 3600,
-		ExpiresAt:   now.Unix() + 3600,
-		ProviderKey: publicKeyDER(t, key),
+		IssuedAt:  now.Unix() - 3600,
+		ExpiresAt: now.Unix() + 3600,
 	}
-	signed, err := policy.SignPolicy(providerPolicy, key)
-	if err != nil {
-		t.Fatalf("sign policy: %v", err)
-	}
-	return signed
 }
 
 // TestJobToReceipt walks the path a real job takes: the credential owner
@@ -179,19 +151,18 @@ func signedOpenAIPolicy(t *testing.T, key *ecdsa.PrivateKey) policy.SignedPolicy
 // spec, so the chain of trust runs from the provider's policy to the TEE's
 // receipt — not from a user's signature.
 func TestJobToReceipt(t *testing.T) {
-	providerKey := generateKey(t)
 	epoch := newEpoch(t)
 
-	// 1. The credential owner publishes a policy.
-	signedProviderPolicy := signedOpenAIPolicy(t, providerKey)
-	policyHash, err := signedProviderPolicy.Hash()
+	// 1. The operator publishes a Hub-predefined whitelist policy.
+	providerPolicy := openAIPolicy()
+	policyHash, err := providerPolicy.Hash()
 	if err != nil {
 		t.Fatalf("policy hash: %v", err)
 	}
 
-	// 2. The TEE loads it. Only verified policies can enter a set.
+	// 2. The TEE loads it from its deployment config.
 	policies := policy.NewSet()
-	if err := policies.Add(signedProviderPolicy, now); err != nil {
+	if err := policies.Install(providerPolicy, now); err != nil {
 		t.Fatalf("install policy: %v", err)
 	}
 
@@ -412,10 +383,8 @@ func covers(receipt proof.Receipt, spec jobs.Spec) bool {
 // If someone later adds a check upstream of Authorize, or loosens the policy
 // matcher, this fails here rather than in production.
 func TestPolicyIsTheOnlyGuardOnHubCraftedJobs(t *testing.T) {
-	providerKey := generateKey(t)
-
 	policies := policy.NewSet()
-	if err := policies.Add(signedOpenAIPolicy(t, providerKey), now); err != nil {
+	if err := policies.Install(openAIPolicy(), now); err != nil {
 		t.Fatalf("install policy: %v", err)
 	}
 
@@ -539,7 +508,7 @@ func newService(t *testing.T, epoch *fakeEpoch, transport tee.Transport) (*tee.S
 	t.Helper()
 
 	policies := policy.NewSet()
-	if err := policies.Add(signedOpenAIPolicy(t, generateKey(t)), now); err != nil {
+	if err := policies.Install(openAIPolicy(), now); err != nil {
 		t.Fatalf("install policy: %v", err)
 	}
 	inbox, err := tee.GenerateInboxKey()

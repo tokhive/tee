@@ -1,11 +1,7 @@
 package policy
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
-	"crypto/x509"
 	"errors"
 	"strings"
 	"sync"
@@ -14,36 +10,14 @@ import (
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 )
 
 // Fixed clock so that expiry assertions do not depend on when the test runs.
 var now = time.Unix(1_800_000_000, 0)
 
-func testKey(t *testing.T) *ecdsa.PrivateKey {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	return key
-}
-
-func publicKeyDER(t *testing.T, key *ecdsa.PrivateKey) []byte {
-	t.Helper()
-	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	if err != nil {
-		t.Fatalf("marshal public key: %v", err)
-	}
-	return der
-}
-
-// openAIPolicy is a representative policy: chat and embeddings on one host.
-// The credential's injection shape no longer lives in the policy — it travels
-// with the token itself through agent registration and is stored only inside
-// the TEE (see tee.Secret), so the policy is purely a whitelist.
-func openAIPolicy(t *testing.T, key *ecdsa.PrivateKey) Policy {
-	t.Helper()
+// openAIPolicy is a representative Hub-predefined whitelist: chat, embeddings,
+// and one parametrised read path on a single host.
+func openAIPolicy() Policy {
 	return Policy{
 		Version:     VersionV1,
 		Provider:    "openai",
@@ -70,19 +44,9 @@ func openAIPolicy(t *testing.T, key *ecdsa.PrivateKey) Policy {
 			MaxBodyBytes:     1 << 16,
 			AllowedHeaders:   []string{"content-type", "openai-organization"},
 		},
-		IssuedAt:    now.Unix() - 3600,
-		ExpiresAt:   now.Unix() + 3600,
-		ProviderKey: publicKeyDER(t, key),
+		IssuedAt:  now.Unix() - 3600,
+		ExpiresAt: now.Unix() + 3600,
 	}
-}
-
-func signedPolicy(t *testing.T, key *ecdsa.PrivateKey) SignedPolicy {
-	t.Helper()
-	signed, err := SignPolicy(openAIPolicy(t, key), key)
-	if err != nil {
-		t.Fatalf("sign policy: %v", err)
-	}
-	return signed
 }
 
 func bodyHash(body string) []byte {
@@ -118,8 +82,7 @@ func spec(t *testing.T, mutate func(*jobs.Spec)) jobs.Spec {
 }
 
 func TestPolicyHashIsCanonical(t *testing.T) {
-	key := testKey(t)
-	policy := openAIPolicy(t, key)
+	policy := openAIPolicy()
 
 	first, err := policy.Hash()
 	if err != nil {
@@ -158,8 +121,6 @@ func TestPolicyHashIsCanonical(t *testing.T) {
 }
 
 func TestPolicyValidateRejectsMalformed(t *testing.T) {
-	key := testKey(t)
-
 	cases := []struct {
 		name   string
 		want   error
@@ -168,17 +129,7 @@ func TestPolicyValidateRejectsMalformed(t *testing.T) {
 		{
 			name:   "unsupported version",
 			want:   ErrUnsupportedVersion,
-			change: func(p *Policy) { p.Version = 2 },
-		},
-		{
-			name:   "empty provider",
-			want:   jobs.ErrInvalidProvider,
-			change: func(p *Policy) { p.Provider = "" },
-		},
-		{
-			name:   "uppercase provider",
-			want:   jobs.ErrInvalidProvider,
-			change: func(p *Policy) { p.Provider = "OpenAI" },
+			change: func(p *Policy) { p.Version = 99 },
 		},
 		{
 			name:   "no hosts",
@@ -186,7 +137,12 @@ func TestPolicyValidateRejectsMalformed(t *testing.T) {
 			change: func(p *Policy) { p.Hosts = nil },
 		},
 		{
-			name:   "host with path",
+			name:   "too many hosts",
+			want:   ErrNoHosts,
+			change: func(p *Policy) { p.Hosts = make([]string, MaxHosts+1) },
+		},
+		{
+			name:   "host with a path",
 			want:   ErrInvalidHost,
 			change: func(p *Policy) { p.Hosts = []string{"api.openai.com/v1"} },
 		},
@@ -196,9 +152,14 @@ func TestPolicyValidateRejectsMalformed(t *testing.T) {
 			change: func(p *Policy) { p.Hosts = []string{"https://api.openai.com"} },
 		},
 		{
-			name:   "duplicate hosts",
+			name:   "host with userinfo",
 			want:   ErrInvalidHost,
-			change: func(p *Policy) { p.Hosts = []string{"api.openai.com", "API.openai.com"} },
+			change: func(p *Policy) { p.Hosts = []string{"user@api.openai.com"} },
+		},
+		{
+			name:   "duplicate hosts differ only in case",
+			want:   ErrInvalidHost,
+			change: func(p *Policy) { p.Hosts = []string{"Api.OpenAi.Com", "api.openai.com"} },
 		},
 		{
 			name:   "no rules",
@@ -206,29 +167,44 @@ func TestPolicyValidateRejectsMalformed(t *testing.T) {
 			change: func(p *Policy) { p.Rules = nil },
 		},
 		{
-			name:   "relative path rule",
-			want:   ErrInvalidPathRule,
-			change: func(p *Policy) { p.Rules[0].Path = "v1/chat" },
+			name:   "too many rules",
+			want:   ErrNoRules,
+			change: func(p *Policy) { p.Rules = make([]Rule, MaxRules+1) },
 		},
 		{
-			name:   "malformed placeholder",
+			name:   "rule with no methods",
+			want:   ErrInvalidMethods,
+			change: func(p *Policy) { p.Rules[0].Methods = nil },
+		},
+		{
+			name:   "relative rule path",
+			want:   ErrInvalidPathRule,
+			change: func(p *Policy) { p.Rules[0].Path = "chat/completions" },
+		},
+		{
+			name:   "partial placeholder",
 			want:   ErrInvalidPathRule,
 			change: func(p *Policy) { p.Rules[2].Path = "/v1/models/{model" },
 		},
 		{
-			name:   "empty placeholder",
+			name:   "placeholder with a slash inside",
 			want:   ErrInvalidPathRule,
-			change: func(p *Policy) { p.Rules[2].Path = "/v1/models/{}" },
+			change: func(p *Policy) { p.Rules[2].Path = "/v1/models/{model/x}" },
+		},
+		{
+			name:   "placeholder name too long",
+			want:   ErrInvalidPathRule,
+			change: func(p *Policy) { p.Rules[2].Path = "/v1/{" + strings.Repeat("x", MaxPlaceholderLen+1) + "}" },
 		},
 		{
 			name:   "unsupported method",
 			want:   ErrInvalidMethods,
-			change: func(p *Policy) { p.Rules[0].Methods = []string{"TRACE"} },
+			change: func(p *Policy) { p.Rules[0].Methods = []string{"HEAD"} },
 		},
 		{
-			name:   "no methods",
+			name:   "duplicate method",
 			want:   ErrInvalidMethods,
-			change: func(p *Policy) { p.Rules[0].Methods = nil },
+			change: func(p *Policy) { p.Rules[0].Methods = []string{"GET", "get"} },
 		},
 		{
 			name:   "zero response limit",
@@ -246,6 +222,11 @@ func TestPolicyValidateRejectsMalformed(t *testing.T) {
 			change: func(p *Policy) { p.Limits.AllowedHeaders = []string{"content type"} },
 		},
 		{
+			name:   "duplicate header differing in case",
+			want:   ErrInvalidHeaderName,
+			change: func(p *Policy) { p.Limits.AllowedHeaders = []string{"content-type", "Content-Type"} },
+		},
+		{
 			name:   "expiry before issue",
 			want:   ErrInvalidTimeRange,
 			change: func(p *Policy) { p.ExpiresAt = p.IssuedAt - 1 },
@@ -254,11 +235,6 @@ func TestPolicyValidateRejectsMalformed(t *testing.T) {
 			name:   "zero issued at",
 			want:   ErrInvalidTimeRange,
 			change: func(p *Policy) { p.IssuedAt = 0 },
-		},
-		{
-			name:   "signing key is not a key",
-			want:   ErrInvalidSigningKey,
-			change: func(p *Policy) { p.ProviderKey = []byte("not a key") },
 		},
 		{
 			name:   "short nonce",
@@ -274,7 +250,7 @@ func TestPolicyValidateRejectsMalformed(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			policy := openAIPolicy(t, key)
+			policy := openAIPolicy()
 			tc.change(&policy)
 			err := policy.Validate()
 			if !errors.Is(err, tc.want) {
@@ -285,8 +261,7 @@ func TestPolicyValidateRejectsMalformed(t *testing.T) {
 }
 
 func TestPolicyValidateAtWindow(t *testing.T) {
-	key := testKey(t)
-	policy := openAIPolicy(t, key)
+	policy := openAIPolicy()
 
 	if err := policy.ValidateAt(now); err != nil {
 		t.Fatalf("policy should be valid now: %v", err)
@@ -303,136 +278,8 @@ func TestPolicyValidateAtWindow(t *testing.T) {
 	}
 }
 
-// TestUnsignedPolicyIsStructurallyValid locks the deployment posture: the
-// Hub-predefined whitelist is not signed by the provider, so a Policy with an
-// empty ProviderKey must pass structure validation. Signatures are optional at
-// this layer — they live on the SignedPolicy wrapper, which keeps the legacy
-// path intact without forcing the deployment path to invent a key.
-func TestUnsignedPolicyIsStructurallyValid(t *testing.T) {
-	policy := openAIPolicy(t, testKey(t))
-	policy.ProviderKey = nil
-	if err := policy.ValidateAt(now); err != nil {
-		t.Fatalf("unsigned deployment policy failed validation: %v", err)
-	}
-	// And its hash is stable and usable as the receipt's PolicyHash anchor.
-	hash, err := policy.Hash()
-	if err != nil {
-		t.Fatalf("hash unsigned policy: %v", err)
-	}
-	if hash == [32]byte{} {
-		t.Fatal("unsigned policy hashed to zero")
-	}
-}
-
-func TestSignAndVerifyPolicy(t *testing.T) {
-	key := testKey(t)
-	signed := signedPolicy(t, key)
-
-	if err := VerifySignedPolicy(signed, now); err != nil {
-		t.Fatalf("verify: %v", err)
-	}
-
-	// A policy is self-certifying: the embedded key must be the signing key,
-	// so swapping in another provider's key must break verification.
-	forged := signed
-	forged.Policy.ProviderKey = publicKeyDER(t, testKey(t))
-	if err := VerifySignedPolicy(forged, now); err == nil {
-		t.Fatal("policy signed by a different key than it names was accepted")
-	}
-
-	// Signatures must cover every policy field. Widen the limit and the
-	// signature from the original policy must stop verifying.
-	tampered := signed
-	tampered.Policy.Limits.MaxResponseBytes = 1 << 40
-	if err := VerifySignedPolicy(tampered, now); err == nil {
-		t.Fatal("tampered policy still verified")
-	}
-
-	// Adding a rule is the most dangerous tamper: it grants new access.
-	widened := signed
-	widened.Policy.Rules = append(widened.Policy.Rules, Rule{
-		Methods: []string{"POST"},
-		Path:    "/v1/anything",
-	})
-	if err := VerifySignedPolicy(widened, now); err == nil {
-		t.Fatal("policy with an added rule still verified")
-	}
-}
-
-func TestSignPolicyOverwritesProviderKey(t *testing.T) {
-	key := testKey(t)
-	policy := openAIPolicy(t, key)
-
-	// Claim a foreign key before signing; SignPolicy must replace it.
-	policy.ProviderKey = publicKeyDER(t, testKey(t))
-	signed, err := SignPolicy(policy, key)
-	if err != nil {
-		t.Fatalf("sign: %v", err)
-	}
-	want := publicKeyDER(t, key)
-	if !strings.EqualFold(string(signed.Policy.ProviderKey), string(want)) {
-		t.Fatal("SignPolicy did not overwrite the claimed provider key")
-	}
-	if err := VerifySignedPolicy(signed, now); err != nil {
-		t.Fatalf("verify after overwrite: %v", err)
-	}
-}
-
-func TestSignPolicyRejectsBadKey(t *testing.T) {
-	key := testKey(t)
-	policy := openAIPolicy(t, key)
-
-	if _, err := SignPolicy(policy, nil); !errors.Is(err, ErrInvalidProviderKey) {
-		t.Fatalf("nil key: error = %v, want %v", err, ErrInvalidProviderKey)
-	}
-
-	p384, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate P-384 key: %v", err)
-	}
-	if _, err := SignPolicy(policy, p384); !errors.Is(err, ErrInvalidProviderKey) {
-		t.Fatalf("P-384 key: error = %v, want %v", err, ErrInvalidProviderKey)
-	}
-}
-
-func TestVerifySignedPolicyAcceptsZeroTime(t *testing.T) {
-	key := testKey(t)
-	signed := signedPolicy(t, key)
-
-	// Archived policies are verified against their own epoch, not against now.
-	if err := VerifySignedPolicy(signed, time.Time{}); err != nil {
-		t.Fatalf("zero time should skip the window check: %v", err)
-	}
-}
-
-func TestDecodeSignedPolicyRejectsNonCanonical(t *testing.T) {
-	key := testKey(t)
-	signed := signedPolicy(t, key)
-
-	encoded, err := signed.EncodeCanonical()
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	if _, err := DecodeSignedPolicy(encoded); err != nil {
-		t.Fatalf("decode canonical: %v", err)
-	}
-
-	// An indefinite-length map carries the same content in different bytes.
-	// Accepting it would let one policy hash two ways.
-	indefinite := append([]byte{0xbf}, encoded[1:]...)
-	if _, err := DecodeSignedPolicy(indefinite); err == nil {
-		t.Fatal("indefinite-length encoding was accepted")
-	}
-	if _, err := DecodeSignedPolicy([]byte{0x01, 0x02, 0x03}); err == nil {
-		t.Fatal("garbage bytes were accepted")
-	}
-	// canonical is still imported for the round-trip assertion above.
-	_ = canonical.ErrNonCanonical
-}
-
 func TestAuthorizeAllowsMatchingJob(t *testing.T) {
-	key := testKey(t)
-	policy := openAIPolicy(t, key)
+	policy := openAIPolicy()
 
 	decision, err := policy.Authorize(spec(t, nil))
 	if err != nil {
@@ -453,8 +300,7 @@ func TestAuthorizeAllowsMatchingJob(t *testing.T) {
 }
 
 func TestAuthorizeRejectsBypasses(t *testing.T) {
-	key := testKey(t)
-	policy := openAIPolicy(t, key)
+	policy := openAIPolicy()
 
 	cases := []struct {
 		name   string
@@ -569,8 +415,7 @@ func TestAuthorizeRejectsBypasses(t *testing.T) {
 }
 
 func TestAuthorizeAtEnforcesBothWindows(t *testing.T) {
-	key := testKey(t)
-	policy := openAIPolicy(t, key)
+	policy := openAIPolicy()
 
 	if _, err := policy.AuthorizeAt(spec(t, nil), now); err != nil {
 		t.Fatalf("authorize at now: %v", err)
@@ -638,12 +483,12 @@ func TestHostMatches(t *testing.T) {
 	}
 }
 
-func TestPolicySetAddAndAuthorize(t *testing.T) {
-	key := testKey(t)
+func TestPolicySetInstallAndAuthorize(t *testing.T) {
 	set := NewSet()
 
-	if err := set.Add(signedPolicy(t, key), now); err != nil {
-		t.Fatalf("add: %v", err)
+	// The deployment path: a Hub-predefined whitelist, installed as-is.
+	if err := set.Install(openAIPolicy(), now); err != nil {
+		t.Fatalf("install: %v", err)
 	}
 	if set.Len() != 1 {
 		t.Fatalf("Len() = %d, want 1", set.Len())
@@ -671,112 +516,39 @@ func TestPolicySetAddAndAuthorize(t *testing.T) {
 	}
 }
 
-func TestPolicySetRejectsUnsignedAndStale(t *testing.T) {
-	key := testKey(t)
-	other := testKey(t)
+func TestPolicySetRejectsExpiredAndStale(t *testing.T) {
 	set := NewSet()
 
-	if err := set.Add(signedPolicy(t, key), now); err != nil {
-		t.Fatalf("add: %v", err)
-	}
-
-	// Forged: signed by a key other than the one the policy names.
-	forged := signedPolicy(t, key)
-	forged.Signature.KeyID = sha256.Sum256(publicKeyDER(t, other))
-	if err := set.Add(forged, now); err == nil {
-		t.Fatal("set accepted a policy with a mismatched signature key")
+	if err := set.Install(openAIPolicy(), now); err != nil {
+		t.Fatalf("install: %v", err)
 	}
 
 	// Expired: valid once, not now.
-	expired := openAIPolicy(t, key)
+	expired := openAIPolicy()
 	expired.IssuedAt = now.Unix() - 7200
 	expired.ExpiresAt = now.Unix() - 3600
-	expiredSigned, err := SignPolicy(expired, key)
-	if err != nil {
-		t.Fatalf("sign expired: %v", err)
-	}
-	if err := set.Add(expiredSigned, now); !errors.Is(err, ErrPolicyExpired) {
+	if err := set.Install(expired, now); !errors.Is(err, ErrPolicyExpired) {
 		t.Fatalf("expired policy: error = %v, want %v", err, ErrPolicyExpired)
 	}
 
 	// Rollback: an older policy must not replace a newer one.
-	newer := openAIPolicy(t, key)
+	newer := openAIPolicy()
 	newer.IssuedAt = now.Unix()
-	newerSigned, err := SignPolicy(newer, key)
-	if err != nil {
-		t.Fatalf("sign newer: %v", err)
+	if err := set.Install(newer, now); err != nil {
+		t.Fatalf("install newer: %v", err)
 	}
-	if err := set.Add(newerSigned, now); err != nil {
-		t.Fatalf("add newer: %v", err)
-	}
-	if err := set.Add(signedPolicy(t, key), now); !errors.Is(err, ErrPolicyRollback) {
+	if err := set.Install(openAIPolicy(), now); !errors.Is(err, ErrPolicyRollback) {
 		t.Fatalf("rollback: error = %v, want %v", err, ErrPolicyRollback)
-	}
-}
-
-func TestPolicySetLoadIsAtomic(t *testing.T) {
-	key := testKey(t)
-	other := testKey(t)
-	set := NewSet()
-
-	good := signedPolicy(t, key)
-	bad := signedPolicy(t, other)
-	// Make the second entry structurally invalid after signing so that Load
-	// fails partway through and must install nothing.
-	bad.Policy.Limits.MaxResponseBytes = 0
-
-	before := set.Len()
-	if err := set.Load([]SignedPolicy{good, bad}, now); err == nil {
-		t.Fatal("Load accepted an invalid entry")
-	}
-	if set.Len() != before {
-		t.Fatalf("Load partially applied: Len() = %d, want %d", set.Len(), before)
-	}
-
-	if err := set.Load([]SignedPolicy{good}, now); err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if set.Len() != 1 {
-		t.Fatalf("Len() = %d, want 1", set.Len())
-	}
-}
-
-func TestPolicySetInstallUnsignedDeploymentPolicy(t *testing.T) {
-	set := NewSet()
-
-	// The deployment path: a Hub-predefined whitelist with no provider key.
-	unsigned := openAIPolicy(t, testKey(t))
-	unsigned.ProviderKey = nil
-	if err := set.Install(unsigned, now); err != nil {
-		t.Fatalf("install unsigned policy: %v", err)
-	}
-	if set.Len() != 1 {
-		t.Fatalf("Len() = %d, want 1", set.Len())
-	}
-
-	decision, err := set.Authorize(spec(t, nil))
-	if err != nil {
-		t.Fatalf("authorize deployment-installed policy: %v", err)
-	}
-	if decision.Provider != "openai" {
-		t.Fatalf("provider = %q, want openai", decision.Provider)
-	}
-	// The PolicyHash anchor still works — the receipt binds to the policy hash,
-	// which is independent of whether a signature wrapper was ever present.
-	got, _ := set.Get("openai")
-	if got.Provider != "openai" {
-		t.Fatalf("Get() provider = %q", got.Provider)
 	}
 }
 
 func TestPolicySetInstallAllIsAtomic(t *testing.T) {
 	set := NewSet()
-	good := openAIPolicy(t, testKey(t))
-	good.ProviderKey = nil
+	good := openAIPolicy()
 
 	// Structurally invalid after the fact, so InstallAll must fail partway and
 	// install nothing.
-	bad := openAIPolicy(t, testKey(t))
+	bad := openAIPolicy()
 	bad.Provider = "anthropic"
 	bad.Limits.MaxResponseBytes = 0
 
@@ -788,9 +560,8 @@ func TestPolicySetInstallAllIsAtomic(t *testing.T) {
 		t.Fatalf("InstallAll partially applied: Len() = %d, want %d", set.Len(), before)
 	}
 
-	other := openAIPolicy(t, testKey(t))
+	other := openAIPolicy()
 	other.Provider = "anthropic"
-	other.ProviderKey = nil
 	if err := set.InstallAll([]Policy{good, other}, now); err != nil {
 		t.Fatalf("InstallAll: %v", err)
 	}
@@ -800,10 +571,9 @@ func TestPolicySetInstallAllIsAtomic(t *testing.T) {
 }
 
 func TestPolicySetConcurrentAccess(t *testing.T) {
-	key := testKey(t)
 	set := NewSet()
-	if err := set.Add(signedPolicy(t, key), now); err != nil {
-		t.Fatalf("add: %v", err)
+	if err := set.Install(openAIPolicy(), now); err != nil {
+		t.Fatalf("install: %v", err)
 	}
 
 	// A policy set is read on every job while policies are rotated in the
@@ -825,23 +595,26 @@ func TestPolicySetConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
-func TestSignedPolicyRoundTrip(t *testing.T) {
-	key := testKey(t)
-	signed := signedPolicy(t, key)
+func TestPolicyRoundTrip(t *testing.T) {
+	policy := openAIPolicy()
 
-	encoded, err := signed.EncodeCanonical()
+	encoded, err := policy.EncodeCanonical()
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	decoded, err := DecodeSignedPolicy(encoded)
-	if err != nil {
+	var decoded Policy
+	if err := canonical.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if err := VerifySignedPolicy(decoded, now); err != nil {
-		t.Fatalf("verify after round trip: %v", err)
+
+	// An indefinite-length map carries the same content in different bytes.
+	// Accepting it would let one policy hash two ways.
+	indefinite := append([]byte{0xbf}, encoded[1:]...)
+	if err := canonical.Unmarshal(indefinite, &decoded); err == nil {
+		t.Fatal("indefinite-length encoding was accepted")
 	}
 
-	originalHash, err := signed.Hash()
+	originalHash, err := policy.Hash()
 	if err != nil {
 		t.Fatalf("hash: %v", err)
 	}
@@ -892,8 +665,7 @@ func TestParseQueryKeys(t *testing.T) {
 // TestPlaceholderCannotEscapeItsSegment guards the one rule that makes
 // placeholders safe: they match a single path segment, never a slash.
 func TestPlaceholderCannotEscapeItsSegment(t *testing.T) {
-	key := testKey(t)
-	policy := openAIPolicy(t, key)
+	policy := openAIPolicy()
 	policy.Rules = []Rule{{
 		Methods:   []string{"GET"},
 		Path:      "/v1/models/{model}",
@@ -918,9 +690,8 @@ func TestPlaceholderCannotEscapeItsSegment(t *testing.T) {
 // TestPolicyUsesJobProviderRules asserts the policy package delegates provider
 // name validation to jobs rather than keeping a second copy that can drift.
 func TestPolicyUsesJobProviderRules(t *testing.T) {
-	key := testKey(t)
 	for _, name := range []string{"openai", "anthropic-2", "a_b", "OpenAI", "bad name", ""} {
-		policy := openAIPolicy(t, key)
+		policy := openAIPolicy()
 		policy.Provider = name
 
 		policyErr := policy.Validate()
@@ -928,32 +699,5 @@ func TestPolicyUsesJobProviderRules(t *testing.T) {
 		if (policyErr == nil) != (jobErr == nil) {
 			t.Errorf("provider %q: policy said %v, jobs said %v", name, policyErr, jobErr)
 		}
-	}
-}
-
-// TestVerifySignedPolicyUsesPlatformPath keeps the policy signature bound to
-// the shared verification path: a signature made over a different domain must
-// be rejected even though the key and algorithm are correct.
-func TestVerifySignedPolicyUsesPlatformPath(t *testing.T) {
-	key := testKey(t)
-	signed := signedPolicy(t, key)
-
-	policyHash, err := signed.Policy.Hash()
-	if err != nil {
-		t.Fatalf("hash: %v", err)
-	}
-	digest, err := platform.SigningDigest("TokenHive.SomethingElse.v1", policyHash[:])
-	if err != nil {
-		t.Fatalf("digest: %v", err)
-	}
-	value, err := ecdsa.SignASN1(rand.Reader, key, digest[:])
-	if err != nil {
-		t.Fatalf("sign: %v", err)
-	}
-
-	crossDomain := signed
-	crossDomain.Signature.Value = value
-	if err := VerifySignedPolicy(crossDomain, now); err == nil {
-		t.Fatal("signature from another domain was accepted")
 	}
 }

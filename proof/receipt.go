@@ -129,10 +129,10 @@ type Receipt struct {
 	FinishedAt    int64           `cbor:"14,keyasint"`
 	Attestation   *AttestationRef `cbor:"15,keyasint,omitempty"`
 
-	// PolicyHash identifies the provider policy the TEE enforced when it ran
+	// PolicyHash identifies the whitelist policy the TEE enforced when it ran
 	// the job. Without it a receipt proves that an enclave produced a response
-	// but not that it stayed inside the bounds the credential owner set, which
-	// is the half of the guarantee a provider actually cares about.
+	// but not that it stayed inside the bounds the provider's whitelist set,
+	// which is the half of the guarantee a provider actually cares about.
 	//
 	// Optional so that a receipt stays valid in contexts where no policy was
 	// consulted; the TEE is expected to populate it on every normal job.
