@@ -76,7 +76,6 @@ var (
 	ErrInvalidExpiry      = errors.New("invalid expiry")
 	ErrInvalidLimit       = errors.New("invalid response size limit")
 	ErrExpired            = errors.New("job spec has expired")
-	ErrNonceEmpty         = errors.New("nonce must not be empty")
 )
 
 // Spec is a request the Hub asks the TEE to perform with a provider credential.
