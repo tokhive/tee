@@ -20,9 +20,15 @@ var ErrNoProviderForModel = errors.New("no provider serves this model")
 //
 // The Hub only routes new work to a provider whose agent is online right now —
 // a provider nobody currently egresses for cannot carry traffic, so it is not a
-// candidate. When no agent has dialed in at all (a Hub running purely against a
-// scripted stand-in), the scheduler falls back to the static market table so the
-// embedded business tests can reason about pricing without a live agent.
+// candidate. A Hub that does not host agent registration at all (no agent
+// secret configured: the embedded business tests driving a scripted TEE)
+// schedules over the static market table instead, where every listed provider
+// is treated as supply.
+//
+// The distinction matters on disconnect: an agent that goes offline takes its
+// listing with it, and its provider stops being a candidate at any price — not
+// even the platform default. Falling back to the market table whenever no agent
+// happened to be online would keep routing jobs to a tunnel nobody is holding.
 //
 // The effective book price is per-request plus any per-model surcharge, taken
 // from the agent's own card when it declared one and the platform default
@@ -31,9 +37,8 @@ var ErrNoProviderForModel = errors.New("no provider serves this model")
 // that depended on it would be non-deterministic. Per-request and model
 // surcharge are both known before dispatch, which is what a decision needs.
 //
-// An unlisted model pays no premium under a rate card, so every online provider
-// is a candidate and still priced. The card's numbers, not the Hub's opinion,
-// decide the order.
+// An unlisted model pays no premium under a rate card, so every candidate is
+// still priced. The card's numbers, not the Hub's opinion, decide the order.
 func (h *Hub) providersForModel(model string) []string {
 	price := func(provider string) uint64 {
 		card, ok := h.card(provider)
@@ -51,14 +56,15 @@ func (h *Hub) providersForModel(model string) []string {
 	}
 
 	var providers []string
-	online := h.agents.onlineProviders()
-	if len(online) > 0 {
-		providers = online
-	} else {
+	if len(h.agentSecret) == 0 {
+		// No agent gate on this Hub: the market table is the supply.
 		providers = make([]string, 0, len(h.rates))
 		for provider := range h.rates {
 			providers = append(providers, provider)
 		}
+	} else {
+		// Supply is exactly the agents holding a tunnel open right now.
+		providers = h.agents.onlineProviders()
 	}
 	sort.SliceStable(providers, func(i, j int) bool {
 		pi, pj := price(providers[i]), price(providers[j])
