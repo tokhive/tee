@@ -276,11 +276,11 @@ type Outcome struct {
 
 // Execute runs one job: check quota, dispatch, verify, price, settle, store.
 //
-// model is the Hub's own pricing key. It was historically carried inside the
-// job spec; it is deliberately out-of-band now: the TEE only establishes and
-// holds the provider connection, so it neither reads nor attests a model, and
-// the spec stays a pure "what HTTP request to perform". The Hub selects and
-// prices providers from the model it resolved locally.
+// model is the Hub's own pricing key, deliberately out-of-band from the job
+// spec: the TEE only establishes and holds the provider connection, so it
+// neither reads nor attests a model, and the spec stays a pure "what HTTP
+// request to perform". The Hub selects and prices providers from the model it
+// resolved locally.
 //
 // The ordering is load-bearing in two places. Quota is checked before
 // dispatch, so a refused request never consumes a ProviderSeq — if it did,

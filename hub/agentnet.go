@@ -89,12 +89,12 @@ type AgentRegister struct {
 	// SelfPrice, when set, is the agent's own rate card. A nil SelfPrice means
 	// the agent accepts the Hub's platform default for its provider.
 	SelfPrice *RateCard `json:"self_price,omitempty"`
-	// Models is the set of model IDs the agent's upstream can serve. Empty
-	// means undeclared: the Hub treats such an agent as serving any model, so
-	// scheduling still tries it and falls back on upstream refusal exactly as
-	// it does today. When non-empty it is a soft capability hint: the Hub
-	// prefers candidates that declare the model, and a model nobody declares
-	// is dispatched to undeclared candidates rather than refused outright.
+	// Models is the set of model IDs the agent's upstream can serve, a soft
+	// capability hint. Non-empty declares capability: the agent is only a
+	// candidate for those models (sending it a job it cannot serve would just
+	// buy an upstream refusal). Empty means undeclared — the agent serves any
+	// model, so it stays a candidate for everything. A model no online agent
+	// can serve is refused outright rather than fired at every provider.
 	Models []string `json:"models,omitempty"`
 	// Credential is the provider's token sealed to the TEE's inbox public key
 	// (tee.EncryptCredential). The Hub only ever holds this ciphertext: it

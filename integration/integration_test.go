@@ -371,7 +371,7 @@ func covers(receipt proof.Receipt, spec jobs.Spec) bool {
 }
 
 // TestPolicyIsTheOnlyGuardOnHubCraftedJobs pins down what the trust model
-// actually guarantees now that the User no longer signs the job spec.
+// guarantees for Hub-authored jobs.
 //
 // The Hub authors every spec, so it can produce a structurally flawless request
 // for anything it likes: a path the policy never listed, a host the provider

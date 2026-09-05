@@ -21,9 +21,8 @@ type ChannelConfig struct {
 	Scheme string
 
 	// AllowPlaintext permits Scheme "http". Plaintext carries a provider
-	// credential that the Agent can read off the wire, so it is refused unless
-	// explicitly enabled — same rule as the old http.go, kept for the tests and
-	// demos that want to inspect bytes.
+	// credential that the Agent can read off the wire, so the default is to
+	// refuse it; tests and demos that want to inspect bytes enable it.
 	AllowPlaintext bool
 
 	// TLSClientConfig customises TLS for provider connections, e.g. trusting a

@@ -3,32 +3,36 @@
 #
 # Builds the simulation binaries, starts the mock provider and the simulated
 # TEE, and walks the scenario matrix end to end:
-#   normal flow            -> seq 1..5, verified receipts, priced from the
-#                             provider's own signed policy
-#   policy denial          -> 403, no receipt (credential never touched)
-#   provider 401 / 429     -> attested, but earns nothing
-#   provider truncate      -> receipt with CompletionTruncated
-#   TEE restart            -> ProviderSeq keeps climbing (cross-restart survival)
-#   ProviderSeq gap        -> Hub hides one record, audit detects the gap
-#   quota                  -> refused request never reaches the TEE, so it
-#                             burns no ProviderSeq and leaves no gap
-#   real TEE via reverse   -> genuine tee.Service egressing over the reverse
-#     tunnel                 tunnel: a Provider Agent behind a NAT dials the
-#                             Hub, the TEE dials the Hub's TeeRelay, and the
-#                             Hub bridges the TEE's stream into the online
-#                             agent's tunnel. A packet capture proves the
-#                             agent relays only ciphertext.
-#   agent killed mid-req   -> the request fails cleanly, never hangs/panics
-#   epoch rotation         -> a TEE restarted with a new key still verifies
-#   oversize response      -> the TEE truncates at its MaxResponseBytes cap
-#   connection residency   -> N requests reuse exactly one upstream TCP
-#                             connection through the tunnel
-#   streaming session      -> a WebSocket session egresses over the reverse
-#                             tunnel and its receipt verifies offline
-#   lowest-price dispatch  -> the Hub schedules by model to the cheapest
-#                             online agent, with commission on the buyer bill
-#   anthropic + responses  -> Hub relays /v1/messages and /v1/responses
-#                             verbatim, each with its own terminal event
+#   1  normal flow           -> seq 1..5, verified receipts, priced from the Hub
+#                               rate table
+#   2  policy denial          -> 403, no receipt (credential never touched)
+#   3-4 provider 401 / 429    -> attested, but earns nothing
+#   5  provider truncate      -> receipt with CompletionTruncated
+#   6  TEE restart            -> ProviderSeq keeps climbing (cross-restart survival)
+#   7  ProviderSeq gap        -> Hub hides one record, audit detects the gap
+#   8  quota                  -> refused request never reaches the TEE, so it
+#                               burns no ProviderSeq and leaves no gap
+#   9  real TEE via reverse   -> genuine tee.Service egressing over the reverse
+#     tunnel                    tunnel: a Provider Agent behind a NAT dials the
+#                               Hub, the TEE dials the Hub's TeeRelay, and the
+#                               Hub bridges the TEE's stream into the online
+#                               agent's tunnel. A packet capture proves the
+#                               agent relays only ciphertext.
+#  10  agent killed mid-req   -> the request fails cleanly, never hangs/panics
+#  11  epoch rotation         -> a TEE restarted with a new key still verifies
+#  12  oversize response      -> the TEE truncates at its MaxResponseBytes cap
+#  13  connection residency   -> N requests reuse exactly one upstream TCP
+#                               connection through the tunnel
+#  14  streaming session      -> a WebSocket session egresses over the reverse
+#                               tunnel and its receipt verifies offline
+#  15  lowest-price dispatch  -> the Hub schedules by model to the cheapest
+#                               online agent, with commission on the buyer bill
+#  16  auto-discovery + catalog: agents come online WITHOUT -models, each
+#       infers and fetches its upstream /v1/models, registers the discovered
+#       list, and the /v1/models directory lists them at the lowest online
+#       price; ?q= search filters by exact ID and by substring.
+#  17  streaming session via  -> the Hub user API WebSocket: select + settle
+#      the Hub user API          + duplex
 #
 # Nothing here talks to a real model or a real enclave. The Hub's business
 # rules (pricing, quota, ledger, gap detection) are unit tested in-process
@@ -303,16 +307,16 @@ fi
 echo "    (credential still never on the agent wire — see scenario 9's tap)"
 
 # =====================================================================
-# S13: CONNECTION RESIDENCY (C1).
-# A fresh real TEE through the online agent; zero the upstream's TCP counter;
-# N requests must reuse exactly ONE connection; a mid-stream disconnect then
-# forces a fresh dial (counter +1) and leaves the next receipt normal.
+# Connection residency: a fresh real TEE through the online agent; zero the
+# upstream's TCP counter; N requests must reuse exactly ONE connection; a
+# mid-stream disconnect then forces a fresh dial (counter +1) and leaves the
+# next receipt normal.
 # =====================================================================
 TEE_C=18097
 # --noproxy '*' : the sim shell carries an HTTP_PROXY env var that would route a
 # query for the local stats listener through the user's proxy and receive
 # nothing back; the 127.0.0.1 probe must always be direct.
-section "13. connection residency (C1): N requests, ONE upstream TCP connection"
+section "13. connection residency: N requests, ONE upstream TCP connection"
 curl -s --noproxy '*' "http://127.0.0.1:$STATS_PORT/reset" > /dev/null   # clean baseline
 echo "    starting fresh real tee C on :$TEE_C, egressing via the reverse tunnel"
 # Fresh TEE, fresh seqstore, so the shared receipt store must be isolated too —
@@ -368,13 +372,13 @@ fi
 kill "$TEE_C_PID" 2>/dev/null; wait "$TEE_C_PID" 2>/dev/null
 
 # =====================================================================
-# S14: STREAMING SESSION (C3) — WebSocket upgrade tunnel + session receipt.
-# A real TEE egresses through the reverse tunnel and upgrades to the provider's
-# /v1/realtime WebSocket; the streamer drives a full-duplex exchange and
-# verifies the terminal 101 session receipt offline against the exact bytes.
+# Streaming session: a real TEE egresses through the reverse tunnel and
+# upgrades to the provider's /v1/realtime WebSocket; the streamer drives a
+# full-duplex exchange and verifies the terminal 101 session receipt offline
+# against the exact bytes.
 # =====================================================================
 TEE_E=18099
-section "14. streaming session (C3): WebSocket upgrade tunnel + session receipt"
+section "14. streaming session: WebSocket upgrade tunnel + session receipt"
 
 echo "    starting real tee E on :$TEE_E, egressing via the reverse tunnel"
 "$BIN/tee" -addr "127.0.0.1:$TEE_E" -relay "$RT_HUB_WS/v1/relay" \
@@ -406,16 +410,15 @@ kill "$AGENT_A_PID" 2>/dev/null; wait "$AGENT_A_PID" 2>/dev/null
 kill "$RT_HUB_PID" 2>/dev/null; wait "$RT_HUB_PID" 2>/dev/null
 
 # =====================================================================
-# S15: LOWEST-PRICE SCHEDULING + COMMISSION (C2).
-# A Hub user-facing API over a real TEE that egresses TWO providers, each
-# through its own online agent. Both serve the same model at different prices
-# (cheap-sim 0.30, openai-sim 1.00), so the scheduler must pick cheap-sim for
-# every request; the 10% commission must land on the buyer's bill while the
-# provider keeps its own price.
+# Lowest-price scheduling + commission: A Hub user-facing API over a real
+# TEE that egresses TWO providers, each through its own online agent. Both
+# serve the same model at different prices (cheap-sim 0.30, openai-sim 1.00),
+# so the scheduler must pick cheap-sim for every request; the 10% commission
+# must land on the buyer's bill while the provider keeps its own price.
 # =====================================================================
 HUB_API_PORT=18085
 TEE_D=18098
-section "15. lowest-price scheduling + commission (C2): user API picks cheap-sim"
+section "15. lowest-price scheduling + commission: user API picks cheap-sim"
 
 echo "    starting the user-facing Hub on :$HUB_API_PORT (10% commission, agent-key gate)"
 "$BIN/hub" -serve "127.0.0.1:$HUB_API_PORT" -host "127.0.0.1:$MP_PORT" \
@@ -486,7 +489,7 @@ fi
 kill "$TEE_D_PID" "$HUB_API_PID" 2>/dev/null; wait "$TEE_D_PID" "$HUB_API_PID" 2>/dev/null
 
 # =====================================================================
-# S16: ANTHROPIC MESSAGES + OPENAI RESPONSES USER-FACING APIS.
+# Anthropic messages + OpenAI responses user APIs:
 # The Hub relays two more wire shapes verbatim over the same scheduler:
 # /v1/messages (Anthropic: event: message_start ... message_stop) and
 # /v1/responses (OpenAI Responses: response.created ... response.completed).
@@ -628,7 +631,7 @@ then :; else echo "      !! FAIL: /v1/models search wrong (see above)"; fi
 kill "$TEE_D16_PID" "$HUB_API16_PID" 2>/dev/null; wait "$TEE_D16_PID" "$HUB_API16_PID" 2>/dev/null
 
 # =====================================================================
-# S17: STREAMING SESSION THROUGH THE HUB USER API (C5).
+# Streaming session through the Hub user API:
 # A user opens /v1/session, the Hub learns the model from the first frame,
 # picks the cheapest provider, and relays the full-duplex session through a
 # real TEE to /v1/realtime. The sessiondriver proves the byte round trip;
@@ -638,7 +641,7 @@ kill "$TEE_D16_PID" "$HUB_API16_PID" 2>/dev/null; wait "$TEE_D16_PID" "$HUB_API1
 # rather than by a dedicated running Hub here.
 # =====================================================================
 TEE_G=18091
-section "17. streaming session via the Hub user API (C5): select + settle + duplex"
+section "17. streaming session via the Hub user API: select + settle + duplex"
 
 echo "    (fresh hub + stores so the receipt count is unambiguous)"
 rm -rf "$SIM/receipts"
