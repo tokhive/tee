@@ -30,6 +30,8 @@ package provider
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,9 +89,32 @@ type AgentConfig struct {
 	// 10s.
 	ConnectTimeout time.Duration
 
-	// ReconnectDelay pauses between reconnect attempts after the tunnel drops.
+	// ReconnectDelay is the pause before the first reconnect after the tunnel
+	// drops. Each consecutive failed attempt doubles it up to MaxReconnectDelay,
+	// so a Hub that is briefly unreachable cannot be hammered at a fixed rate.
 	// Zero means 1s.
 	ReconnectDelay time.Duration
+
+	// MaxReconnectDelay caps the backoff. Zero means 30s.
+	MaxReconnectDelay time.Duration
+
+	// ModelsURL, when set, is fetched once before the agent comes online and
+	// the model list it returns declares this agent's upstream capability to
+	// the Hub. It follows the OpenAI /v1/models convention: a JSON object whose
+	// "data" array holds objects with an "id" field. A plain newline-separated
+	// list is accepted as a fallback.
+	//
+	// A fetch failure is fatal: the agent reports the error and refuses to come
+	// online rather than silently registering as if it served anything. When
+	// unset and Self.Models is empty the agent declares no models, which the
+	// Hub reads as "serves anything" (relay-only deployments, tests).
+	ModelsURL string
+
+	// RootCAs, when set, replaces the system pool for the agent's control-plane
+	// HTTPS fetches (the ModelsURL discovery). The simulation injects the
+	// mock provider's throwaway CA here; production leaves it nil and trusts
+	// the public roots.
+	RootCAs *x509.CertPool
 
 	// DialTarget replaces the outbound upstream dial. Test injection point; nil
 	// uses the standard dialer.
@@ -107,6 +132,11 @@ type AgentConfig struct {
 type Agent struct {
 	cfg AgentConfig
 	hdr http.Header
+
+	// models is the list resolved from ModelsURL before the first dial (see
+	// prepareModels). It stays empty when no automatic discovery is configured,
+	// which the Hub reads as "serves anything".
+	models []string
 }
 
 // NewAgent validates the configuration and returns a ready agent.
@@ -134,6 +164,9 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 	if cfg.ReconnectDelay <= 0 {
 		cfg.ReconnectDelay = time.Second
 	}
+	if cfg.MaxReconnectDelay <= 0 {
+		cfg.MaxReconnectDelay = 30 * time.Second
+	}
 	a := &Agent{cfg: cfg}
 	a.hdr = http.Header{}
 	a.hdr.Set(hub.AgentKeyHeader, string(cfg.SharedKey))
@@ -144,22 +177,49 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 // tunnel drop. register is one full connection cycle: dial, register, and relay
 // until the tunnel ends.
 //
+// Automatic model discovery happens before the first dial (see
+// prepareModels): a ModelsURL that cannot be fetched is a configuration
+// error, reported here so the operator sees it instead of an agent that
+// silently comes online claiming to serve anything.
+//
 // The context also interrupts an in-flight cycle: without it, a graceful stop
 // would leave the tunnel open (runOnce blocks in io.Copy on the control
 // stream) and the Hub would keep the provider online. runOnce registers the
 // interrupt with the live tunnel so cancellation closes the connection, which
 // is exactly what a killed process does — the Hub sees the drop and revokes
 // the credential.
+//
+// Reconnects back off: a failed attempt doubles the pause up to
+// MaxReconnectDelay, and a clean connection resets it to ReconnectDelay. A Hub
+// that is briefly unreachable therefore gets a widening gap between attempts
+// rather than a fixed-rate hammer, which is the whole point — an agent must
+// not amplify a Hub outage into a connection storm.
 func (a *Agent) Run(ctx context.Context) error {
+	if err := a.prepareModels(); err != nil {
+		return err
+	}
+	delay := a.cfg.ReconnectDelay
 	for {
 		err := a.runOnce(ctx)
 		if err != nil && ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err == nil {
+			delay = a.cfg.ReconnectDelay
+		} else {
+			next := delay * 2
+			if next <= 0 || next > a.cfg.MaxReconnectDelay {
+				next = a.cfg.MaxReconnectDelay
+			}
+			delay = next
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(a.cfg.ReconnectDelay):
+		case <-time.After(delay):
 		}
 	}
 }
@@ -219,6 +279,14 @@ func (a *Agent) runOnce(ctx context.Context) error {
 // without an envelope (relay-only deployments, tests).
 func (a *Agent) register() (hub.AgentRegister, error) {
 	reg := a.cfg.Self
+	if len(a.models) > 0 {
+		// Automatic discovery (ModelsURL) resolved before the first dial; the
+		// discovered list is the declaration. An explicitly configured
+		// Self.Models always wins over discovery.
+		if len(reg.Models) == 0 {
+			reg.Models = a.models
+		}
+	}
 	if a.cfg.Credential.Token == "" {
 		return reg, nil
 	}
@@ -233,6 +301,85 @@ func (a *Agent) register() (hub.AgentRegister, error) {
 	}
 	reg.Credential = &envelope
 	return reg, nil
+}
+
+// prepareModels resolves ModelsURL before the first dial, so a provider that
+// asked for automatic model discovery but cannot reach its upstream fails
+// here — Run returns the error and the agent never comes online — instead of
+// registering as if it served anything. Self.Models, when configured
+// explicitly, is used as-is and discovery is skipped. Models are resolved
+// once per agent lifetime: re-fetching on every reconnect would probe the
+// upstream on the very cadence the backoff exists to stop.
+func (a *Agent) prepareModels() error {
+	if a.cfg.ModelsURL == "" || len(a.cfg.Self.Models) > 0 {
+		return nil
+	}
+	var auth http.Header
+	if a.cfg.Credential.Token != "" {
+		if name, value, err := a.cfg.Credential.Render(); err == nil {
+			auth = http.Header{name: []string{value}}
+		}
+	}
+	models, err := fetchModels(a.cfg.ModelsURL, a.httpClient(), auth)
+	if err != nil {
+		return fmt.Errorf("no models configured and fetching %s failed: %w", a.cfg.ModelsURL, err)
+	}
+	if len(models) == 0 {
+		return fmt.Errorf("no models configured and %s returned an empty model list", a.cfg.ModelsURL)
+	}
+	a.models = models
+	return nil
+}
+
+// fetchModels retrieves a model list following the OpenAI /v1/models shape:
+// a JSON object with a "data" array of objects carrying an "id". A
+// newline-delimited plain-text list is accepted as a fallback, so a provider
+// can point ModelsURL at anything from a live API to a static file.
+// auth, when non-nil, is applied to the request (many providers require the
+// same credential on the models endpoint as on the inference endpoints).
+func fetchModels(url string, client *http.Client, auth http.Header) ([]string, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("models url: %w", err)
+	}
+	req.Header = auth
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch models: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch models: status %d", resp.StatusCode)
+	}
+
+	var doc struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read models: %w", err)
+	}
+	if jsonErr := json.Unmarshal(raw, &doc); jsonErr == nil && len(doc.Data) > 0 {
+		ids := make([]string, 0, len(doc.Data))
+		for _, d := range doc.Data {
+			if d.ID != "" {
+				ids = append(ids, d.ID)
+			}
+		}
+		return ids, nil
+	}
+
+	// Fallback: one model ID per line.
+	var ids []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			ids = append(ids, line)
+		}
+	}
+	return ids, nil
 }
 
 // credentialKey fetches the Hub's published TEE inbox public key. The Hub
@@ -255,10 +402,16 @@ func (a *Agent) hubHTTPURL() string {
 }
 
 // httpClient returns a bounded client for the control-plane HTTP calls the
-// agent makes (credential-key fetch). It is deliberately separate from the
-// WebSocket dialer: same server, different hop.
+// agent makes (model discovery and the credential-key fetch). It is
+// deliberately separate from the WebSocket dialer: same server, different hop.
+// RootCAs, when set, replaces the system pool so the simulation's agent can
+// fetch the model list from the TLS mock provider.
 func (a *Agent) httpClient() *http.Client {
-	return &http.Client{Timeout: a.cfg.ConnectTimeout}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if a.cfg.RootCAs != nil {
+		transport.TLSClientConfig = &tls.Config{RootCAs: a.cfg.RootCAs, MinVersion: tls.VersionTLS12}
+	}
+	return &http.Client{Timeout: a.cfg.ConnectTimeout, Transport: transport}
 }
 
 // handleRelay bridges one Hub-opened relay stream to the named upstream. It runs

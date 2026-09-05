@@ -297,3 +297,63 @@ func TestAgentRequiresConfig(t *testing.T) {
 		t.Fatalf("error = %v, want ErrEmptyAllowlist", err)
 	}
 }
+
+// TestAgentDiscoversModelsFromUpstream pins the no-config path: an agent with
+// no explicit model list fetches the conventional /v1/models endpoint before
+// it comes online and reports the discovered list at registration.
+func TestAgentDiscoversModelsFromUpstream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"object":"list","data":[{"id":"gpt-4o"},{"id":"deepseek-pro"},{"id":"deepseek-flash"}]}`)
+	}))
+	defer srv.Close()
+
+	a, err := NewAgent(AgentConfig{
+		HubGateURL:     "ws://127.0.0.1:1/v1/agent",
+		SharedKey:      []byte(testAgentSecret),
+		Self:           hub.AgentRegister{Provider: "p"},
+		AllowedTargets: []string{"api.example.com"},
+		ModelsURL:      srv.URL + "/v1/models",
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	if err := a.prepareModels(); err != nil {
+		t.Fatalf("prepareModels: %v", err)
+	}
+	got := a.models
+	want := []string{"gpt-4o", "deepseek-pro", "deepseek-flash"}
+	if len(got) != len(want) {
+		t.Fatalf("discovered models = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("discovered models = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestAgentRefusesToComeOnlineWithoutDiscoverableModels pins that a failed
+// model discovery is fatal: the agent reports the error instead of silently
+// registering as "serves anything".
+func TestAgentRefusesToComeOnlineWithoutDiscoverableModels(t *testing.T) {
+	// A models endpoint that answers 404 — no upstream model list to find.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	a, err := NewAgent(AgentConfig{
+		HubGateURL:     "ws://127.0.0.1:1/v1/agent",
+		SharedKey:      []byte(testAgentSecret),
+		Self:           hub.AgentRegister{Provider: "p"},
+		AllowedTargets: []string{"api.example.com"},
+		ModelsURL:      srv.URL + "/v1/models",
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	if err := a.prepareModels(); err == nil {
+		t.Fatal("prepareModels succeeded against a 404 models endpoint")
+	}
+}

@@ -11,7 +11,9 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -32,6 +34,9 @@ func main() {
 	name := flag.String("name", "", "optional human display label for this agent")
 	price := flag.Int64("price", 0, "per-request price in micro-units; 0 accepts the Hub's platform default for this provider")
 	targets := flag.String("targets", "127.0.0.1:18080", "comma-separated host:port the agent may dial (the AI provider endpoint)")
+	models := flag.String("models", "", "comma-separated model IDs this agent's upstream serves; empty auto-discovers them from the upstream's conventional /v1/models endpoint")
+	modelsURL := flag.String("models-url", "", "explicit URL to fetch the model list from; overrides the conventional discovery endpoint")
+	caFile := flag.String("ca", "", "CA file to trust when fetching the model list over TLS (the simulation's mock provider CA)")
 	tap := flag.String("tap", "", "file to mirror every relayed byte into (test/demo: proves the agent only sees ciphertext)")
 	token := flag.String("token", "", "the provider's access token (API key). Required; sealed to the TEE at registration — the Hub never sees it")
 	authScheme := flag.String("auth-scheme", "auto", "prefix before the token in the auth header: auto, a literal scheme (e.g. Bearer), or empty for a raw-token header")
@@ -54,6 +59,9 @@ func main() {
 		if t = strings.TrimSpace(t); t != "" {
 			allowed = append(allowed, t)
 		}
+	}
+	if len(allowed) == 0 {
+		log.Fatal("agent requires at least one -target")
 	}
 
 	// Resolve the token's presentation shape. "auto" picks the convention that
@@ -96,6 +104,29 @@ func main() {
 		}
 		cfg.Tap = f
 	}
+	if list := splitModels(*models); len(list) > 0 {
+		cfg.Self.Models = list
+		log.Printf("provider agent %s: declaring %d models explicitly", *providerName, len(list))
+	} else {
+		// No explicit model list: discover it from the upstream's conventional
+		// models endpoint before coming online. A failure here is fatal — the
+		// agent reports it and refuses to register — so a provider that meant
+		// to declare capability but cannot reach its upstream is never silently
+		// treated as "serves anything".
+		discoverURL := *modelsURL
+		if discoverURL == "" {
+			discoverURL = "https://" + allowed[0] + "/v1/models"
+			log.Printf("provider agent %s: no -models; will discover from %s", *providerName, discoverURL)
+		}
+		cfg.ModelsURL = discoverURL
+		if *caFile != "" {
+			pool, err := loadCAPool(*caFile)
+			if err != nil {
+				log.Fatalf("load CA: %v", err)
+			}
+			cfg.RootCAs = pool
+		}
+	}
 
 	agent, err := provider.NewAgent(cfg)
 	if err != nil {
@@ -110,6 +141,30 @@ func main() {
 	if err := agent.Run(ctx); err != nil {
 		log.Fatalf("agent: %v", err)
 	}
+}
+
+// splitModels parses a comma-separated model list, dropping empty fields.
+func splitModels(list string) []string {
+	var out []string
+	for _, m := range strings.Split(list, ",") {
+		if m = strings.TrimSpace(m); m != "" {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// loadCAPool reads a PEM CA file into a trust pool for the discovery fetch.
+func loadCAPool(path string) (*x509.CertPool, error) {
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("no certificates parsed from %s", path)
+	}
+	return pool, nil
 }
 
 func priceLabel(micros int64) string {
