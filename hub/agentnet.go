@@ -89,6 +89,13 @@ type AgentRegister struct {
 	// SelfPrice, when set, is the agent's own rate card. A nil SelfPrice means
 	// the agent accepts the Hub's platform default for its provider.
 	SelfPrice *RateCard `json:"self_price,omitempty"`
+	// Models is the set of model IDs the agent's upstream can serve. Empty
+	// means undeclared: the Hub treats such an agent as serving any model, so
+	// scheduling still tries it and falls back on upstream refusal exactly as
+	// it does today. When non-empty it is a soft capability hint: the Hub
+	// prefers candidates that declare the model, and a model nobody declares
+	// is dispatched to undeclared candidates rather than refused outright.
+	Models []string `json:"models,omitempty"`
 	// Credential is the provider's token sealed to the TEE's inbox public key
 	// (tee.EncryptCredential). The Hub only ever holds this ciphertext: it
 	// stores the envelope in its credential store and attaches it to every job
@@ -113,13 +120,29 @@ type RelayOpen struct {
 	Host     string `json:"host"`
 }
 
-// agentConn is one online agent: its live multiplexed tunnel plus the price the
-// Hub quotes for it, which is the agent's own card when it declared one and the
-// platform default otherwise.
+// agentConn is one online agent: its live multiplexed tunnel, the price the
+// Hub quotes for it (the agent's own card when it declared one, the platform
+// default otherwise), and the models it declared it can serve.
 type agentConn struct {
 	provider string
 	price    RateCard
+	models   []string
 	mux      *tunnel.Multiplexer
+}
+
+// serves reports whether the agent declares the model. An undeclared list
+// means the agent serves anything (no capability information was reported), so
+// serves is true for every model.
+func (a *agentConn) serves(model string) bool {
+	if len(a.models) == 0 {
+		return true
+	}
+	for _, m := range a.models {
+		if m == model {
+			return true
+		}
+	}
+	return false
 }
 
 // agentRegistry tracks which agents are online right now. It is the Hub's view

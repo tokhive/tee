@@ -23,7 +23,13 @@ func scriptedHub(t *testing.T, cfg Config) *Hub {
 // and removed, and register only touches the previous tunnel's mux when it
 // evicts one, which these tests never do.
 func agentsOnline(h *Hub, provider string, price RateCard) func() {
-	h.agents.register(&agentConn{provider: provider, price: price})
+	return agentsOnlineWith(h, provider, price, nil)
+}
+
+// agentsOnlineWith is agentsOnline plus a declared model list, for the model
+// directory tests.
+func agentsOnlineWith(h *Hub, provider string, price RateCard, models []string) func() {
+	h.agents.register(&agentConn{provider: provider, price: price, models: models})
 	return func() { h.agents.deregister(provider, nil) }
 }
 
@@ -98,5 +104,59 @@ func TestMarketTableWithoutAgents(t *testing.T) {
 	providers := h.providersForModel("m")
 	if len(providers) != 2 || providers[0] != "cheap" || providers[1] != "dear" {
 		t.Fatalf("candidates = %v, want [cheap dear] from the market table", providers)
+	}
+}
+
+// TestModelDirectoryListsDeclaredModels pins the buyer-facing market view: an
+// online agent's declared models appear in the directory, each priced at that
+// agent's listing, and an agent that declares nothing serves everything but
+// lists nothing of its own.
+func TestModelDirectoryListsDeclaredModels(t *testing.T) {
+	h := scriptedHub(t, Config{
+		Rates:       ratesTable(map[string]RateCard{"cheap": {PerRequestMicros: 100}}),
+		AgentSecret: []byte("gate-secret"),
+	})
+	offline := agentsOnlineWith(h, "cheap", RateCard{PerRequestMicros: 250},
+		[]string{"sim-mock-0.5b", "claude-sim-haiku"})
+
+	dir := h.ModelDirectory()
+	if len(dir) != 2 {
+		t.Fatalf("directory = %+v, want the two declared models", dir)
+	}
+	for _, q := range dir {
+		if q.Provider != "cheap" || q.PriceMicros != 250 {
+			t.Fatalf("quote %+v: want provider cheap at 250", q)
+		}
+	}
+
+	// The agent drops: its listings leave the directory with it.
+	offline()
+	if dir := h.ModelDirectory(); len(dir) != 0 {
+		t.Fatalf("directory after the agent dropped = %+v, want empty", dir)
+	}
+}
+
+// TestSearchModelsMatchesExactAndSubstring pins the buyer-side search: an
+// exact model ID hits one quote, and a shared prefix returns every member of
+// the family.
+func TestSearchModelsMatchesExactAndSubstring(t *testing.T) {
+	h := scriptedHub(t, Config{
+		Rates:       ratesTable(map[string]RateCard{"cheap": {PerRequestMicros: 100}}),
+		AgentSecret: []byte("gate-secret"),
+	})
+	agentsOnlineWith(h, "cheap", RateCard{PerRequestMicros: 100},
+		[]string{"deepseek-pro", "deepseek-flash", "gpt-4o"})
+
+	if got := h.SearchModels("deepseek-pro"); len(got) != 1 || got[0].Model != "deepseek-pro" {
+		t.Fatalf("exact search = %+v, want just deepseek-pro", got)
+	}
+	if got := h.SearchModels("deepseek"); len(got) != 2 {
+		t.Fatalf("prefix search = %+v, want deepseek-pro and deepseek-flash", got)
+	}
+	if got := h.SearchModels("DEEPSEEK"); len(got) != 2 {
+		t.Fatalf("case-insensitive search = %+v, want both deepseek models", got)
+	}
+	if got := h.SearchModels("claude"); len(got) != 0 {
+		t.Fatalf("no-match search = %+v, want empty", got)
 	}
 }

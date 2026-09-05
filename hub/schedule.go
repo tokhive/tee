@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 )
@@ -30,6 +31,14 @@ var ErrNoProviderForModel = errors.New("no provider serves this model")
 // even the platform default. Falling back to the market table whenever no agent
 // happened to be online would keep routing jobs to a tunnel nobody is holding.
 //
+// An agent may additionally declare which models its upstream can serve (see
+// AgentRegister.Models). That declaration is a soft capability hint, not a
+// gate: an agent that declared nothing serves any model and stays a candidate;
+// an agent that declared a list the requested model is not in is skipped, since
+// sending it the job would only buy an upstream refusal. When the model is in
+// no online agent's list at all, the request is refused with
+// ErrNoProviderForModel rather than fired at every provider hoping one answers.
+//
 // The effective book price is per-request plus any per-model surcharge, taken
 // from the agent's own card when it declared one and the platform default
 // otherwise. Volume pricing is deliberately left out of the choice — the Hub
@@ -40,21 +49,6 @@ var ErrNoProviderForModel = errors.New("no provider serves this model")
 // An unlisted model pays no premium under a rate card, so every candidate is
 // still priced. The card's numbers, not the Hub's opinion, decide the order.
 func (h *Hub) providersForModel(model string) []string {
-	price := func(provider string) uint64 {
-		card, ok := h.card(provider)
-		if !ok {
-			return ^uint64(0)
-		}
-		book, ok := addChecked(card.PerRequestMicros, card.Premium(model))
-		if !ok {
-			// Saturate rather than overflow: validating refuses such a card for
-			// real, but saturating keeps this sort total and deterministic even
-			// against a hand-built in-memory table.
-			return ^uint64(0)
-		}
-		return book
-	}
-
 	var providers []string
 	if len(h.agentSecret) == 0 {
 		// No agent gate on this Hub: the market table is the supply.
@@ -63,17 +57,118 @@ func (h *Hub) providersForModel(model string) []string {
 			providers = append(providers, provider)
 		}
 	} else {
-		// Supply is exactly the agents holding a tunnel open right now.
-		providers = h.agents.onlineProviders()
+		// Supply is the agents holding a tunnel open right now that can serve
+		// this model (an agent that declared no models serves everything).
+		online := h.agents.onlineProviders()
+		providers = make([]string, 0, len(online))
+		for _, provider := range online {
+			if conn, ok := h.agents.conn(provider); ok && conn.serves(model) {
+				providers = append(providers, provider)
+			}
+		}
 	}
 	sort.SliceStable(providers, func(i, j int) bool {
-		pi, pj := price(providers[i]), price(providers[j])
+		pi, ok := h.bookPrice(providers[i], model)
+		if !ok {
+			pi = ^uint64(0)
+		}
+		pj, ok := h.bookPrice(providers[j], model)
+		if !ok {
+			pj = ^uint64(0)
+		}
 		if pi != pj {
 			return pi < pj
 		}
 		return providers[i] < providers[j]
 	})
 	return providers
+}
+
+// bookPrice returns a provider's per-request book price for a model: the
+// per-request rate plus any model surcharge, taken from the agent's own card
+// when it declared one and the platform default otherwise. ok is false when
+// the provider has no card at all.
+//
+// It is the single price source for both the scheduler's candidate order and
+// the buyer-facing directory, so the price a buyer sees is the price the
+// scheduler would dispatch on.
+func (h *Hub) bookPrice(provider, model string) (uint64, bool) {
+	card, ok := h.card(provider)
+	if !ok {
+		return 0, false
+	}
+	book, ok := addChecked(card.PerRequestMicros, card.Premium(model))
+	return book, ok
+}
+
+// ModelQuote is one row of the buyer-facing model directory: a model an online
+// agent declared it can serve, priced at the lowest per-request book price
+// among its current candidates.
+type ModelQuote struct {
+	// Model is the model ID (as declared by the serving agents).
+	Model string `json:"model"`
+	// Provider is the cheapest candidate currently serving the model.
+	Provider string `json:"provider"`
+	// PriceMicros is that provider's per-request book price for the model
+	// (per-request plus any model surcharge), in micro-units.
+	PriceMicros uint64 `json:"price_micros"`
+}
+
+// ModelDirectory lists every model an online agent has declared it can serve,
+// each with the lowest price a buyer would currently pay for it. It is the
+// market's answer to "what can I buy, and what does it cost" — computed
+// entirely from the Hub's in-memory supply, with no probe of any provider.
+//
+// A Hub without an agent gate has no declarations to list, so it returns
+// nothing regardless of its market table.
+func (h *Hub) ModelDirectory() []ModelQuote {
+	return h.SearchModels("")
+}
+
+// SearchModels filters the model directory by name: a case-insensitive
+// substring match, so a buyer can search by an exact model ID ("gpt-4o") or by
+// a prefix or fragment ("deepseek" matches both "deepseek-pro" and
+// "deepseek-flash"). An empty query returns the whole directory.
+func (h *Hub) SearchModels(query string) []ModelQuote {
+	if len(h.agentSecret) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	for _, provider := range h.agents.onlineProviders() {
+		conn, ok := h.agents.conn(provider)
+		if !ok {
+			continue
+		}
+		for _, model := range conn.models {
+			if model != "" {
+				seen[model] = struct{}{}
+			}
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+
+	query = strings.ToLower(query)
+	quotes := make([]ModelQuote, 0, len(seen))
+	for model := range seen {
+		if query != "" && !strings.Contains(strings.ToLower(model), query) {
+			continue
+		}
+		candidates := h.providersForModel(model)
+		if len(candidates) == 0 {
+			continue
+		}
+		cheapest := candidates[0]
+		price, _ := h.bookPrice(cheapest, model)
+		quotes = append(quotes, ModelQuote{
+			Model:       model,
+			Provider:    cheapest,
+			PriceMicros: price,
+		})
+	}
+	sort.Slice(quotes, func(i, j int) bool { return quotes[i].Model < quotes[j].Model })
+	return quotes
 }
 
 // ExecuteForModel runs a job for a model, dispatching to the cheapest provider

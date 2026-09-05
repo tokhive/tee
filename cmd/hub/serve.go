@@ -75,6 +75,7 @@ const (
 	agentGatePath     = "/v1/agent"
 	teeRelayPath      = "/v1/relay"
 	credentialKeyPath = "/v1/credential-key"
+	modelsPath        = "/v1/models"
 )
 
 var relayUpgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -94,8 +95,9 @@ func runServe(h *hub.Hub, cfg serveConfig) {
 	mux.Handle(agentGatePath, h.AgentGate(relayUpgrader))
 	mux.Handle(teeRelayPath, h.TeeRelay(relayUpgrader))
 	mux.HandleFunc(credentialKeyPath, h.CredentialKeyHandler)
-	log.Printf("hub user-facing API listening on http://%s%v (sessions at %s)",
-		cfg.Addr, routePaths(), sessionPath)
+	mux.HandleFunc(modelsPath, modelsHandler(h))
+	log.Printf("hub user-facing API listening on http://%s%v (sessions at %s, models at %s)",
+		cfg.Addr, routePaths(), sessionPath, modelsPath)
 	log.Printf("hub reverse-tunnel endpoints: agent gate %s, tee relay %s, credential key %s",
 		agentGatePath, teeRelayPath, credentialKeyPath)
 	log.Fatal(http.ListenAndServe(cfg.Addr, mux))
@@ -205,6 +207,24 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		req.Model, c.route.Path, tenant, outcome.Receipt.Receipt.Provider, chunks,
 		float64(outcome.Charged)/microsPerUnit, float64(outcome.Commission)/microsPerUnit,
 		float64(outcome.Buyer)/microsPerUnit, err)
+}
+
+// modelsHandler answers GET /v1/models: the buyer-facing market directory.
+// Each row is a model an online agent declared it can serve, priced at the
+// lowest current per-request book price. The optional ?q= query filters by a
+// case-insensitive substring of the model name, so a buyer can look up an
+// exact model or scan a family ("deepseek" returns every deepseek-* listing).
+func modelsHandler(h *hub.Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		quotes := h.SearchModels(r.URL.Query().Get("q"))
+		if quotes == nil {
+			quotes = []hub.ModelQuote{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			Models []hub.ModelQuote `json:"models"`
+		}{Models: quotes})
+	}
 }
 
 // apiErrorStatus maps a dispatch failure to an HTTP status. A provider that

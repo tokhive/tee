@@ -168,3 +168,35 @@ func TestPreDispatchFailureIsAJSONError(t *testing.T) {
 		t.Fatalf("error body is not JSON: %q", body)
 	}
 }
+
+// TestModelsEndpointShape pins the /v1/models wire contract at the serve
+// layer: JSON with a "models" array, empty (not null) when this Hub has no
+// agent gate and therefore nothing declared. Search and directory semantics
+// live in the hub package tests; here we only lock the envelope.
+func TestModelsEndpointShape(t *testing.T) {
+	h := newServeTestHub(t, []byte("x"))
+	handler := modelsHandler(h)
+
+	req := httptest.NewRequest(http.MethodGet, modelsPath, nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	ctype := rec.Header().Get("Content-Type")
+	if !strings.Contains(ctype, "application/json") {
+		t.Fatalf("content-type = %q, want application/json", ctype)
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"models":[]}` {
+		t.Fatalf("empty directory body = %q, want {\"models\":[]}", body)
+	}
+
+	// A query parameter is accepted and still yields an empty (filtered) list.
+	req = httptest.NewRequest(http.MethodGet, modelsPath+"?q=deepseek", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"models":[]}` {
+		t.Fatalf("filtered empty directory body = %q, want {\"models\":[]}", body)
+	}
+}

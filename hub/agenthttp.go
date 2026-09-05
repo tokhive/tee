@@ -81,7 +81,7 @@ func (h *Hub) serveAgentTunnel(conn *websocket.Conn) {
 			_ = control.Close()
 			return
 		}
-		h.agents.register(&agentConn{provider: reg.Provider, price: price, mux: mux})
+		h.agents.register(&agentConn{provider: reg.Provider, price: price, models: reg.Models, mux: mux})
 		// The control stream is the agent's lease on being online: drain it until
 		// it closes, then drop the tunnel from the scheduler and revoke the token
 		// so it is never used while its agent is offline. Revoking is gated on the
