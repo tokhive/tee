@@ -125,6 +125,30 @@ var anthropicMessagesChunks = [][2]string{
 	{"message_stop", `{"type":"message_stop"}`},
 }
 
+// modelsResponse is the /v1/models payload this mock provider serves. It is
+// fixed, like the SSE streams: the simulated models a provider agent can
+// discover by fetching the conventional models endpoint before it comes online.
+var modelsResponse = struct {
+	Object string `json:"object"`
+	Data   []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+}{
+	Object: "list",
+	Data: []struct {
+		ID string `json:"id"`
+	}{
+		{ID: "sim-mock-0.5b"},
+		{ID: "claude-sim-haiku"},
+		{ID: "sim-claude-haiku"},
+	},
+}
+
+func handleModels(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(modelsResponse)
+}
+
 // sseFrame renders one OpenAI-style SSE event: `data: <payload>\n\n`.
 func sseFrame(payload string) string { return "data: " + payload + "\n\n" }
 
@@ -147,6 +171,7 @@ func main() {
 	mux.HandleFunc("/v1/chat/completions", handleChat)
 	mux.HandleFunc("/v1/messages", handleMessages)
 	mux.HandleFunc("/v1/responses", handleResponses)
+	mux.HandleFunc("/v1/models", handleModels)
 	mux.HandleFunc("/v1/realtime", handleRealtime)
 	srv := &http.Server{Addr: *addr, Handler: mux, ConnState: trackConn}
 

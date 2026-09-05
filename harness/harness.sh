@@ -197,7 +197,7 @@ section "9. real TEE -> tee relay -> agent reverse tunnel -> provider (TLS)"
 
 echo "    starting provider agent A (openai-sim) dialing the reverse-tunnel hub"
 "$BIN/agent" -hub "$RT_HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
-  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -tap "$SIM/tap.log" > "$SIM/agentA.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" -tap "$SIM/tap.log" > "$SIM/agentA.log" 2>&1 &
 AGENT_A_PID=$!
 # The agent registers asynchronously; give it a beat before the first request.
 sleep 1
@@ -271,7 +271,7 @@ kill "$TEE_B_PID" 2>/dev/null; wait "$TEE_B_PID" 2>/dev/null
 section "11. TEE restarts with a NEW signing key (epoch rotation)"
 echo "    (a fresh sim epoch => new key; restart agent A so openai-sim is back online)"
 "$BIN/agent" -hub "$RT_HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
-  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -tap "$SIM/tap.log" > "$SIM/agentA2.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" -tap "$SIM/tap.log" > "$SIM/agentA2.log" 2>&1 &
 AGENT_A_PID=$!
 sleep 1
 
@@ -426,10 +426,10 @@ wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
 echo "    two provider agents come online: cheap-sim (0.30) and openai-sim (1.00)"
 "$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider cheap-sim \
-  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_CHEAP" > "$SIM/agent-cheap.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_CHEAP" -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" > "$SIM/agent-cheap.log" 2>&1 &
 AGENT_CHEAP_PID=$!
 "$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
-  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" > "$SIM/agent-oai.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" > "$SIM/agent-oai.log" 2>&1 &
 AGENT_OAI_PID=$!
 sleep 1
 
@@ -493,6 +493,10 @@ kill "$TEE_D_PID" "$HUB_API_PID" 2>/dev/null; wait "$TEE_D_PID" "$HUB_API_PID" 2
 # Unlike chat completions these carry their own terminal events, so the Hub
 # must NOT append [DONE]. Both must pick cheap-sim (lowest price) and store
 # one receipt each.
+# The two agents come online WITHOUT -models here: each auto-discovers its
+# model list from the upstream's /v1/models (trusting the sim CA), so the
+# directory and search assertions below prove the whole discovery chain
+# (fetch -> register -> Hub catalog) end to end, not just declared models.
 # =====================================================================
 section "16. Anthropic /v1/messages + OpenAI /v1/responses user APIs"
 
@@ -504,14 +508,22 @@ rm -rf "$SIM/receipts"
 HUB_API16_PID=$!
 wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
-echo "    bringing the two agents back online"
+echo "    bringing the two agents back online (no -models: each auto-discovers from its upstream /v1/models)"
 "$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider cheap-sim \
-  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_CHEAP" > "$SIM/agent-cheap16.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_CHEAP" -ca "$SIM/ca.pem" > "$SIM/agent-cheap16.log" 2>&1 &
 AGENT_CHEAP_PID=$!
 "$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
-  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" > "$SIM/agent-oai16.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -ca "$SIM/ca.pem" > "$SIM/agent-oai16.log" 2>&1 &
 AGENT_OAI_PID=$!
 sleep 1
+
+echo "    assertion: both agents entered auto-discovery (no -models on the command line):"
+if grep -q "will discover from https://127.0.0.1:$MP_PORT/v1/models" "$SIM/agent-cheap16.log" \
+   && grep -q "will discover from https://127.0.0.1:$MP_PORT/v1/models" "$SIM/agent-oai16.log"; then
+  echo "      OK: both agents infer and fetch their upstream /v1/models before registering"
+else
+  echo "      !! FAIL: an agent did not attempt conventional /v1/models discovery"
+fi
 
 "$BIN/tee" -addr "127.0.0.1:$TEE_D" -relay "$HUB_WS/v1/relay" \
   -seq "$SIM/seqstore-t16.json" > "$SIM/teeD16.log" 2>&1 &
@@ -571,6 +583,48 @@ else
   echo "      !! FAIL: expected 2 receipts under cheap-sim, got $messages_receipts"
 fi
 
+echo "    assertion: GET /v1/models lists the market (model + lowest price):"
+curl -s --noproxy '*' "http://127.0.0.1:$HUB_API_PORT/v1/models" > "$SIM/models-dir.json"
+if python3 - "$SIM/models-dir.json" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+models = {m["model"]: m for m in doc["models"]}
+want = {"sim-mock-0.5b": "cheap-sim", "claude-sim-haiku": "cheap-sim", "sim-claude-haiku": "cheap-sim"}
+ok = True
+for model, provider in want.items():
+    row = models.get(model)
+    if row is None:
+        print(f"      !! missing {model} from directory"); ok = False
+    elif row["provider"] != provider:
+        print(f"      !! {model} cheapest is {row['provider']}, want {provider}"); ok = False
+    elif row["price_micros"] == 0:
+        print(f"      !! {model} has a zero price"); ok = False
+if ok:
+    print("      OK: directory lists all declared models at the lowest online price")
+else:
+    sys.exit(1)
+PY
+then :; else echo "      !! FAIL: /v1/models directory wrong (see above)"; fi
+
+echo "    assertion: model search by exact name and by substring:"
+curl -s --noproxy '*' "http://127.0.0.1:$HUB_API_PORT/v1/models?q=claude-sim-haiku" > "$SIM/models-search-exact.json"
+curl -s --noproxy '*' "http://127.0.0.1:$HUB_API_PORT/v1/models?q=sim-mock" > "$SIM/models-search-sub.json"
+if python3 - "$SIM/models-search-exact.json" "$SIM/models-search-sub.json" <<'PY'
+import json, sys
+exact = {m["model"] for m in json.load(open(sys.argv[1]))["models"]}
+sub = {m["model"] for m in json.load(open(sys.argv[2]))["models"]}
+ok = True
+if exact != {"claude-sim-haiku"}:
+    print(f"      !! exact q=claude-sim-haiku -> {exact}"); ok = False
+if "sim-mock-0.5b" not in sub:
+    print(f"      !! substring q=sim-mock missing sim-mock-0.5b: {sub}"); ok = False
+if ok:
+    print("      OK: search matches an exact ID and a shared prefix")
+else:
+    sys.exit(1)
+PY
+then :; else echo "      !! FAIL: /v1/models search wrong (see above)"; fi
+
 kill "$TEE_D16_PID" "$HUB_API16_PID" 2>/dev/null; wait "$TEE_D16_PID" "$HUB_API16_PID" 2>/dev/null
 
 # =====================================================================
@@ -597,10 +651,10 @@ wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
 echo "    two provider agents online (cheap-sim cheapest for the model)"
 "$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider cheap-sim \
-  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_CHEAP" > "$SIM/agent-cheap17.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_CHEAP" -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" > "$SIM/agent-cheap17.log" 2>&1 &
 AGENT_CHEAP_PID=$!
 "$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
-  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" > "$SIM/agent-oai17.log" 2>&1 &
+  -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" > "$SIM/agent-oai17.log" 2>&1 &
 AGENT_OAI_PID=$!
 sleep 1
 
