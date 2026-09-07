@@ -1,0 +1,9 @@
+# Secrets and per-run state must never be committed.
+.env
+ssh-key.pem
+ssh-key.pem.pub
+hosts.json
+logs/
+bin/
+__pycache__/
+.venv/
