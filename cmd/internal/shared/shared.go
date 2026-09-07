@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
@@ -268,6 +269,26 @@ func LoadTEEIdentity() (platform.Identity, error) {
 		return platform.Identity{}, err
 	}
 	return id, nil
+}
+
+// EvidenceDir is where the TEE keeps the restart-surviving evidence store that
+// lets a hash-only receipt (no inline evidence) verify online or offline.
+func EvidenceDir() string { return filepath.Join(ConfigDir(), "evidence") }
+
+// RecordTEEEvidence appends the given identity's full evidence to the local
+// store so a verifier pointed at the same directory can resolve its
+// EvidenceHash later. It is idempotent and cheap to call on every epoch build.
+func RecordTEEEvidence(id platform.Identity) error {
+	store, err := evidence.NewStore(EvidenceDir())
+	if err != nil {
+		return err
+	}
+	return store.Put(id)
+}
+
+// LoadEvidenceStore opens (creating if needed) the local evidence store.
+func LoadEvidenceStore() (*evidence.Store, error) {
+	return evidence.NewStore(EvidenceDir())
 }
 
 // CAPEMPath is where mockprovider drops its CA certificate for the TEE to trust.

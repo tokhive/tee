@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
@@ -137,6 +138,12 @@ func main() {
 	if err := shared.WriteTEEIdentity(epoch.Identity()); err != nil {
 		log.Fatalf("write tee identity: %v", err)
 	}
+	// Record the epoch in the restart-surviving evidence store so a hash-only
+	// receipt (from a TEE with -evidence=false) still verifies offline. The
+	// /v1/evidence endpoint serves the same store to a remote Hub.
+	if err := shared.RecordTEEEvidence(epoch.Identity()); err != nil {
+		log.Fatalf("record tee evidence: %v", err)
+	}
 
 	// The A-layer fake never egresses: its transport answers with canned bytes,
 	// so the execution path only needs to decrypt a job's envelope. Like the real
@@ -181,6 +188,13 @@ func main() {
 	mux.HandleFunc("/v1/credential-key", func(w http.ResponseWriter, r *http.Request) {
 		tee.ServeCredentialKey(inbox, w, r)
 	})
+	// Evidence retrieval, mirroring cmd/tee: serve the restart-surviving store
+	// so a remote Hub or auditor resolves a hash-only receipt's EvidenceHash.
+	evStore, err := shared.LoadEvidenceStore()
+	if err != nil {
+		log.Fatalf("open evidence store: %v", err)
+	}
+	evidence.NewHTTPServer(evStore, mux)
 	log.Printf("faketee (in-memory A-layer TEE, real service) listening on http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }

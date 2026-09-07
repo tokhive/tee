@@ -29,6 +29,7 @@ import (
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/attest"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
@@ -42,10 +43,11 @@ import (
 // integers.
 const microsPerUnit = 1_000_000
 
-// evidenceCache resolves full attestation evidence for hash-only receipts. It
-// is populated as TEEs come online (credential/register attach their identity),
-// so a later receipt carrying only an evidence hash resolves against what the
-// Hub actually saw. The Hub never trusts an epoch it has not observed.
+// evidenceCache resolves full attestation evidence for hash-only receipts this
+// process has seen, layered on top of the restart-surviving evidence store the
+// TEE publishes. A receipt carrying only an evidence hash resolves against what
+// the Hub actually observed or the TEE recorded; the Hub never trusts an epoch
+// it has not seen evidence for.
 var evidenceCache attest.Cache
 
 func main() {
@@ -71,12 +73,13 @@ func main() {
 	allowed := flag.String("allowed-platforms", "simulated", "comma-separated attestation platforms the Hub trusts (e.g. simulated,aws-sev-snp)")
 	expectedApp := flag.String("expected-app", "", "for aws-sev-snp: the attested application identity the deployment trusts (snp-app:<sha256 hex>)")
 	policyHash := flag.String("policy-set-hash", "", "hex digest the enclave must have bound into its evidence; empty skips the deployment-binding assertion (the Hub pins the platform, not the exact policy digest, at runtime)")
+	evFetchURL := flag.String("evidence-fetch", "", "base URL for remote evidence retrieval (e.g. https://tee:18090); empty = resolve EvidenceHash from the local evidence store only")
 	flag.Parse()
 
 	store := hub.NewReceiptStore(filepath.Join(shared.ConfigDir(), "receipts"))
 
 	if *audit {
-		runAudit(store, *provider, *allowed, *expectedApp, *policyHash)
+		runAudit(store, *provider, *allowed, *expectedApp, *policyHash, *evFetchURL)
 		return
 	}
 
@@ -101,7 +104,7 @@ func main() {
 		SessionURL: wsEndpoint(*teeURL, "/v1/session"),
 		BaseURL:    *teeURL,
 	}
-	verifier, err := buildVerifier(*allowed, *expectedApp, *policyHash)
+	verifier, err := buildVerifier(*allowed, *expectedApp, *policyHash, *evFetchURL)
 	if err != nil {
 		log.Fatalf("attestation: %v", err)
 	}
@@ -211,8 +214,8 @@ func printLedger(ledger *hub.Ledger) {
 	}
 }
 
-func runAudit(store *hub.ReceiptStore, provider, allowed, expectedApp, policyHash string) {
-	verifier, err := buildVerifier(allowed, expectedApp, policyHash)
+func runAudit(store *hub.ReceiptStore, provider, allowed, expectedApp, policyHash, evFetchURL string) {
+	verifier, err := buildVerifier(allowed, expectedApp, policyHash, evFetchURL)
 	if err != nil {
 		log.Fatalf("attestation: %v", err)
 	}
@@ -239,7 +242,7 @@ func runAudit(store *hub.ReceiptStore, provider, allowed, expectedApp, policyHas
 // allowlist. A platform the operator advertises as trusted but that has no
 // evidence verifier wired here is a wiring error and fails loudly at startup,
 // not at the first receipt.
-func buildVerifier(allowed, expectedApp, policyHash string) (*attest.Verifier, error) {
+func buildVerifier(allowed, expectedApp, policyHash, evFetchURL string) (*attest.Verifier, error) {
 	lists, err := splitCSV(allowed)
 	if err != nil {
 		return nil, err
@@ -250,13 +253,14 @@ func buildVerifier(allowed, expectedApp, policyHash string) (*attest.Verifier, e
 			ExpectedApp: expectedApp,
 		},
 	}
+	fetcher, err := buildFetcher(evFetchURL)
+	if err != nil {
+		return nil, err
+	}
 	cfg := attest.Config{
 		AllowedPlatforms: lists,
 		ByPlatform:       byPlatform,
-		// The Hub is only ever handed receipts whose evidence it has already
-		// seen the TEE attach to a credential/register call; a hash-only receipt
-		// from an unknown epoch resolves nothing and is refused.
-		Fetcher: &evidenceCache,
+		Fetcher:          fetcher,
 	}
 	// The deployment binding is opt-in. At runtime the Hub pins the platform
 	// trust root, not the exact policy digest: policy files are rewritten with a
@@ -291,6 +295,26 @@ func splitCSV(s string) ([]string, error) {
 		return nil, fmt.Errorf("empty -allowed-platforms")
 	}
 	return out, nil
+}
+
+// buildFetcher assembles the evidence retrieval path in resolution order: the
+// in-memory cache of epochs this process has verified, then the restart-surviving
+// local store, then an optional remote /v1/evidence endpoint. Each layer is
+// tried in turn until one holds the bytes.
+func buildFetcher(evFetchURL string) (attest.Fetcher, error) {
+	backend := &evidence.Chain{}
+	backend.Add(&evidenceCache)
+	if store, err := shared.LoadEvidenceStore(); err == nil {
+		backend.Add(store)
+	}
+	if evFetchURL != "" {
+		httpFetcher, err := evidence.NewHTTPFetcher(evFetchURL)
+		if err != nil {
+			return nil, err
+		}
+		backend.Add(httpFetcher)
+	}
+	return backend, nil
 }
 
 // withholdSeq models a Hub that hides one execution from the provider. The

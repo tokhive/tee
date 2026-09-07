@@ -1,8 +1,9 @@
 // Command verify is the offline verifier a provider (or auditor) would run
 // against the receipt store. It cryptographically verifies every stored
 // SignedReceipt using the real proof.Verify path and the simulated platform's
-// trust root, then reports any ProviderSeq gaps — the signal that the set of
-// receipts is incomplete.
+// trust root, resolving any EvidenceHash-only receipts against the local
+// restart-surviving evidence store the TEE populated, then reports any
+// ProviderSeq gaps — the signal that the set of receipts is incomplete.
 //
 // Usage:
 //
@@ -17,8 +18,11 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/attest"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 )
@@ -54,11 +58,35 @@ func main() {
 	}
 }
 
+// verifier resolves hash-only receipts first against the local evidence store,
+// so a real TEE that shipped -evidence=false receipts still verifies offline.
+var evidenceStore = &evidence.Chain{}
+
+func init() {
+	if store, err := shared.LoadEvidenceStore(); err == nil {
+		evidenceStore.Add(store)
+	}
+	// Wrapped through an interface so a remote evidence endpoint could be added
+	// later without changing the audit logic.
+}
+
 func auditProvider(provider, dir string) bool {
 	files, err := filepath.Glob(filepath.Join(dir, "*.cbor"))
 	if err != nil || len(files) == 0 {
 		fmt.Printf("[%s] no receipts\n", provider)
 		return false
+	}
+
+	verifier, err := attest.New(attest.Config{
+		AllowedPlatforms: []string{simulated.Platform},
+		ByPlatform: map[string]platform.EvidenceVerifier{
+			simulated.Platform: simulated.Verifier{},
+		},
+		Fetcher: evidenceStore,
+	})
+	if err != nil {
+		fmt.Printf("[%s] build verifier: %v\n", provider, err)
+		return true
 	}
 
 	seqs := make([]uint64, 0, len(files))
@@ -76,8 +104,8 @@ func auditProvider(provider, dir string) bool {
 			bad++
 			continue
 		}
-		if err := proof.Verify(signed, proof.VerifyOptions{AllowedPlatforms: []string{simulated.Platform}}); err != nil {
-			fmt.Printf("  [BAD] %s: verify: %v\n", filepath.Base(f), err)
+		if err := verifier.Check(signed); err != nil {
+			fmt.Printf("  [BAD] %s: %v\n", filepath.Base(f), err)
 			bad++
 			continue
 		}

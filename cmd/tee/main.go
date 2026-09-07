@@ -41,6 +41,7 @@ import (
 	"path/filepath"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/transport"
@@ -88,6 +89,12 @@ func main() {
 	}
 	if err := shared.WriteTEEIdentity(epoch.Identity()); err != nil {
 		log.Fatalf("write tee identity: %v", err)
+	}
+	// Record this epoch's evidence in the restart-surviving store so a hash-only
+	// receipt (IncludeEvidence=false) resolves against what the verifier saw, and
+	// the /v1/evidence endpoint below can serve it to a Hub on another host.
+	if err := shared.RecordTEEEvidence(epoch.Identity()); err != nil {
+		log.Fatalf("record tee evidence: %v", err)
 	}
 	log.Printf("policy set hash bound into attestation evidence: %x", policySetHash)
 
@@ -156,6 +163,15 @@ func main() {
 	mux.HandleFunc("/v1/credential-key", func(w http.ResponseWriter, r *http.Request) {
 		tee.ServeCredentialKey(inbox, w, r)
 	})
+	// Evidence retrieval: serves the restart-surviving evidence store so a Hub
+	// or auditor can resolve a hash-only receipt's EvidenceHash against a real
+	// (possibly rotated) epoch this TEE presented. GET /v1/evidence/<hex-hash>
+	// returns raw evidence bytes; GET /v1/evidence lists the stored hashes.
+	evStore, err := shared.LoadEvidenceStore()
+	if err != nil {
+		log.Fatalf("open evidence store: %v", err)
+	}
+	evidence.NewHTTPServer(evStore, mux)
 	log.Printf("tee (platform=%s, includeEvidence=%t) listening on http://%s",
 		*platformName, *includeEvidence, *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
