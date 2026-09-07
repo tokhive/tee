@@ -182,11 +182,13 @@ func (h *Hub) SearchModels(query string) []ModelQuote {
 // is returned: the Hub still has to be able to show what it received, and the
 // receipt store records every attempt so no credential use is ever invisible.
 //
-// Fallback stops the moment the first byte has been relayed. Once the user has
+// Fallback stops the moment the response is committed to a provider — either
+// its response start has been relayed (the caller has already written that
+// provider's status and headers) or its first body byte has. Once the user has
 // seen content from provider A, switching to provider B would splice two
 // providers' transcripts into one response — a stream no client could parse
-// and no receipt would cover. A provider that fails mid-stream is therefore
-// committed to: its (truncated) outcome is returned as final, and the caller
+// and no receipt would cover. A provider that fails after committing is
+// therefore final: its (truncated) outcome is returned as-is, and the caller
 // reports what it got rather than silently switching horses mid-response.
 //
 // build produces the job spec for a given provider: the Hub decides who to ask,
@@ -217,6 +219,19 @@ func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []
 			return onChunk(chunk)
 		}
 	}
+	// A relayed response start commits the exchange exactly as a body byte
+	// does: the caller has already written that provider's status and headers
+	// by the time onStart returns, so falling back would splice the next
+	// provider's bytes under the first provider's response. A provider whose
+	// start was shown but whose body never came is therefore committed to.
+	start := onStart
+	if len(start) > 0 && start[0] != nil {
+		cb := start[0]
+		start = []func(tee.Response){func(resp tee.Response) {
+			relayed = true
+			cb(resp)
+		}}
+	}
 
 	for _, provider := range providers {
 		spec, berr := build(provider)
@@ -224,11 +239,11 @@ func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []
 			return Outcome{}, fmt.Errorf("build spec for %q: %w", provider, berr)
 		}
 		ran = true
-		last, err = h.Execute(ctx, tenant, model, spec, body, relay, onStart...)
+		last, err = h.Execute(ctx, tenant, model, spec, body, relay, start...)
 		if err != nil {
 			if relayed {
-				// The user saw this provider's bytes before it failed. There is
-				// no honest way to continue with another provider: return the
+				// This provider's start or bytes already reached the user. There
+				// is no honest way to continue with another provider: return the
 				// attempt's outcome as final.
 				return last, err
 			}

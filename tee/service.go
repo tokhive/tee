@@ -459,17 +459,22 @@ func (s *Service) perform(
 
 	completion := proof.CompletionComplete
 	switch {
-	case err != nil && hasher.BytesWritten() == 0:
+	case err != nil && !started && hasher.BytesWritten() == 0:
 		completion = proof.CompletionFailed
 	case err != nil, truncated:
 		completion = proof.CompletionTruncated
 	}
 
-	// A status is trustworthy only once a response actually began. Clearing it
-	// after bytes arrived would erase a real 200 that merely ran long, and
-	// that status is part of what the Hub needs to be able to prove.
+	// A status is trustworthy only once the response actually began, and
+	// `started` — not the byte count — is the marker of a begun response: the
+	// transport fires start the moment it parses the headers, before any body
+	// byte. An error after that (headers arrived, body dropped) is a truncated
+	// response with a real status, which the receipt must keep attesting:
+	// clearing it would contradict the start the Hub was already shown, and
+	// the Hub would reject every such exchange. Only when the start never
+	// fired is there truly no status to attest.
 	statusCode := response.StatusCode
-	if err != nil && hasher.BytesWritten() == 0 {
+	if err != nil && !started {
 		statusCode = 0
 	}
 

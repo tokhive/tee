@@ -204,12 +204,21 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 		commit)
 
-	if err != nil {
-		if !started {
-			writeJSONError(w, apiErrorStatus(err), err.Error())
-			log.Printf("api model=%q path=%s tenant=%q err=%v", req.Model, c.route.Path, tenant, err)
-			return
+	if !started {
+		// Nothing was committed to the wire: either a dispatch failure, or
+		// every provider failed before its response began and the last attempt
+		// came back as a verified failure receipt with no Go error (status
+		// zero, no bytes). Both must reach the buyer as a proper error — an
+		// empty implicit 200 would say "succeeded" with no body and no SSE
+		// content type.
+		if err == nil {
+			err = errors.New("no provider produced a response")
 		}
+		writeJSONError(w, apiErrorStatus(err), err.Error())
+		log.Printf("api model=%q path=%s tenant=%q err=%v", req.Model, c.route.Path, tenant, err)
+		return
+	}
+	if err != nil {
 		// The response is committed. For a 2xx stream the failure is reported
 		// as an SSE error frame; for a non-2xx upstream status the upstream's
 		// own error body already tells the story, and splicing an SSE frame

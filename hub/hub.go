@@ -335,9 +335,12 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 	// The response start the Hub acted on must be the exchange the receipt
 	// attests: the status it committed to its caller and the headers it
 	// relayed are part of what the provider gets billed against, so they must
-	// be provable. A start frame was seen exactly when res.Status is non-zero;
-	// with none (a response that never began) there is nothing to bind.
-	if res.Status != 0 && !receiptMatchesStart(res.Receipt.Receipt, res.Status, res.Headers) {
+	// be provable. The check binds in both directions (see receiptMatchesStart):
+	// a start frame whose receipt contradicts it is refused, and so is a
+	// receipt that attests a start — a non-empty ResponseHeadersHash — when no
+	// frame was observed, since body chunks committed under a default 200
+	// would then settle against a receipt attesting a real 401.
+	if !receiptMatchesStart(res.Receipt.Receipt, res.Status, res.Headers) {
 		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, ErrResponseStartMismatch
 	}
 
@@ -374,11 +377,17 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 // frame the Hub parsed, and compared against the signed value — a TEE that
 // relayed one start and signed another would be caught the same way a forged
 // stream is caught by MatchesStream.
+//
+// A receipt without a ResponseHeadersHash attests no start, so it binds
+// nothing: it is compatible exactly with an exchange that produced no start
+// either (status zero — the legacy pre-start shape). Once a start was shown
+// the Hub must be able to prove what it relayed, and once a receipt attests a
+// start the Hub must have observed the frame it describes.
 func receiptMatchesStart(r proof.Receipt, status uint32, headers map[string][]string) bool {
-	if r.StatusCode != status {
-		return false
-	}
 	if len(r.ResponseHeadersHash) == 0 {
+		return status == 0
+	}
+	if r.StatusCode != status {
 		return false
 	}
 	h := tee.HashResponseHeaders(headers)

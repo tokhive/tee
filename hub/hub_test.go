@@ -726,6 +726,19 @@ func TestResponseStartIsBoundToTheReceipt(t *testing.T) {
 			t.Fatalf("error = %v, want ErrResponseStartMismatch", err)
 		}
 	})
+
+	t.Run("attested start without an observed frame is refused", func(t *testing.T) {
+		// The receipt proves a start existed — 401 plus a header hash — but
+		// the Hub was shown no start frame at all. Settling it would let
+		// chunks committed under a default 200 be covered by a receipt
+		// attesting a real 401, so it must not pass the binding check either.
+		r := makeReceipt(1, stream, func(r *proof.Receipt) { r.StatusCode = 401 })
+		h := mustHub(t, Config{TEE: &startStubTEE{status: 0, headers: hdr, receipt: boundReceipt(r.Receipt, hdr)}})
+		_, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil)
+		if !errors.Is(err, ErrResponseStartMismatch) {
+			t.Fatalf("error = %v, want ErrResponseStartMismatch", err)
+		}
+	})
 }
 
 // boundReceipt attaches the response-start binding to a receipt, as the TEE

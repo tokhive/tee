@@ -93,6 +93,11 @@ type fakeTransport struct {
 	// Negative means deliver everything.
 	failAfter int
 	err       error
+
+	// afterStart, when non-nil, makes Do fire the response start and then
+	// return it as the error before delivering any chunk: a connection that
+	// died after its headers arrived but before its first body byte.
+	afterStart error
 }
 
 func (f *fakeTransport) Do(_ context.Context, req Request, onChunk func([]byte) error, onStart ...StartFunc) (Response, error) {
@@ -103,15 +108,20 @@ func (f *fakeTransport) Do(_ context.Context, req Request, onChunk func([]byte) 
 	headers := f.headers
 	failAfter := f.failAfter
 	scriptedErr := f.err
+	afterStart := f.afterStart
 	f.mu.Unlock()
 
 	resp := Response{StatusCode: statusCode, Headers: headers}
 	// The response start is reported as soon as the headers are parsed, before
 	// any chunk — the same ordering the real transport honours. A failAfter-0
 	// scripted failure models a connection that died before its response
-	// headers arrived, so no start is emitted then.
+	// headers arrived, so no start is emitted then; afterStart models the
+	// opposite — headers arrived, and the body read then failed.
 	if statusCode != 0 && !(failAfter == 0 && scriptedErr != nil) && len(onStart) > 0 && onStart[0] != nil {
 		onStart[0](resp)
+	}
+	if afterStart != nil {
+		return resp, afterStart
 	}
 	// failAfter counts chunks delivered before the failure, so the limit is
 	// checked before delivering rather than after.
@@ -652,6 +662,44 @@ func TestExecuteSignsATruncatedStream(t *testing.T) {
 	// The status is real: the provider did answer before dropping the stream.
 	if result.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200 preserved across a mid-stream failure", result.StatusCode)
+	}
+	verifyReceipt(t, result.Receipt, spec)
+}
+
+// TestExecuteKeepsTheStatusOnceTheStartArrived pins the case where the
+// response start was relayed but the body read failed before yielding a byte:
+// the receipt must still attest the start's real status and headers (and call
+// the exchange truncated), or the Hub would reject it as contradicting the
+// start frame it was shown.
+func TestExecuteKeepsTheStatusOnceTheStartArrived(t *testing.T) {
+	env := newTestEnv(t)
+	env.transport.afterStart = errors.New("connection reset after headers")
+
+	body := []byte(`{"model":"gpt-4o"}`)
+	spec := env.spec(t, body)
+
+	var starts int
+	result, err := env.service.Execute(context.Background(), Job{Spec: spec, Body: body}, nil,
+		func(resp Response) {
+			starts++
+			if resp.StatusCode != 200 {
+				t.Errorf("start status = %d, want 200", resp.StatusCode)
+			}
+		})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if starts != 1 {
+		t.Fatalf("onStart fired %d times, want 1", starts)
+	}
+	if result.StatusCode != 200 {
+		t.Errorf("status = %d, want 200 preserved once the response started", result.StatusCode)
+	}
+	if result.Receipt.Receipt.Completion != proof.CompletionTruncated {
+		t.Errorf("completion = %v, want truncated (headers arrived, body did not)", result.Receipt.Receipt.Completion)
+	}
+	if len(result.Receipt.Receipt.ResponseHeadersHash) == 0 {
+		t.Error("receipt must still bind the start's headers")
 	}
 	verifyReceipt(t, result.Receipt, spec)
 }

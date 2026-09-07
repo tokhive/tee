@@ -242,6 +242,46 @@ func TestPreDispatchFailureIsAJSONError(t *testing.T) {
 	}
 }
 
+// TestAllProvidersFailingBeforeAStartIsA502 covers the outcome where every
+// provider's exchange failed before producing a response: the TEE attests each
+// as a verified failure receipt with no status and no bytes, ExecuteForModel
+// returns the last such outcome with no Go error, and nothing was ever
+// committed to the user's connection. The handler must surface that as a
+// proper failure response — not fall through to an empty implicit 200.
+func TestAllProvidersFailingBeforeAStartIsA502(t *testing.T) {
+	route := userRoutes[0]
+	fake := &hub.ScriptedTEE{Reply: func(call int, spec jobs.Spec) (hub.Result, error) {
+		r := hub.ScriptReceipt(nil, proof.Receipt{
+			Provider:    spec.Provider,
+			Completion:  proof.CompletionFailed,
+			ProviderSeq: uint64(call),
+		})
+		return hub.Result{Receipt: proof.SignedReceipt{Receipt: r}}, nil
+	}}
+	h, err := hub.New(hub.Config{
+		TEE: fake,
+		Rates: map[string]hub.RateCard{
+			"p1": {PerRequestMicros: 100},
+			"p2": {PerRequestMicros: 900},
+		},
+		Store:  hub.NewReceiptStore(t.TempDir()),
+		Verify: func(proof.SignedReceipt) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("build hub: %v", err)
+	}
+	status, body, ctype := serveStatus(t, h, route, `{"model":"m"}`)
+	if status != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", status)
+	}
+	if !strings.Contains(ctype, "application/json") {
+		t.Errorf("content-type = %q, want application/json", ctype)
+	}
+	if !strings.Contains(body, "no provider produced a response") {
+		t.Errorf("error body missing: %q", body)
+	}
+}
+
 // TestModelsEndpointShape pins the /v1/models wire contract at the serve
 // layer: JSON with a "models" array, empty (not null) when this Hub has no
 // agent gate and therefore nothing declared. Search and directory semantics
