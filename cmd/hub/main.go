@@ -38,8 +38,10 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/alicloud"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/tencent"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
@@ -301,6 +303,10 @@ func buildVerifier(allowed, expectedApp, policyHash, evFetchURL string) (*attest
 		platform.PlatformAWSSEVSNP: sevsnp.Verifier{
 			ExpectedApp: expectedApp,
 		},
+		// Cloud adapter skeletons: wired so an allowlist entry is honest, but
+		// every receipt is refused until the attestation paths are implemented.
+		platform.PlatformAlibabaCloud: alicloud.Verifier{},
+		platform.PlatformTencentCloud: tencent.Verifier{},
 	}
 	fetcher, err := buildFetcher(evFetchURL)
 	if err != nil {
