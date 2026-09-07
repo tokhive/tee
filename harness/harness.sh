@@ -33,6 +33,9 @@
 #       price; ?q= search filters by exact ID and by substring.
 #  17  streaming session via  -> the Hub user API WebSocket: select + settle
 #      the Hub user API          + duplex
+#  18  Hub↔TEE mTLS             -> the TEE listener demands a Hub client cert;
+#       pinning + identity        the Hub pins the TEE's RA-TLS certificate;
+#                                 unpinned peers and plain HTTP are refused
 #
 # Nothing here talks to a real model or a real enclave. The Hub's business
 # rules (pricing, quota, ledger, gap detection) are unit tested in-process
@@ -408,6 +411,7 @@ kill "$TEE_E_PID" 2>/dev/null; wait "$TEE_E_PID" 2>/dev/null
 # scenario 9-14 reverse-tunnel Hub and its agent.
 kill "$AGENT_A_PID" 2>/dev/null; wait "$AGENT_A_PID" 2>/dev/null
 kill "$RT_HUB_PID" 2>/dev/null; wait "$RT_HUB_PID" 2>/dev/null
+kill "$TEE_A_PID" 2>/dev/null; wait "$TEE_A_PID" 2>/dev/null
 
 # =====================================================================
 # Lowest-price scheduling + commission: A Hub user-facing API over a real
@@ -707,6 +711,48 @@ else
 fi
 
 kill "$TEE_G_PID" "$HUB_API17_PID" 2>/dev/null; wait "$TEE_G_PID" "$HUB_API17_PID" 2>/dev/null
+
+# --- Scenario 18: Hub↔TEE mutual TLS --------------------------------------
+section "18. Hub↔TEE mutual TLS: attested-cert pinning + Hub client identity"
+TEE_MTLS_PORT=18095
+echo "    starting faketee with -mtls on :$TEE_MTLS_PORT (demands a Hub client cert)"
+"$BIN/faketee" -addr "127.0.0.1:$TEE_MTLS_PORT" -mtls -seq "$SIM/seqstore-mtls.json" > "$SIM/faketee-mtls.log" 2>&1 &
+TEE_MTLS_PID=$!
+sleep 0.6
+
+if [ ! -f "$SIM/tee-cert.pem" ]; then
+  echo "      !! FAIL: TEE did not publish its RA-TLS certificate to $SIM/tee-cert.pem"
+else
+  echo "      OK: TEE published its RA-TLS certificate for the Hub to pin"
+fi
+
+echo "    one request over mTLS (pinned TEE cert + Hub client identity):"
+"$BIN/hub" -tee "https://127.0.0.1:$TEE_MTLS_PORT" -mtls-ca "$SIM/tee-cert.pem" \
+  -credential "$TOKEN_OAI" -n 1 > "$SIM/hub-mtls.log" 2>&1
+if grep -qE "^\[receipt\].*completion=complete" "$SIM/hub-mtls.log"; then
+  echo "      OK: request completed over mTLS, receipt verified and settled"
+else
+  echo "      !! FAIL: mTLS request did not complete"
+  tail -5 "$SIM/hub-mtls.log"
+fi
+
+echo "    negative: Hub pinning the WRONG certificate must be refused:"
+if "$BIN/hub" -tee "https://127.0.0.1:$TEE_MTLS_PORT" -mtls-ca "$SIM/ca.pem" \
+  -credential "$TOKEN_OAI" -n 1 > "$SIM/hub-mtls-wrongca.log" 2>&1; then
+  echo "      !! FAIL: Hub with an unpinned TEE was admitted"
+else
+  echo "      OK: Hub with an unpinned TEE was refused at the handshake"
+fi
+
+echo "    negative: plain HTTP must not reach an mTLS listener:"
+if "$BIN/hub" -tee "http://127.0.0.1:$TEE_MTLS_PORT" -credential "$TOKEN_OAI" \
+  -n 1 > "$SIM/hub-mtls-plain.log" 2>&1; then
+  echo "      !! FAIL: plain HTTP reached the mTLS listener"
+else
+  echo "      OK: plain HTTP was refused by the mTLS listener"
+fi
+
+kill "$TEE_MTLS_PID" 2>/dev/null; wait "$TEE_MTLS_PID" 2>/dev/null
 
 # --- cleanup -------------------------------------------------------------
 echo

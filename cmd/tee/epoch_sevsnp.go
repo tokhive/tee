@@ -4,13 +4,16 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"time"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp"
 )
 
-// buildEpoch assembles the attested signing epoch for the selected platform.
+// buildEpoch assembles the attested signing epoch and its RA-TLS server TLS
+// config for the selected platform.
 //
 // This file is compiled only with `-tags sevsnp`, which is how a real enclave
 // deployment builds the TEE: the AWS SEV-SNP adapter self-verifies its RA-TLS
@@ -22,7 +25,7 @@ import (
 // SEV-SNP host the whitelist ships inside the measured image, so the hardware
 // measurement covers it by construction; the parameter is threaded through for
 // API symmetry and is not otherwise used by the sevsnp branch.
-func buildEpoch(platformName string, policySetHash [32]byte) (platform.Epoch, error) {
+func buildEpoch(platformName string, policySetHash [32]byte) (platform.Epoch, *tls.Config, error) {
 	if platformName == "sevsnp" {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -30,9 +33,17 @@ func buildEpoch(platformName string, policySetHash [32]byte) (platform.Epoch, er
 			Role: envOr("TOKENHIVE_TEE_ROLE", "tokenhive-tee"),
 		})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return adapter.Snapshot(ctx)
+		snapshot, err := adapter.Snapshot(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return snapshot, adapter.ServerTLSConfig(), nil
 	}
-	return buildSimulatedEpoch(policySetHash)
+	epoch, err := buildSimulatedEpoch(policySetHash)
+	if err != nil {
+		return nil, nil, err
+	}
+	return epoch, shared.PlatformServerTLS(epoch), nil
 }

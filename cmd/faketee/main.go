@@ -113,10 +113,17 @@ func queryParam(query, key string) string {
 func main() {
 	addr := flag.String("addr", "127.0.0.1:18091", "listen address")
 	seqPath := flag.String("seq", "", "ProviderSeq store file (default <simdir>/seqstore.json)")
+	mtls := flag.Bool("mtls", false, "serve the Hub-facing API over mutual TLS (sim test certificate, demanding a Hub client certificate)")
+	mtlsClientCA := flag.String("mtls-client-ca", "", "PEM CA(s) that sign Hub client certificates; empty defaults to <simdir>/hub-ca.pem (required with -mtls)")
 	flag.Parse()
 
 	if err := shared.EnsureDefaults(); err != nil {
 		log.Fatalf("ensure defaults: %v", err)
+	}
+	if *mtls {
+		if err := shared.EnsureMTLSCerts(); err != nil {
+			log.Fatalf("ensure mtls fixtures: %v", err)
+		}
 	}
 
 	policies, err := shared.LoadPolicySetAll()
@@ -195,6 +202,28 @@ func main() {
 		log.Fatalf("open evidence store: %v", err)
 	}
 	evidence.NewHTTPServer(evStore, mux)
+
+	if *mtls {
+		clientCAPath := *mtlsClientCA
+		if clientCAPath == "" {
+			clientCAPath = filepath.Join(shared.ConfigDir(), shared.MTLSClientCAPath)
+		}
+		serverTLS := shared.PlatformServerTLS(epoch)
+		if serverTLS == nil {
+			log.Fatalf("simulated platform provides no RA-TLS server certificate; cannot serve -mtls")
+		}
+		cfg, err := shared.ServerMTLSConfig(serverTLS, clientCAPath)
+		if err != nil {
+			log.Fatalf("mtls server config: %v", err)
+		}
+		if err := shared.WriteTEECert(cfg); err != nil {
+			log.Fatalf("publish tee certificate: %v", err)
+		}
+		log.Printf("faketee (in-memory A-layer TEE, real service, mtls) listening on https://%s", *addr)
+		server := &http.Server{Addr: *addr, Handler: mux, TLSConfig: cfg}
+		log.Fatal(server.ListenAndServeTLS("", ""))
+	}
+
 	log.Printf("faketee (in-memory A-layer TEE, real service) listening on http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }

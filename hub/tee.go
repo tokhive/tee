@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
@@ -113,8 +115,13 @@ type HTTPTEE struct {
 	// credential-key plane is derived from (/v1/credential-key); without it the
 	// Hub cannot publish the TEE's inbox key to dialing agents.
 	BaseURL string
-	// Client is the HTTP client to use. Defaults to http.DefaultClient.
+	// Client is the HTTP client to use. Defaults to http.DefaultClient. Under
+	// mTLS it must carry the pinned RA-TLS root and the Hub's client identity.
 	Client *http.Client
+	// Dialer is the WebSocket dialer OpenSession uses. Defaults to
+	// websocket.DefaultDialer. Under mTLS it must carry the same TLS config as
+	// Client, or sessions would connect in plaintext while execute goes TLS.
+	Dialer *websocket.Dialer
 
 	// keyMu guards keyCall, the in-flight credential-key fetch. Agents pull
 	// the TEE inbox key through the Hub on every reconnect, so a fleet that

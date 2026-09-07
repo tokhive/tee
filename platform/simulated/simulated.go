@@ -20,10 +20,16 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
+	"sync"
+	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 )
@@ -87,6 +93,9 @@ type epoch struct {
 	keyID      [32]byte
 	evidence   []byte
 	evidenceID SimEvidence
+
+	serverTLSOnce sync.Once
+	serverTLS     *tls.Config
 }
 
 // NewEpoch generates a fresh software signing key and returns an epoch backed
@@ -170,6 +179,57 @@ func (e *epoch) Sign(domain string, payload []byte) (platform.Signature, error) 
 		KeyID:     e.keyID,
 		Value:     value,
 	}, nil
+}
+
+// ServerTLSConfig returns a TLS server configuration whose leaf certificate is
+// minted from this epoch's attested key — the simulated twin of the SEV-SNP
+// adapter's RA-TLS ServerTLSConfig. The leaf is self-signed and carries no
+// chain: a client trusts it by pinning the attested SPKI (the certificate's
+// SPKI hash equals the epoch's KeyID), exactly as it would pin an RA-TLS
+// certificate. Minting is lazy and cached; it cannot fail under normal
+// operation, and a failure fails closed (GetCertificate returns the error)
+// rather than serving an unattested key.
+func (e *epoch) ServerTLSConfig() *tls.Config {
+	e.serverTLSOnce.Do(func() { e.serverTLS = e.mintServerTLS() })
+	return e.serverTLS.Clone()
+}
+
+func (e *epoch) mintServerTLS() *tls.Config {
+	tmpl := &x509.Certificate{
+		SerialNumber: new(big.Int).SetBytes(e.keyID[:8]),
+		Subject:      pkix.Name{CommonName: "tokenhive-sim-tee"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * 365 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &e.priv.PublicKey, e.priv)
+	if err != nil {
+		return &tls.Config{
+			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+				return nil, fmt.Errorf("mint sim RA-TLS certificate: %w", err)
+			},
+		}
+	}
+	certDER := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: mustMarshalEC(e.priv)})
+	cert, err := tls.X509KeyPair(certDER, keyDER)
+	if err != nil {
+		return &tls.Config{
+			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+				return nil, fmt.Errorf("load minted sim RA-TLS certificate: %w", err)
+			},
+		}
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}}
+}
+
+func mustMarshalEC(k *ecdsa.PrivateKey) []byte {
+	b, err := x509.MarshalECPrivateKey(k)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }
 
 // CheckEvidence verifies a simulated attestation the way a verifier would: the

@@ -19,13 +19,18 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/attest"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
@@ -74,6 +79,9 @@ func main() {
 	expectedApp := flag.String("expected-app", "", "for aws-sev-snp: the attested application identity the deployment trusts (snp-app:<sha256 hex>)")
 	policyHash := flag.String("policy-set-hash", "", "hex digest the enclave must have bound into its evidence; empty skips the deployment-binding assertion (the Hub pins the platform, not the exact policy digest, at runtime)")
 	evFetchURL := flag.String("evidence-fetch", "", "base URL for remote evidence retrieval (e.g. https://tee:18090); empty = resolve EvidenceHash from the local evidence store only")
+	mtlsCA := flag.String("mtls-ca", "", "PEM file pinning the TEE's RA-TLS certificate (or the CA that signs it); the RA-TLS verification half of Hub↔TEE mTLS. Implies -tee is https://")
+	mtlsCert := flag.String("mtls-cert", "", "client certificate the Hub presents to the TEE under mTLS; empty defaults to <simdir>/hub-client.pem")
+	mtlsKey := flag.String("mtls-key", "", "private key for -mtls-cert; empty defaults to <simdir>/hub-client-key.pem")
 	flag.Parse()
 
 	store := hub.NewReceiptStore(filepath.Join(shared.ConfigDir(), "receipts"))
@@ -99,10 +107,25 @@ func main() {
 		}
 	}
 
+	teeTLS, err := buildTEEClientTLS(*mtlsCA, *mtlsCert, *mtlsKey)
+	if err != nil {
+		log.Fatalf("tee mtls: %v", err)
+	}
+	if teeTLS != nil && !strings.HasPrefix(*teeURL, "https://") {
+		log.Fatalf("-mtls-ca pins the TEE certificate, so -tee must be an https:// URL (got %q)", *teeURL)
+	}
+	var httpClient *http.Client
+	var teeDialer *websocket.Dialer
+	if teeTLS != nil {
+		httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: teeTLS}}
+		teeDialer = &websocket.Dialer{TLSClientConfig: teeTLS}
+	}
 	teeClient := &hub.HTTPTEE{
 		URL:        *teeURL + "/v1/execute",
 		SessionURL: wsEndpoint(*teeURL, "/v1/session"),
 		BaseURL:    *teeURL,
+		Client:     httpClient,
+		Dialer:     teeDialer,
 	}
 	verifier, err := buildVerifier(*allowed, *expectedApp, *policyHash, *evFetchURL)
 	if err != nil {
@@ -236,6 +259,32 @@ func runAudit(store *hub.ReceiptStore, provider, allowed, expectedApp, policyHas
 	}
 	fmt.Printf(">>> GAP DETECTED: provider was used at least %d times but is missing receipts %v\n",
 		report.MaxSeq, report.Missing)
+}
+
+// buildTEEClientTLS assembles the Hub's client TLS config for the Hub↔TEE
+// channel. It pins the TEE's RA-TLS certificate (or its signing CA), which is
+// the deployment's out-of-band statement "this certificate is the attested
+// TEE"; and it presents the Hub's own client certificate so the TEE admits it.
+// Without -mtls-ca it returns nil (plain HTTP/WSS-less operation). The cert and
+// key default to the simulation identity so a local mTLS run needs no flags
+// beyond the pin.
+func buildTEEClientTLS(caFile, certFile, keyFile string) (*tls.Config, error) {
+	if caFile == "" {
+		if certFile != "" || keyFile != "" {
+			return nil, errors.New("-mtls-cert/-mtls-key require -mtls-ca")
+		}
+		return nil, nil
+	}
+	if certFile == "" {
+		certFile = filepath.Join(shared.ConfigDir(), shared.MTLSClientCertPath)
+	}
+	if keyFile == "" {
+		keyFile = filepath.Join(shared.ConfigDir(), shared.MTLSClientKeyPath)
+	}
+	if err := shared.EnsureMTLSCerts(); err != nil {
+		return nil, err
+	}
+	return shared.ClientMTLSConfig(caFile, certFile, keyFile)
 }
 
 // buildVerifier assembles the attestation trust root from the operator's

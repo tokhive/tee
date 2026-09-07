@@ -25,16 +25,13 @@
 //
 // The Hub↔TEE channel is deliberately separate: local sims run plain HTTP, and
 // production enables mTLS at the listener using the platform adapter's
-// ServerTLSConfig (RA-TLS certificates) — see the C4 checklist document for the
-// exact wiring; this file's job is to expose the switches, not to guess at a
-// deployment's certificate topology.
+// ServerTLSConfig (RA-TLS certificates). -mtls switches the listener to that
+// mode; -mtls-client-ca names the CA that signs Hub client certificates.
 package main
 
 import (
 	"crypto/tls"
-	"crypto/x509"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -59,6 +56,8 @@ func main() {
 	platformName := flag.String("platform", defaultPlatform, "attestation platform: simulated or sevsnp")
 	includeEvidence := flag.Bool("evidence", true, "embed attestation evidence in every receipt (false = resolve EvidenceHash via evidence retrieval)")
 	caFile := flag.String("ca", "", "root CA PEM for provider TLS; empty = sim test CA on simulated, system roots on sevsnp")
+	mtls := flag.Bool("mtls", false, "serve the Hub-facing API over mutual TLS: the platform's RA-TLS server certificate (sevsnp) or the sim test certificate (simulated), demanding a Hub client certificate")
+	mtlsClientCA := flag.String("mtls-client-ca", "", "PEM CA(s) that sign Hub client certificates; empty defaults to <simdir>/hub-ca.pem (required with -mtls)")
 	flag.Parse()
 
 	// Fixtures are idempotent and live under TOKENHIVE_SIM_DIR (default .sim):
@@ -68,6 +67,11 @@ func main() {
 	// sim and cloud — only the file contents differ.
 	if err := shared.EnsureDefaults(); err != nil {
 		log.Fatalf("ensure defaults: %v", err)
+	}
+	if *mtls {
+		if err := shared.EnsureMTLSCerts(); err != nil {
+			log.Fatalf("ensure mtls fixtures: %v", err)
+		}
 	}
 
 	// The whitelist is part of this enclave's measured configuration: load it
@@ -83,7 +87,7 @@ func main() {
 		log.Fatalf("hash policy set: %v", err)
 	}
 
-	epoch, err := buildEpoch(*platformName, policySetHash)
+	epoch, serverTLS, err := buildEpoch(*platformName, policySetHash)
 	if err != nil {
 		log.Fatalf("build platform epoch: %v", err)
 	}
@@ -172,6 +176,28 @@ func main() {
 		log.Fatalf("open evidence store: %v", err)
 	}
 	evidence.NewHTTPServer(evStore, mux)
+
+	if *mtls {
+		clientCAPath := *mtlsClientCA
+		if clientCAPath == "" {
+			clientCAPath = filepath.Join(shared.ConfigDir(), shared.MTLSClientCAPath)
+		}
+		if serverTLS == nil {
+			log.Fatalf("platform %q provides no RA-TLS server certificate; cannot serve -mtls", *platformName)
+		}
+		cfg, err := shared.ServerMTLSConfig(serverTLS, clientCAPath)
+		if err != nil {
+			log.Fatalf("mtls server config: %v", err)
+		}
+		if err := shared.WriteTEECert(cfg); err != nil {
+			log.Fatalf("publish tee certificate: %v", err)
+		}
+		log.Printf("tee (platform=%s, includeEvidence=%t, mtls) listening on https://%s",
+			*platformName, *includeEvidence, *addr)
+		server := &http.Server{Addr: *addr, Handler: mux, TLSConfig: cfg}
+		log.Fatal(server.ListenAndServeTLS("", ""))
+	}
+
 	log.Printf("tee (platform=%s, includeEvidence=%t) listening on http://%s",
 		*platformName, *includeEvidence, *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
@@ -186,7 +212,7 @@ func main() {
 func upstreamTLSConfig(platformName, caFile string) (*tls.Config, error) {
 	switch {
 	case caFile != "":
-		pool, err := loadCAPath(caFile)
+		pool, err := shared.LoadCAPath(caFile)
 		if err != nil {
 			return nil, err
 		}
@@ -204,18 +230,6 @@ func upstreamTLSConfig(platformName, caFile string) (*tls.Config, error) {
 		}
 		return &tls.Config{RootCAs: pool}, nil
 	}
-}
-
-func loadCAPath(path string) (*x509.CertPool, error) {
-	der, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read CA %s: %w", path, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(der) {
-		return nil, fmt.Errorf("no certificates parsed from %s", path)
-	}
-	return pool, nil
 }
 
 // envOr returns the environment variable or a fallback. Used by the sevsnp

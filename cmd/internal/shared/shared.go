@@ -33,6 +33,7 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
@@ -294,6 +295,70 @@ func LoadEvidenceStore() (*evidence.Store, error) {
 // CAPEMPath is where mockprovider drops its CA certificate for the TEE to trust.
 func CAPEMPath() string { return filepath.Join(ConfigDir(), "ca.pem") }
 
+// mTLS fixture paths for the Hub↔TEE channel.
+const (
+	// MTLSClientCAPath is the throwaway CA that signs the Hub's client
+	// certificate; the TEE trusts it with -mtls-client-ca.
+	MTLSClientCAPath = "hub-ca.pem"
+	// MTLSClientCertPath / MTLSClientKeyPath are the Hub's own mTLS identity,
+	// presented with -mtls-cert/-mtls-key.
+	MTLSClientCertPath = "hub-client.pem"
+	MTLSClientKeyPath  = "hub-client-key.pem"
+	// MTLSServerCertPath is the TEE's RA-TLS leaf cert, published so the Hub
+	// can pin it with -mtls-ca. In production this cert is attested (its SPKI
+	// is the receipt's KeyID) and is distributed out of band by the deployment.
+	MTLSServerCertPath = "tee-cert.pem"
+)
+
+// EnsureMTLSCerts writes the simulation's Hub mTLS identity if it is missing:
+// a throwaway CA (hub-ca.pem) and a client certificate it signs
+// (hub-client.pem/key). The TEE's -mtls-client-ca trusts the former, and the
+// Hub presents the latter with -mtls-cert/-mtls-key. Nothing here is
+// production material — it exists so the mTLS wiring can be exercised
+// end-to-end on a laptop.
+func EnsureMTLSCerts() error {
+	caPEM, certPEM, keyPEM, err := mtls.GenHubClientCerts()
+	if err != nil {
+		return err
+	}
+	for path, v := range map[string][]byte{
+		MTLSClientCAPath:   caPEM,
+		MTLSClientCertPath: certPEM,
+		MTLSClientKeyPath:  keyPEM,
+	} {
+		if err := writePEMIfAbsent(filepath.Join(ConfigDir(), path), v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// LoadCAPath reads a PEM file into a certificate pool.
+func LoadCAPath(path string) (*x509.CertPool, error) {
+	return mtls.LoadCAPath(path)
+}
+
+// PlatformServerTLS returns the RA-TLS server configuration the platform epoch
+// provides, or nil when the platform has none.
+func PlatformServerTLS(epoch platform.Epoch) *tls.Config {
+	return mtls.PlatformServerTLS(epoch)
+}
+
+// ServerMTLSConfig assembles the TEE-side mTLS listener config.
+func ServerMTLSConfig(serverTLS *tls.Config, clientCAPath string) (*tls.Config, error) {
+	return mtls.ServerMTLSConfig(serverTLS, clientCAPath)
+}
+
+// ClientMTLSConfig assembles the Hub-side mTLS client config.
+func ClientMTLSConfig(caPEMPath, certPath, keyPath string) (*tls.Config, error) {
+	return mtls.ClientMTLSConfig(caPEMPath, certPath, keyPath)
+}
+
+// WriteTEECert publishes the leaf certificate a TEE listener presents.
+func WriteTEECert(cfg *tls.Config) error {
+	return mtls.WriteTEECert(cfg, filepath.Join(ConfigDir(), MTLSServerCertPath))
+}
+
 // GenCerts generates a throwaway CA and a server certificate for the loopback
 // interface, returning a TLS config for the mock provider and the CA PEM for
 // the TEE to trust. No external tooling required.
@@ -379,6 +444,16 @@ func writeIfAbsent(path string, v any) error {
 		return nil
 	}
 	return writeJSON(path, v)
+}
+
+// writePEMIfAbsent writes raw PEM bytes — unlike writeIfAbsent, it must NOT
+// JSON-escape the payload (a quoted, \n-escaped string is not a parseable
+// certificate).
+func writePEMIfAbsent(path string, b []byte) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	}
+	return os.WriteFile(path, b, 0o644)
 }
 
 func writeJSON(path string, v any) error {
