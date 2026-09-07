@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -26,11 +27,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/attest"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
@@ -38,6 +41,12 @@ import (
 // this binary prints. Only the display divides; every calculation stays in
 // integers.
 const microsPerUnit = 1_000_000
+
+// evidenceCache resolves full attestation evidence for hash-only receipts. It
+// is populated as TEEs come online (credential/register attach their identity),
+// so a later receipt carrying only an evidence hash resolves against what the
+// Hub actually saw. The Hub never trusts an epoch it has not observed.
+var evidenceCache attest.Cache
 
 func main() {
 	teeURL := flag.String("tee", "http://127.0.0.1:18090", "TEE base URL")
@@ -59,12 +68,15 @@ func main() {
 	agentKey := flag.String("agent-key", "", "shared key Provider Agents must present to dial in (required to make the Hub schedulable-by-online)")
 	credential := flag.String("credential", "", "provider access token to register with the TEE before the request loop (simulation one-shot mode: the CLI holds the seller's token and delivers it sealed to -tee, as a dialing agent would through a resident Hub)")
 	audit := flag.Bool("audit", false, "audit the receipt store for gaps and verify signatures")
+	allowed := flag.String("allowed-platforms", "simulated", "comma-separated attestation platforms the Hub trusts (e.g. simulated,aws-sev-snp)")
+	expectedApp := flag.String("expected-app", "", "for aws-sev-snp: the attested application identity the deployment trusts (snp-app:<sha256 hex>)")
+	policyHash := flag.String("policy-set-hash", "", "hex digest the enclave must have bound into its evidence; empty skips the deployment-binding assertion (the Hub pins the platform, not the exact policy digest, at runtime)")
 	flag.Parse()
 
 	store := hub.NewReceiptStore(filepath.Join(shared.ConfigDir(), "receipts"))
 
 	if *audit {
-		runAudit(store, *provider)
+		runAudit(store, *provider, *allowed, *expectedApp, *policyHash)
 		return
 	}
 
@@ -89,11 +101,15 @@ func main() {
 		SessionURL: wsEndpoint(*teeURL, "/v1/session"),
 		BaseURL:    *teeURL,
 	}
+	verifier, err := buildVerifier(*allowed, *expectedApp, *policyHash)
+	if err != nil {
+		log.Fatalf("attestation: %v", err)
+	}
 	h, err := hub.New(hub.Config{
 		TEE:                 teeClient,
 		Rates:               rates,
 		Store:               store,
-		Verify:              verifyReceipt,
+		Verify:              verifier.VerifyFunc(),
 		Quota:               quota,
 		Commission:          uint64(*commission),
 		Withhold:            withholdSeq(*drop),
@@ -195,8 +211,12 @@ func printLedger(ledger *hub.Ledger) {
 	}
 }
 
-func runAudit(store *hub.ReceiptStore, provider string) {
-	report, err := store.Audit(provider, verifyReceipt)
+func runAudit(store *hub.ReceiptStore, provider, allowed, expectedApp, policyHash string) {
+	verifier, err := buildVerifier(allowed, expectedApp, policyHash)
+	if err != nil {
+		log.Fatalf("attestation: %v", err)
+	}
+	report, err := store.Audit(provider, verifier.VerifyFunc())
 	if err != nil {
 		log.Fatalf("audit: %v", err)
 	}
@@ -204,41 +224,8 @@ func runAudit(store *hub.ReceiptStore, provider string) {
 		fmt.Printf("no receipts stored for provider %q\n", provider)
 		return
 	}
-	fmt.Printf("verified %d/%d receipts for provider %q\n", report.Verified, report.Total, provider)
-
-	// The deployment binding: receipts issued by a TEE deployed with the
-	// current whitelist carry that policy-set hash in their evidence. When the
-	// local deployment config exists, compare; receipts whose evidence lacks
-	// the binding (issued by an unbound epoch) are flagged as warnings.
-	expectedHash, haveDeployment := localPolicySetHash()
-	if haveDeployment {
-		fmt.Printf("expected deployment policy-set hash: %x\n", expectedHash)
-	}
-
-	// Evidence is checked separately from the signature: a receipt can be
-	// perfectly signed and still point at an attestation that no longer
-	// resolves, which is a cache problem rather than a forgery.
-	receipts, err := store.List(provider)
-	if err != nil {
-		logf("list receipts: %v", err)
-	}
-	for _, signed := range receipts {
-		id, err := signed.Receipt.Identity()
-		if err != nil {
-			fmt.Printf("  [WARN] seq=%d: identity: %v\n", signed.Receipt.ProviderSeq, err)
-			continue
-		}
-		if haveDeployment {
-			if err := simulated.CheckEvidenceForDeployment(id, expectedHash); err != nil {
-				fmt.Printf("  [WARN] seq=%d: deployment binding: %v\n", signed.Receipt.ProviderSeq, err)
-				continue
-			}
-			continue
-		}
-		if err := simulated.CheckEvidence(id); err != nil {
-			fmt.Printf("  [WARN] seq=%d: evidence: %v\n", signed.Receipt.ProviderSeq, err)
-		}
-	}
+	fmt.Printf("verified %d/%d receipts for provider %q (allowed platforms: %v)\n",
+		report.Verified, report.Total, provider, verifier.AllowedPlatforms())
 
 	if report.Complete() {
 		fmt.Printf("sequence complete: 1..%d, no gaps\n", report.MaxSeq)
@@ -248,27 +235,62 @@ func runAudit(store *hub.ReceiptStore, provider string) {
 		report.MaxSeq, report.Missing)
 }
 
-// localPolicySetHash loads the deployment policy config the way cmd/tee does
-// and returns the hash a correctly-deployed TEE would have bound into its
-// evidence. haveDeployment is false when no policy config exists locally, in
-// which case callers fall back to binding-free evidence checks.
-func localPolicySetHash() (hash [32]byte, haveDeployment bool) {
-	set, err := shared.LoadPolicySetAll()
+// buildVerifier assembles the attestation trust root from the operator's
+// allowlist. A platform the operator advertises as trusted but that has no
+// evidence verifier wired here is a wiring error and fails loudly at startup,
+// not at the first receipt.
+func buildVerifier(allowed, expectedApp, policyHash string) (*attest.Verifier, error) {
+	lists, err := splitCSV(allowed)
 	if err != nil {
-		return hash, false
+		return nil, err
 	}
-	hash, err = set.Hash()
-	if err != nil {
-		logf("hash policy set: %v", err)
-		return hash, false
+	byPlatform := map[string]platform.EvidenceVerifier{
+		simulated.Platform: simulated.Verifier{},
+		platform.PlatformAWSSEVSNP: sevsnp.Verifier{
+			ExpectedApp: expectedApp,
+		},
 	}
-	return hash, true
+	cfg := attest.Config{
+		AllowedPlatforms: lists,
+		ByPlatform:       byPlatform,
+		// The Hub is only ever handed receipts whose evidence it has already
+		// seen the TEE attach to a credential/register call; a hash-only receipt
+		// from an unknown epoch resolves nothing and is refused.
+		Fetcher: &evidenceCache,
+	}
+	// The deployment binding is opt-in. At runtime the Hub pins the platform
+	// trust root, not the exact policy digest: policy files are rewritten with a
+	// fresh IssuedAt on every startup, so deriving the hash here would race the
+	// TEE's own binding and reject valid receipts. An operator who wants the
+	// strongest bound (prove the enclave ran a specific whitelist config)
+	// passes the digest explicitly.
+	if policyHash != "" {
+		h, err := hex.DecodeString(policyHash)
+		if err != nil {
+			return nil, fmt.Errorf("parse -policy-set-hash: %w", err)
+		}
+		if len(h) != 32 {
+			return nil, fmt.Errorf("-policy-set-hash must be a 32-byte hex digest, got %d bytes", len(h))
+		}
+		copy(cfg.PolicySetHash[:], h)
+	}
+	return attest.New(cfg)
 }
 
-// verifyReceipt checks a receipt's signature and attestation. The allowed
-// platform list is the trust root; in the simulation it is the software epoch.
-func verifyReceipt(signed proof.SignedReceipt) error {
-	return proof.Verify(signed, proof.VerifyOptions{AllowedPlatforms: []string{simulated.Platform}})
+// splitCSV splits a comma-separated allowlist, trimming whitespace.
+func splitCSV(s string) ([]string, error) {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty -allowed-platforms")
+	}
+	return out, nil
 }
 
 // withholdSeq models a Hub that hides one execution from the provider. The
