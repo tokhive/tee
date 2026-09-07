@@ -122,6 +122,60 @@ func TestChannelBasicExchange(t *testing.T) {
 	}
 }
 
+// TestChannelReportsResponseStart pins the transport half of the start-frame
+// contract: the onStart callback fires exactly once, as soon as the response
+// headers are parsed and before the first body chunk, carrying the status and
+// the full upstream header set (filtering to the allowlist is the service's
+// job, so the transport reports everything it parsed).
+func TestChannelReportsResponseStart(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Retry-After", "15")
+		w.Header().Set("X-Internal", "hidden")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		fmt.Fprint(w, "data: one\n\n")
+		flusher.Flush()
+	}))
+	defer srv.Close()
+
+	cm := newTestManager(t)
+	var (
+		starts  []tee.Response
+		chunked bool
+	)
+	_, err := cm.Do(context.Background(),
+		testReq(tee.Request{Method: "POST", Host: hostOf(srv), Path: "/v1/x", Body: []byte("{}")}),
+		func(chunk []byte) error {
+			if len(starts) == 0 {
+				chunked = true
+			}
+			return nil
+		},
+		func(resp tee.Response) { starts = append(starts, resp) })
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if len(starts) != 1 {
+		t.Fatalf("onStart fired %d times, want 1", len(starts))
+	}
+	if chunked {
+		t.Fatal("a body chunk arrived before the response start")
+	}
+	if starts[0].StatusCode != http.StatusOK {
+		t.Errorf("start status = %d, want 200", starts[0].StatusCode)
+	}
+	if got := starts[0].Headers["Content-Type"]; len(got) != 1 || got[0] != "text/event-stream" {
+		t.Errorf("start content-type = %v", got)
+	}
+	if got := starts[0].Headers["Retry-After"]; len(got) != 1 || got[0] != "15" {
+		t.Errorf("start retry-after = %v", got)
+	}
+	if got := starts[0].Headers["X-Internal"]; len(got) != 1 || got[0] != "hidden" {
+		t.Errorf("start lost an upstream header: %v", got)
+	}
+}
+
 func TestChannelSSEStreamRelayed(t *testing.T) {
 	events := []string{"data: event-0\n\n", "data: event-1\n\n", "data: event-2\n\n"}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

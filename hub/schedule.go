@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
 // ErrNoProviderForModel means no provider on the market can serve the
@@ -192,7 +193,7 @@ func (h *Hub) SearchModels(query string) []ModelQuote {
 // but the caller supplies how to phrase the ask (host, headers, body binding)
 // once, since that framing is identical across providers.
 func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []byte,
-	build func(provider string) (jobs.Spec, error), onChunk func([]byte) error) (Outcome, error) {
+	build func(provider string) (jobs.Spec, error), onChunk func([]byte) error, onStart ...func(tee.Response)) (Outcome, error) {
 
 	providers := h.providersForModel(model)
 	if len(providers) == 0 {
@@ -223,7 +224,7 @@ func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []
 			return Outcome{}, fmt.Errorf("build spec for %q: %w", provider, berr)
 		}
 		ran = true
-		last, err = h.Execute(ctx, tenant, model, spec, body, relay)
+		last, err = h.Execute(ctx, tenant, model, spec, body, relay, onStart...)
 		if err != nil {
 			if relayed {
 				// The user saw this provider's bytes before it failed. There is

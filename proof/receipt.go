@@ -82,6 +82,7 @@ var (
 	ErrInvalidJobID        = errors.New("invalid job ID")
 	ErrInvalidJobSpecHash  = errors.New("invalid job spec hash")
 	ErrInvalidStreamHash   = errors.New("invalid response stream hash")
+	ErrInvalidHeaderHash   = errors.New("invalid response headers hash")
 	ErrInvalidPolicyHash   = errors.New("invalid policy hash")
 	ErrInvalidCompletion   = errors.New("invalid completion state")
 	ErrInvalidTimeRange    = errors.New("invalid time range")
@@ -151,6 +152,15 @@ type Receipt struct {
 	// and can demand the missing record. It is the only piece of TEE state and
 	// must survive restarts (sealed in production, a file store in simulation).
 	ProviderSeq uint64 `cbor:"18,keyasint,omitempty"`
+
+	// ResponseHeadersHash is the digest of the response headers the TEE
+	// forwarded in the start frame (see tee.ForwardResponseHeaders and
+	// tee.HashResponseHeaders). It binds the response start the Hub acted on —
+	// the status it showed the user and the headers it relayed — to this
+	// receipt, exactly as StreamHash binds the body. Optional: an exchange
+	// that never produced a response (CompletionFailed, no start frame) has
+	// nothing to attest, so it stays empty.
+	ResponseHeadersHash []byte `cbor:"19,keyasint,omitempty"`
 }
 
 // SignedReceipt is a receipt together with the TEE's signature over it.
@@ -179,6 +189,9 @@ func (r Receipt) Validate() error {
 	}
 	if len(r.StreamHash) != StreamHashLength {
 		return fmt.Errorf("%w: length %d, want %d", ErrInvalidStreamHash, len(r.StreamHash), StreamHashLength)
+	}
+	if len(r.ResponseHeadersHash) != 0 && len(r.ResponseHeadersHash) != StreamHashLength {
+		return fmt.Errorf("%w: length %d, want %d", ErrInvalidHeaderHash, len(r.ResponseHeadersHash), StreamHashLength)
 	}
 	if len(r.PolicyHash) != 0 && len(r.PolicyHash) != PolicyHashLength {
 		return fmt.Errorf("%w: length %d, want %d", ErrInvalidPolicyHash, len(r.PolicyHash), PolicyHashLength)

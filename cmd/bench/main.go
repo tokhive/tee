@@ -322,6 +322,10 @@ func readSSE(r io.Reader, capBytes int) sseResult {
 					capped = true
 				}
 			}
+		case tee.EventStart:
+			// The response-start frame is control data, not a body chunk:
+			// dropping it keeps the timing samples honest without polluting
+			// the payload count.
 		case tee.EventReceipt:
 			receipt = data.String()
 			res.receiptAt = time.Now()

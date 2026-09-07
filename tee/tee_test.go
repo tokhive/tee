@@ -86,6 +86,7 @@ type fakeTransport struct {
 	requests []Request
 
 	statusCode uint32
+	headers    map[string][]string
 	chunks     [][]byte
 
 	// failAfter is the number of chunks to deliver before failing with err.
@@ -94,33 +95,42 @@ type fakeTransport struct {
 	err       error
 }
 
-func (f *fakeTransport) Do(_ context.Context, req Request, onChunk func([]byte) error) (Response, error) {
+func (f *fakeTransport) Do(_ context.Context, req Request, onChunk func([]byte) error, onStart ...StartFunc) (Response, error) {
 	f.mu.Lock()
 	f.requests = append(f.requests, req)
 	chunks := f.chunks
 	statusCode := f.statusCode
+	headers := f.headers
 	failAfter := f.failAfter
 	scriptedErr := f.err
 	f.mu.Unlock()
 
+	resp := Response{StatusCode: statusCode, Headers: headers}
+	// The response start is reported as soon as the headers are parsed, before
+	// any chunk — the same ordering the real transport honours. A failAfter-0
+	// scripted failure models a connection that died before its response
+	// headers arrived, so no start is emitted then.
+	if statusCode != 0 && !(failAfter == 0 && scriptedErr != nil) && len(onStart) > 0 && onStart[0] != nil {
+		onStart[0](resp)
+	}
 	// failAfter counts chunks delivered before the failure, so the limit is
 	// checked before delivering rather than after.
 	for i, chunk := range chunks {
 		if failAfter >= 0 && i >= failAfter {
-			return Response{StatusCode: statusCode}, scriptedErr
+			return resp, scriptedErr
 		}
 		if onChunk != nil {
 			if err := onChunk(chunk); err != nil {
-				return Response{StatusCode: statusCode}, err
+				return resp, err
 			}
 		}
 	}
 	// Covers failing before the first chunk (failAfter 0) and failing after the
 	// last one (failAfter == len(chunks)).
 	if failAfter >= 0 && failAfter <= len(chunks) {
-		return Response{StatusCode: statusCode}, scriptedErr
+		return resp, scriptedErr
 	}
-	return Response{StatusCode: statusCode}, nil
+	return resp, nil
 }
 
 func (f *fakeTransport) sent() []Request {
@@ -379,6 +389,107 @@ func TestExecuteHappyPath(t *testing.T) {
 	// provider cannot audit what rules were in force.
 	if len(result.PolicyHash) != 32 {
 		t.Fatalf("policy hash length = %d, want 32", len(result.PolicyHash))
+	}
+}
+
+// TestExecuteAttestsResponseStart pins the response-start half of the new
+// protocol: the onStart callback fires exactly once, before the first chunk,
+// with the upstream status and only the allowlisted headers; the receipt binds
+// that exact start via ResponseHeadersHash; and a header outside the allowlist
+// never reaches the callback or the digest.
+func TestExecuteAttestsResponseStart(t *testing.T) {
+	env := newTestEnv(t)
+	env.transport.headers = map[string][]string{
+		"Content-Type": {"text/event-stream"},
+		"Retry-After":  {"30"},
+		"Set-Cookie":   {"session=secret"},
+	}
+
+	body := []byte(`{"model":"gpt-4o"}`)
+	spec := env.spec(t, body)
+
+	var (
+		started    []Response
+		firstChunk bool
+		chunks     int
+	)
+	result, err := env.service.Execute(context.Background(), Job{Spec: spec, Body: body},
+		func(chunk []byte) error {
+			chunks++
+			if len(started) == 0 {
+				firstChunk = true
+			}
+			return nil
+		},
+		func(resp Response) {
+			started = append(started, resp)
+		})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	// Exactly one start, delivered before the first chunk, with the status and
+	// only the allowlisted headers.
+	if len(started) != 1 {
+		t.Fatalf("onStart fired %d times, want 1", len(started))
+	}
+	if firstChunk {
+		t.Fatal("a chunk arrived before the response start")
+	}
+	if started[0].StatusCode != 200 {
+		t.Fatalf("start status = %d, want 200", started[0].StatusCode)
+	}
+	if _, ok := started[0].Headers["Set-Cookie"]; ok {
+		t.Fatal("a non-allowlisted header reached the start callback")
+	}
+	if got := started[0].Headers["Content-Type"]; len(got) != 1 || got[0] != "text/event-stream" {
+		t.Errorf("start content-type = %v, want [text/event-stream]", got)
+	}
+	if got := started[0].Headers["Retry-After"]; len(got) != 1 || got[0] != "30" {
+		t.Errorf("start retry-after = %v, want [30]", got)
+	}
+
+	// The receipt binds the start: the signed hash must equal the digest of
+	// the forwarded (allowlisted) set, and differ from a digest that included
+	// the filtered header.
+	want := HashResponseHeaders(ForwardResponseHeaders(env.transport.headers))
+	if !bytes.Equal(result.Receipt.Receipt.ResponseHeadersHash, want[:]) {
+		t.Fatal("receipt does not bind the forwarded response headers")
+	}
+	unfiltered := HashResponseHeaders(env.transport.headers)
+	if bytes.Equal(result.Receipt.Receipt.ResponseHeadersHash, unfiltered[:]) {
+		t.Fatal("receipt binds headers that were never forwarded")
+	}
+
+	// A receipt with a start must still verify end to end.
+	verifyReceipt(t, result.Receipt, spec)
+	if chunks != 2 {
+		t.Fatalf("relayed %d chunks, want 2", chunks)
+	}
+}
+
+// TestExecuteSignsNoResponseStartWhenNothingArrived pins the complement: an
+// exchange that never produced a response has no start to attest, so the
+// receipt carries no ResponseHeadersHash at all.
+func TestExecuteSignsNoResponseStartWhenNothingArrived(t *testing.T) {
+	env := newTestEnv(t)
+	env.transport.chunks = nil
+	env.transport.failAfter = 0
+	env.transport.err = errors.New("connection refused")
+
+	body := []byte(`{"model":"gpt-4o"}`)
+	spec := env.spec(t, body)
+
+	result, err := env.service.Execute(context.Background(), Job{Spec: spec, Body: body}, nil,
+		func(Response) { t.Fatal("no response means no start frame") })
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if result.Receipt.Receipt.Completion != proof.CompletionFailed {
+		t.Fatalf("completion = %v, want failed", result.Receipt.Receipt.Completion)
+	}
+	if len(result.Receipt.Receipt.ResponseHeadersHash) != 0 {
+		t.Fatal("failed exchange carries a response headers hash")
 	}
 }
 

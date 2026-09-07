@@ -27,7 +27,7 @@ import (
 // dispatch through it — it exists only to satisfy hub.New's wiring requirements.
 type refuseTEE struct{}
 
-func (refuseTEE) Execute(context.Context, jobs.Spec, []byte, func([]byte) error) (hub.Result, error) {
+func (refuseTEE) Execute(context.Context, jobs.Spec, []byte, func([]byte) error, ...func(tee.Response)) (hub.Result, error) {
 	return hub.Result{}, errUnwired
 }
 func (refuseTEE) OpenSession(context.Context, jobs.Spec) (hub.SessionConn, error) {

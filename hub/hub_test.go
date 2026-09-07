@@ -580,16 +580,29 @@ func TestHTTPTEERoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode receipt: %v", err)
 	}
-	server := sseServer(t, fmt.Sprintf("data: hello \n\ndata: world\n\nevent: receipt\ndata: %s\n\n",
+	server := sseServer(t, fmt.Sprintf("event: start\ndata: {\"status\":200,\"headers\":{\"content-type\":[\"text/event-stream\"]}}\n\n"+
+		"data: hello \n\ndata: world\n\nevent: receipt\ndata: %s\n\n",
 		base64.StdEncoding.EncodeToString(encoded)))
 	defer server.Close()
 
 	client := &HTTPTEE{URL: server.URL + "/v1/execute"}
-	var forwarded [][]byte
-	res, err := client.Execute(context.Background(), testSpec(testProvider, "m"), []byte("{}"), func(chunk []byte) error {
-		forwarded = append(forwarded, chunk)
-		return nil
-	})
+	var (
+		forwarded [][]byte
+		started   bool
+		startResp tee.Response
+	)
+	res, err := client.Execute(context.Background(), testSpec(testProvider, "m"), []byte("{}"),
+		func(chunk []byte) error {
+			if !started {
+				t.Error("a chunk arrived before the response start")
+			}
+			forwarded = append(forwarded, chunk)
+			return nil
+		},
+		func(resp tee.Response) {
+			started = true
+			startResp = resp
+		})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -602,6 +615,125 @@ func TestHTTPTEERoundTrip(t *testing.T) {
 	if res.Receipt.Receipt.ProviderSeq != 3 {
 		t.Errorf("ProviderSeq = %d, want 3", res.Receipt.Receipt.ProviderSeq)
 	}
+	// The start frame reached both the callback and the result, before the
+	// body, carrying the status and the relayed headers.
+	if !started {
+		t.Fatal("response start was never reported")
+	}
+	if startResp.StatusCode != 200 {
+		t.Errorf("start status = %d, want 200", startResp.StatusCode)
+	}
+	if got := startResp.Headers["content-type"]; len(got) != 1 || got[0] != "text/event-stream" {
+		t.Errorf("start content-type = %v", got)
+	}
+	if res.Status != 200 || len(res.Headers["content-type"]) != 1 {
+		t.Errorf("result status/headers = %d %v", res.Status, res.Headers)
+	}
+}
+
+// startStubTEE is a scripted TEE whose response start is under the test's
+// control — including a start that does NOT match the receipt, which is the
+// one case ScriptedTEE cannot produce because it binds the receipt itself.
+type startStubTEE struct {
+	status  uint32
+	headers map[string][]string
+	receipt proof.Receipt
+}
+
+func (s *startStubTEE) Execute(_ context.Context, _ jobs.Spec, _ []byte, onChunk func([]byte) error, onStart ...func(tee.Response)) (Result, error) {
+	if len(onStart) > 0 && onStart[0] != nil {
+		onStart[0](tee.Response{StatusCode: s.status, Headers: s.headers})
+	}
+	if onChunk != nil {
+		_ = onChunk([]byte("ok"))
+	}
+	return Result{Chunks: [][]byte{[]byte("ok")}, Status: s.status, Headers: s.headers, Receipt: proof.SignedReceipt{Receipt: s.receipt}}, nil
+}
+
+func (s *startStubTEE) OpenSession(context.Context, jobs.Spec) (SessionConn, error) {
+	return nil, ErrSessionUnsupported
+}
+
+// TestResponseStartIsBoundToTheReceipt covers the binding checks that make the
+// start frame trustworthy: the Hub acts on the start immediately (that is the
+// point of the protocol), but settles only when the signed receipt attests the
+// same status and the same forwarded header set.
+func TestResponseStartIsBoundToTheReceipt(t *testing.T) {
+	stream := chunks("ok")
+	hdr := map[string][]string{"content-type": {"text/event-stream"}}
+
+	t.Run("matching start settles", func(t *testing.T) {
+		r := makeReceipt(1, stream, func(r *proof.Receipt) { r.StatusCode = 401 })
+		h := mustHub(t, Config{TEE: &startStubTEE{
+			status:  401,
+			headers: hdr,
+			receipt: boundReceipt(r.Receipt, hdr),
+		}})
+		out, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil)
+		if err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		// The status the Hub committed is the attested one, and a 401 earns
+		// the provider nothing.
+		if out.StatusCode != 401 {
+			t.Errorf("outcome status = %d, want 401", out.StatusCode)
+		}
+		if out.Charged != 0 || out.Buyer != 0 {
+			t.Errorf("401 settled %d/%d, want nothing", out.Charged, out.Buyer)
+		}
+	})
+
+	t.Run("status mismatch is refused", func(t *testing.T) {
+		// The Hub showed the user a 401; the receipt says the upstream
+		// answered 200. One of the two is a lie, and neither is settleable.
+		r := makeReceipt(1, stream, nil) // StatusCode 200
+		h := mustHub(t, Config{TEE: &startStubTEE{
+			status:  401,
+			headers: hdr,
+			receipt: boundReceipt(r.Receipt, hdr),
+		}})
+		_, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil)
+		if !errors.Is(err, ErrResponseStartMismatch) {
+			t.Fatalf("error = %v, want ErrResponseStartMismatch", err)
+		}
+		if h.Ledger().Snapshot().Revenue != 0 {
+			t.Error("a start that contradicts the receipt must not settle")
+		}
+	})
+
+	t.Run("header hash mismatch is refused", func(t *testing.T) {
+		r := makeReceipt(1, stream, nil)
+		h := mustHub(t, Config{TEE: &startStubTEE{
+			status:  200,
+			headers: hdr,
+			// The receipt attests a DIFFERENT header set than the one the Hub
+			// was shown and relayed.
+			receipt: boundReceipt(r.Receipt, map[string][]string{"retry-after": {"30"}}),
+		}})
+		_, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil)
+		if !errors.Is(err, ErrResponseStartMismatch) {
+			t.Fatalf("error = %v, want ErrResponseStartMismatch", err)
+		}
+	})
+
+	t.Run("missing header hash is refused", func(t *testing.T) {
+		// A start frame was shown but the receipt attests no header set at
+		// all: the Hub cannot prove what it relayed, so it must not settle.
+		r := makeReceipt(1, stream, nil)
+		h := mustHub(t, Config{TEE: &startStubTEE{status: 200, headers: hdr, receipt: r.Receipt}})
+		_, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil)
+		if !errors.Is(err, ErrResponseStartMismatch) {
+			t.Fatalf("error = %v, want ErrResponseStartMismatch", err)
+		}
+	})
+}
+
+// boundReceipt attaches the response-start binding to a receipt, as the TEE
+// does when it signs an exchange that produced a response.
+func boundReceipt(r proof.Receipt, headers map[string][]string) proof.Receipt {
+	h := tee.HashResponseHeaders(headers)
+	r.ResponseHeadersHash = h[:]
+	return r
 }
 
 // TestHTTPTEERoundTripsChunksByteForByte pins the framing's fidelity.

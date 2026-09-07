@@ -16,6 +16,7 @@ import (
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
 // serveConfig is the routing the resident service hands to the scheduler: the
@@ -143,21 +144,43 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	flusher, _ := w.(http.Flusher)
 
-	// The 200 + SSE headers are committed on the first relayed byte, not
-	// before dispatch. A dispatch that fails before anything was relayed
-	// (unknown model, quota, no serving provider) can therefore return a
-	// proper JSON error with a meaningful status — an SSE error frame under a
-	// 200 would leave SDKs guessing.
-	var started bool
-	start := func() {
+	// The user-visible status and headers are committed from the TEE's
+	// response-start frame, not from the first relayed byte: the Hub must know
+	// whether the upstream answered 200 or 401/429 before it shows the buyer
+	// anything. Dispatch failures that happen before any start (unknown model,
+	// quota, no serving provider) return a proper JSON error with a
+	// meaningful status instead.
+	var (
+		started bool
+		status  int
+	)
+	commit := func(resp tee.Response) {
 		if started {
 			return
 		}
 		started = true
+		status = int(resp.StatusCode)
+		if status == 0 {
+			// No response start (an exchange that never produced a response):
+			// fall back to the streaming default, as before.
+			status = http.StatusOK
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(http.StatusOK)
+		// The upstream's relayed headers override the defaults: a 401 JSON
+		// error keeps its application/json, a 200 stream keeps its
+		// text/event-stream. Del-then-Add replaces the default value rather
+		// than appending a second one, while still preserving a multi-value
+		// upstream header.
+		for name, values := range resp.Headers {
+			w.Header().Del(name)
+			for _, value := range values {
+				w.Header().Add(name, value)
+			}
+		}
+		w.WriteHeader(status)
 	}
+	isSuccess := func() bool { return status >= 200 && status < 300 }
 
 	var chunks int
 	outcome, err := c.h.ExecuteForModel(r.Context(), tenant, req.Model, body,
@@ -169,7 +192,7 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// frames `data: {…}` and the data path relays raw body bytes, so
 			// re-wrapping here would emit `data: data: {…}` and break every
 			// OpenAI SDK. The Hub's only job is byte-pass-through.
-			start()
+			commit(tee.Response{})
 			if _, werr := w.Write(chunk); werr != nil {
 				return werr
 			}
@@ -178,7 +201,8 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				flusher.Flush()
 			}
 			return nil
-		})
+		},
+		commit)
 
 	if err != nil {
 		if !started {
@@ -186,25 +210,33 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			log.Printf("api model=%q path=%s tenant=%q err=%v", req.Model, c.route.Path, tenant, err)
 			return
 		}
-		// Streaming had already begun: the status is committed, so the failure
-		// is reported as an SSE error frame instead.
-		fmt.Fprintf(w, "event: error\ndata: %s\n\n", sseError(err))
+		// The response is committed. For a 2xx stream the failure is reported
+		// as an SSE error frame; for a non-2xx upstream status the upstream's
+		// own error body already tells the story, and splicing an SSE frame
+		// into it would corrupt the error the buyer is reading. Either way
+		// nothing settles: hub.Execute returned no verified receipt to settle
+		// against, so the failure is logged and the response ends here.
+		if isSuccess() {
+			fmt.Fprintf(w, "event: error\ndata: %s\n\n", sseError(err))
+		}
 	}
-	if c.route.Done {
+	if c.route.Done && isSuccess() {
 		// OpenAI-compatible chat streams terminate with an explicit done marker,
 		// which the mock upstream does not emit. Appended after an error frame
-		// too, so a client that started reading a stream is never left waiting
-		// for a terminator that cannot come. An upstream that completed with an
-		// empty body still needs the marker, hence the start() here.
-		start()
+		// too, so a client that started reading a 2xx stream is never left
+		// waiting for a terminator that cannot come. Never appended to a
+		// non-2xx response, whose body is the complete error already. An
+		// upstream that completed with an empty body still needs the marker,
+		// hence the commit here.
+		commit(tee.Response{})
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}
 	if started && flusher != nil {
 		flusher.Flush()
 	}
 
-	log.Printf("api model=%q path=%s tenant=%q provider=%q chunks=%d charged=%.2f commission=%.2f buyer=%.2f err=%v",
-		req.Model, c.route.Path, tenant, outcome.Receipt.Receipt.Provider, chunks,
+	log.Printf("api model=%q path=%s tenant=%q provider=%q status=%d chunks=%d charged=%.2f commission=%.2f buyer=%.2f err=%v",
+		req.Model, c.route.Path, tenant, outcome.Receipt.Receipt.Provider, status, chunks,
 		float64(outcome.Charged)/microsPerUnit, float64(outcome.Commission)/microsPerUnit,
 		float64(outcome.Buyer)/microsPerUnit, err)
 }

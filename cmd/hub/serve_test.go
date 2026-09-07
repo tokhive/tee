@@ -25,12 +25,13 @@ import (
 // the supplied upstream SSE bytes (the fixed frames mockprovider serves).
 func newServeTestHub(t *testing.T, upstream []byte) *hub.Hub {
 	t.Helper()
-	return newServeTestHubReply(t, upstream, nil)
+	return newServeTestHubStatus(t, upstream, 200, nil)
 }
 
-// newServeTestHubReply is newServeTestHub with a TEE whose Reply may fail, so
-// a test can exercise the pre-dispatch error path (every provider refuses).
-func newServeTestHubReply(t *testing.T, upstream []byte, fail error) *hub.Hub {
+// newServeTestHubStatus is newServeTestHub with control over the upstream
+// status and the TEE's Reply error, so a test can exercise the pre-dispatch
+// error path (every provider refuses) and the upstream-error passthrough.
+func newServeTestHubStatus(t *testing.T, upstream []byte, status int, fail error) *hub.Hub {
 	t.Helper()
 
 	// The sim fixtures (seller rate table for openai-sim and cheap-sim, plus
@@ -49,19 +50,28 @@ func newServeTestHubReply(t *testing.T, upstream []byte, fail error) *hub.Hub {
 	}
 
 	stream := [][]byte{upstream}
+	ctype := "text/event-stream"
+	if status != 200 {
+		ctype = "application/json"
+	}
 	fake := &hub.ScriptedTEE{Reply: func(call int, spec jobs.Spec) (hub.Result, error) {
 		if fail != nil {
 			return hub.Result{}, fail
 		}
 		r := hub.ScriptReceipt(stream, proof.Receipt{
 			Provider:      spec.Provider,
-			StatusCode:    200,
+			StatusCode:    uint32(status),
 			Completion:    proof.CompletionComplete,
 			ChunkCount:    1,
 			ResponseBytes: uint64(len(upstream)),
 			ProviderSeq:   uint64(call),
 		})
-		return hub.Result{Chunks: stream, Receipt: proof.SignedReceipt{Receipt: r}}, nil
+		return hub.Result{
+			Status:  uint32(status),
+			Headers: map[string][]string{"content-type": {ctype}},
+			Chunks:  stream,
+			Receipt: proof.SignedReceipt{Receipt: r},
+		}, nil
 	}}
 
 	h, err := hub.New(hub.Config{
@@ -75,6 +85,13 @@ func newServeTestHubReply(t *testing.T, upstream []byte, fail error) *hub.Hub {
 		t.Fatalf("build hub: %v", err)
 	}
 	return h
+}
+
+// newServeTestHubReply is kept for the pre-dispatch failure test: a TEE whose
+// Reply always fails.
+func newServeTestHubReply(t *testing.T, upstream []byte, fail error) *hub.Hub {
+	t.Helper()
+	return newServeTestHubStatus(t, upstream, 200, fail)
 }
 
 // postBody hits one user-facing route with a JSON body and returns the raw
@@ -151,6 +168,62 @@ func TestUserRoutesServeStreamingContentType(t *testing.T) {
 			t.Errorf("%s returned an empty stream", route.Path)
 		}
 	}
+}
+
+// TestUpstreamErrorStatusIsPassedThrough locks the fix this protocol change
+// exists for: when the upstream answers 401, the buyer sees a 401 with the
+// upstream's error body — not a 200 with an SSE stream. The upstream's own
+// body is the complete error, so no [DONE] marker is appended to it.
+func TestUpstreamErrorStatusIsPassedThrough(t *testing.T) {
+	route := userRoutes[0]
+	h := newServeTestHubStatus(t,
+		[]byte(`{"error":{"message":"invalid api key"}}`), 401, nil)
+	status, body, ctype := serveStatus(t, h, route, `{"model":"sim-mock-0.5b"}`)
+	if status != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", status)
+	}
+	if !strings.Contains(ctype, "application/json") {
+		t.Errorf("content-type = %q, want the upstream's application/json", ctype)
+	}
+	if !strings.Contains(body, `{"error":{"message":"invalid api key"}}`) {
+		t.Errorf("upstream error body missing: %q", body)
+	}
+	if strings.Contains(body, "[DONE]") {
+		t.Errorf("error body must not be spliced with a stream terminator: %q", body)
+	}
+	if strings.Contains(body, "event: error") {
+		t.Errorf("hub error frame must not be spliced into a non-2xx error body: %q", body)
+	}
+}
+
+// TestUpstreamErrorStatusAlsoPassesThroughRateLimit covers the 429 shape: the
+// upstream's Retry-After hint must reach the buyer alongside the status.
+func TestUpstreamErrorStatusAlsoPassesThroughRateLimit(t *testing.T) {
+	route := userRoutes[0]
+	// A 429 receipt is not billable, so the scheduler would fall back to the
+	// next provider; with both providers scripted to 429, the last attempt is
+	// returned and its status is what the buyer sees.
+	h := newServeTestHubStatus(t,
+		[]byte(`{"error":{"message":"rate limit exceeded"}}`), 429, nil)
+	status, _, _ := serveStatus(t, h, route, `{"model":"sim-mock-0.5b"}`)
+	if status != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", status)
+	}
+}
+
+// serveStatus runs one route and returns the recorded status, body, and
+// content type.
+func serveStatus(t *testing.T, h *hub.Hub, route userRoute, body string) (int, string, string) {
+	t.Helper()
+	cfg := serveConfig{Host: "127.0.0.1:18080", Query: "", Max: 1 << 20}
+	handler := &userHandler{h: h, cfg: cfg, route: route}
+
+	req := httptest.NewRequest(http.MethodPost, route.Path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-TokenHive-Key", "tenant-test")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec.Code, rec.Body.String(), rec.Header().Get("Content-Type")
 }
 
 // TestPreDispatchFailureIsAJSONError locks the deferred-header behaviour: a

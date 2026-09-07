@@ -490,18 +490,22 @@ type scriptedTransport struct {
 	lastRequest tee.Request
 }
 
-func (s *scriptedTransport) Do(_ context.Context, req tee.Request, onChunk func([]byte) error) (tee.Response, error) {
+func (s *scriptedTransport) Do(_ context.Context, req tee.Request, onChunk func([]byte) error, onStart ...tee.StartFunc) (tee.Response, error) {
 	s.calls++
 	s.lastRequest = req
+	resp := tee.Response{StatusCode: s.statusCode, Headers: map[string][]string{"content-type": {"text/event-stream"}}}
+	if s.statusCode != 0 && len(onStart) > 0 && onStart[0] != nil {
+		onStart[0](resp)
+	}
 	for _, chunk := range s.chunks {
 		if onChunk == nil {
 			continue
 		}
 		if err := onChunk(chunk); err != nil {
-			return tee.Response{StatusCode: s.statusCode}, err
+			return resp, err
 		}
 	}
-	return tee.Response{StatusCode: s.statusCode}, nil
+	return resp, nil
 }
 
 func newService(t *testing.T, epoch *fakeEpoch, transport tee.Transport) (*tee.Service, []byte) {
@@ -670,7 +674,7 @@ type failingTransport struct {
 	inner *scriptedTransport
 }
 
-func (f *failingTransport) Do(ctx context.Context, req tee.Request, onChunk func([]byte) error) (tee.Response, error) {
+func (f *failingTransport) Do(ctx context.Context, req tee.Request, onChunk func([]byte) error, onStart ...tee.StartFunc) (tee.Response, error) {
 	f.inner.calls++
 	f.inner.lastRequest = req
 	if onChunk != nil && len(f.inner.chunks) > 0 {

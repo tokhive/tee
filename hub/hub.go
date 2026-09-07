@@ -43,6 +43,12 @@ var (
 	// the Hub forwarded. Either the Hub is lying about what it delivered or
 	// the TEE is not describing the same exchange; neither is settleable.
 	ErrStreamMismatch = errors.New("receipt attests different bytes than the Hub forwarded")
+	// ErrResponseStartMismatch means the response-start frame the Hub acted
+	// on — the status it showed the user and the headers it relayed — is not
+	// the exchange the receipt attests. Like ErrStreamMismatch it is a
+	// contradiction between what the Hub did and what the TEE signed, so
+	// nothing is settled against it.
+	ErrResponseStartMismatch = errors.New("response start does not match the receipt")
 )
 
 // Config assembles a Hub.
@@ -262,6 +268,9 @@ type Outcome struct {
 	Receipt proof.SignedReceipt
 	// Chunks are the response bytes the Hub forwarded to its caller.
 	Chunks [][]byte
+	// StatusCode is the upstream status the Hub committed its response with.
+	// Zero when the exchange never produced a response.
+	StatusCode uint32
 	// Charged is what the provider earned, in the micro-units of its own rate
 	// card. Zero for anything the provider did not complete.
 	Charged uint64
@@ -287,7 +296,8 @@ type Outcome struct {
 // ordinary rate limiting would punch holes in the provider's sequence and be
 // indistinguishable from the Hub hiding executions. And the receipt is
 // verified before anything is charged, so a forged receipt cannot move money.
-func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec, body []byte, onChunk func([]byte) error) (Outcome, error) {
+func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec, body []byte,
+	onChunk func([]byte) error, onStart ...func(tee.Response)) (Outcome, error) {
 	if h.quota != nil && !h.quota.Allow(tenant, h.clock()) {
 		return Outcome{}, fmt.Errorf("%w: tenant %q", ErrQuotaExceeded, tenant)
 	}
@@ -308,31 +318,40 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 
 	h.ledger.NoteDispatch(spec.Provider)
 
-	res, err := h.tee.Execute(ctx, spec, body, onChunk)
+	res, err := h.tee.Execute(ctx, spec, body, onChunk, onStart...)
 	if err != nil {
-		return Outcome{Chunks: res.Chunks}, err
+		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, err
 	}
 
 	if err := h.verify(res.Receipt); err != nil {
-		return Outcome{Chunks: res.Chunks}, fmt.Errorf("verify receipt: %w", err)
+		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, fmt.Errorf("verify receipt: %w", err)
 	}
 	h.ledger.NoteVerified(spec.Provider)
 
 	if !res.Receipt.Receipt.MatchesStream(res.Chunks) {
-		return Outcome{Chunks: res.Chunks}, ErrStreamMismatch
+		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, ErrStreamMismatch
+	}
+
+	// The response start the Hub acted on must be the exchange the receipt
+	// attests: the status it committed to its caller and the headers it
+	// relayed are part of what the provider gets billed against, so they must
+	// be provable. A start frame was seen exactly when res.Status is non-zero;
+	// with none (a response that never began) there is nothing to bind.
+	if res.Status != 0 && !receiptMatchesStart(res.Receipt.Receipt, res.Status, res.Headers) {
+		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, ErrResponseStartMismatch
 	}
 
 	charged, err := Price(card, model, res.Receipt.Receipt)
 	if err != nil {
-		return Outcome{Chunks: res.Chunks}, err
+		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, err
 	}
 	commission, err := h.commission.CommissionOn(charged)
 	if err != nil {
-		return Outcome{Chunks: res.Chunks}, err
+		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, err
 	}
 	buyer, ok := addChecked(charged, commission)
 	if !ok {
-		return Outcome{Chunks: res.Chunks}, fmt.Errorf("%w: charged %d plus commission %d",
+		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, fmt.Errorf("%w: charged %d plus commission %d",
 			ErrPriceOverflow, charged, commission)
 	}
 	h.ledger.NoteSettled(spec.Provider, charged)
@@ -340,11 +359,28 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 
 	seq := res.Receipt.Receipt.ProviderSeq
 	if h.withhold != nil && h.withhold(seq) {
-		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, Charged: charged, Commission: commission, Buyer: buyer}, nil
+		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer}, nil
 	}
 	if err := h.store.Put(spec.Provider, res.Receipt); err != nil {
-		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, Charged: charged, Commission: commission, Buyer: buyer},
+		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer},
 			fmt.Errorf("store receipt: %w", err)
 	}
-	return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, Charged: charged, Commission: commission, Buyer: buyer, Stored: true}, nil
+	return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer, Stored: true}, nil
+}
+
+// receiptMatchesStart reports whether a receipt attests the response start the
+// Hub acted on: the same status, and a ResponseHeadersHash over exactly the
+// header set the Hub was shown. The digest is recomputed here, from the start
+// frame the Hub parsed, and compared against the signed value — a TEE that
+// relayed one start and signed another would be caught the same way a forged
+// stream is caught by MatchesStream.
+func receiptMatchesStart(r proof.Receipt, status uint32, headers map[string][]string) bool {
+	if r.StatusCode != status {
+		return false
+	}
+	if len(r.ResponseHeadersHash) == 0 {
+		return false
+	}
+	h := tee.HashResponseHeaders(headers)
+	return streamHashEq(h[:], r.ResponseHeadersHash)
 }
