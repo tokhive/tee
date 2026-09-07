@@ -357,3 +357,34 @@ func TestAgentRefusesToComeOnlineWithoutDiscoverableModels(t *testing.T) {
 		t.Fatal("prepareModels succeeded against a 404 models endpoint")
 	}
 }
+
+// TestReconnectPauseIsJittered pins the two properties that stop a fleet of
+// agents from reconnecting as one block: the pause stays inside the backoff
+// window the doubling computed, and it is actually spread out inside it. A
+// fixed pause would leave every agent that went offline at the same instant
+// (a TEE or Hub restart) dialling in on the same tick.
+func TestReconnectPauseIsJittered(t *testing.T) {
+	if got := jittered(0); got != 0 {
+		t.Fatalf("jittered(0) = %v, want 0", got)
+	}
+
+	const window = time.Second
+	const samples = 400
+	var total time.Duration
+	distinct := make(map[time.Duration]struct{}, samples)
+	for i := 0; i < samples; i++ {
+		got := jittered(window)
+		if got < 0 || got >= window {
+			t.Fatalf("jittered(%v) = %v, want a pause inside [0,%v)", window, got, window)
+		}
+		total += got
+		distinct[got] = struct{}{}
+	}
+	if len(distinct) < samples/2 {
+		t.Fatalf("jitter collapsed to %d distinct pauses over %d samples: a fleet would still reconnect in lockstep", len(distinct), samples)
+	}
+	// Uniform over [0, window), so the mean sits near the middle of it.
+	if mean := total / samples; mean < window/4 || mean > 3*window/4 {
+		t.Fatalf("jittered mean = %v, want near %v", mean, window/2)
+	}
+}

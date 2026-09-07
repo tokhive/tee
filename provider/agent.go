@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"strings"
@@ -193,7 +194,9 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 // MaxReconnectDelay, and a clean connection resets it to ReconnectDelay. A Hub
 // that is briefly unreachable therefore gets a widening gap between attempts
 // rather than a fixed-rate hammer, which is the whole point — an agent must
-// not amplify a Hub outage into a connection storm.
+// not amplify a Hub outage into a connection storm. Each pause is then
+// jittered (see jittered), so agents that all went offline together do not
+// come back in the same instant.
 func (a *Agent) Run(ctx context.Context) error {
 	if err := a.prepareModels(); err != nil {
 		return err
@@ -219,9 +222,21 @@ func (a *Agent) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(delay):
+		case <-time.After(jittered(delay)):
 		}
 	}
+}
+
+// jittered returns a delay in [0, d): full jitter on the backoff pause. The
+// doubling still bounds how fast a hopeless retry loop spins, but the phase is
+// now random, so a fleet of agents that lost its tunnel at the same instant
+// (a TEE or Hub restart) reconnects spread across the window instead of
+// arriving in lockstep waves that spike the Hub and the TEE together.
+func jittered(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int63n(int64(d)))
 }
 
 // runOnce runs one connection cycle: dial the Hub gate, register, and relay
