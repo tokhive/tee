@@ -40,11 +40,13 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 
+	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
@@ -58,6 +60,19 @@ import (
 const defaultPlatform = "simulated"
 
 func main() {
+	// Under the measured loader the loader launches this binary twice: once as a
+	// root-only attestation broker (which owns /dev/sev-guest, /dev/tpm0) and once
+	// as the unprivileged app connected to it. When env marks this process as the
+	// broker, serve attestation requests in a loop and exit instead of running the
+	// TEE service (the same split tee_k/tee_t use).
+	if broker, err := rootShared.RunSNPAttestationBrokerIfRequested(); broker {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "SNP attestation broker failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	addr := flag.String("addr", "127.0.0.1:18090", "listen address")
 	relay := flag.String("relay", "", "Hub TeeRelay WebSocket URL: every provider connection egresses as a stream over the Hub's reverse tunnel")
 	seqPath := flag.String("seq", "", "ProviderSeq store file (default <simdir>/seqstore.json)")
