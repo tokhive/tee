@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
@@ -114,6 +115,21 @@ type HTTPTEE struct {
 	BaseURL string
 	// Client is the HTTP client to use. Defaults to http.DefaultClient.
 	Client *http.Client
+
+	// keyMu guards keyCall, the in-flight credential-key fetch. Agents pull
+	// the TEE inbox key through the Hub on every reconnect, so a fleet that
+	// reconnects in a wave would otherwise become one request per agent
+	// against the TEE. Sharing the in-flight fetch collapses that wave.
+	keyMu   sync.Mutex
+	keyCall *credentialKeyCall
+}
+
+// credentialKeyCall is one in-flight CredentialKey fetch, shared by every
+// caller that arrives while it is running.
+type credentialKeyCall struct {
+	done chan struct{}
+	key  tee.InboxPublic
+	err  error
 }
 
 // Execute implements TEE.
@@ -149,11 +165,39 @@ func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onCh
 }
 
 // CredentialKey implements CredentialService.
+//
+// Concurrent callers share one TEE round-trip. That is the whole mitigation:
+// the result is handed to every waiter and then dropped, so the next caller
+// reads the TEE again. Caching the key for a TTL would be cheaper still but
+// wrong here — the key rotates on every TEE restart, and for the whole TTL
+// window after one the Hub would hand every reconnecting agent the dead key,
+// whose sealed envelopes the new TEE can no longer open. Collapsing only the
+// in-flight request has no such window.
 func (t *HTTPTEE) CredentialKey(ctx context.Context) (tee.InboxPublic, error) {
 	if t.BaseURL == "" {
 		return tee.InboxPublic{}, errors.New("hub: TEE BaseURL is empty")
 	}
-	return tee.CredentialKeyRequest(ctx, t.Client, t.BaseURL+"/v1/credential-key")
+
+	t.keyMu.Lock()
+	if t.keyCall != nil {
+		call := t.keyCall
+		t.keyMu.Unlock()
+		<-call.done
+		return call.key, call.err
+	}
+	call := &credentialKeyCall{done: make(chan struct{})}
+	t.keyCall = call
+	t.keyMu.Unlock()
+
+	call.key, call.err = tee.CredentialKeyRequest(ctx, t.Client, t.BaseURL+"/v1/credential-key")
+	close(call.done)
+
+	t.keyMu.Lock()
+	if t.keyCall == call {
+		t.keyCall = nil
+	}
+	t.keyMu.Unlock()
+	return call.key, call.err
 }
 
 // readSSE parses the response stream, handing each chunk to onChunk and
