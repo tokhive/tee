@@ -16,6 +16,7 @@ import (
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
@@ -218,6 +219,15 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("api model=%q path=%s tenant=%q err=%v", req.Model, c.route.Path, tenant, err)
 		return
 	}
+	// A committed 2xx stream is a success only when the receipt says the
+	// upstream completed it. A provider that answered 200 and then died
+	// mid-body — crash, reset, timeout after the first byte, or the TEE's own
+	// byte cap — is attested as CompletionTruncated and priced at zero. Ending
+	// such a stream with [DONE] would present a partial answer as a finished
+	// one, so on the routes that fabricate the terminator the truncation is
+	// reported like any committed failure and the marker is withheld.
+	truncated := err == nil && isSuccess() &&
+		outcome.Receipt.Receipt.Completion != proof.CompletionComplete
 	if err != nil {
 		// The response is committed. For a 2xx stream the failure is reported
 		// as an SSE error frame; for a non-2xx upstream status the upstream's
@@ -229,7 +239,10 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "event: error\ndata: %s\n\n", sseError(err))
 		}
 	}
-	if c.route.Done && isSuccess() {
+	if c.route.Done && truncated {
+		fmt.Fprintf(w, "event: error\ndata: %s\n\n", sseError(errors.New("upstream response ended before completion")))
+	}
+	if c.route.Done && isSuccess() && !truncated {
 		// OpenAI-compatible chat streams terminate with an explicit done marker,
 		// which the mock upstream does not emit. Appended after an error frame
 		// too, so a client that started reading a 2xx stream is never left

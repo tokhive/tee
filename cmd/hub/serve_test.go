@@ -282,6 +282,57 @@ func TestAllProvidersFailingBeforeAStartIsA502(t *testing.T) {
 	}
 }
 
+// TestTruncatedStreamIsNotTerminatedAsASuccess locks the mid-stream drop:
+// the upstream answered 200, relayed some content, then died. The receipt
+// attests CompletionTruncated and prices at zero, but the buyer must not see a
+// clean [DONE] — that marker says the answer arrived whole. The handler has to
+// surface the truncation as an error frame and withhold the terminator.
+func TestTruncatedStreamIsNotTerminatedAsASuccess(t *testing.T) {
+	route := userRoutes[0]
+	stream := [][]byte{[]byte("data: {\"partial\":true}\n\n")}
+	fake := &hub.ScriptedTEE{Reply: func(call int, spec jobs.Spec) (hub.Result, error) {
+		r := hub.ScriptReceipt(stream, proof.Receipt{
+			Provider:      spec.Provider,
+			StatusCode:    200,
+			Completion:    proof.CompletionTruncated,
+			ChunkCount:    1,
+			ResponseBytes: uint64(len(stream[0])),
+			ProviderSeq:   uint64(call),
+		})
+		return hub.Result{
+			Status:  200,
+			Headers: map[string][]string{"content-type": {"text/event-stream"}},
+			Chunks:  stream,
+			Receipt: proof.SignedReceipt{Receipt: r},
+		}, nil
+	}}
+	h, err := hub.New(hub.Config{
+		TEE: fake,
+		Rates: map[string]hub.RateCard{
+			"p1": {PerRequestMicros: 100},
+			"p2": {PerRequestMicros: 900},
+		},
+		Store:  hub.NewReceiptStore(t.TempDir()),
+		Verify: func(proof.SignedReceipt) error { return nil },
+	})
+	if err != nil {
+		t.Fatalf("build hub: %v", err)
+	}
+	status, body, _ := serveStatus(t, h, route, `{"model":"m"}`)
+	if status != http.StatusOK {
+		t.Errorf("status = %d, want 200 (the stream was already committed)", status)
+	}
+	if !strings.Contains(body, "data: {\"partial\":true}") {
+		t.Errorf("relayed content missing from the stream: %q", body)
+	}
+	if !strings.Contains(body, "event: error") {
+		t.Errorf("truncation must be reported as an error frame: %q", body)
+	}
+	if strings.Contains(body, "[DONE]") {
+		t.Errorf("a truncated stream must not end with [DONE]: %q", body)
+	}
+}
+
 // TestModelsEndpointShape pins the /v1/models wire contract at the serve
 // layer: JSON with a "models" array, empty (not null) when this Hub has no
 // agent gate and therefore nothing declared. Search and directory semantics
