@@ -41,62 +41,82 @@ func (ch *channel) wroteNothing() bool { return ch.wrote == 0 }
 
 // channelPool is the resident-connection pool for one (provider, host). It
 // tracks how many connections are alive and reaps those idle past the window.
+//
+// active counts every live connection (idle or checked out) and is the bound
+// the per-host cap enforces; a healthy connection keeps its slot while it is
+// idle. Waiter notification is a closed-and-replaced channel rather than a
+// bare condition variable, because an acquirer must be able to wait on "a
+// connection came back" OR "my context ended" — and a condition variable
+// cannot select on a context.
 type channelPool struct {
 	mgr *ChannelManager
 	key string
 
 	mu     sync.Mutex
-	cond   *sync.Cond
+	notify chan struct{}
 	active int
 	closed bool
 	idle   []*channel
 }
 
 func newChannelPool(mgr *ChannelManager, key string) *channelPool {
-	p := &channelPool{mgr: mgr, key: key}
-	p.cond = sync.NewCond(&p.mu)
-	return p
+	return &channelPool{mgr: mgr, key: key, notify: make(chan struct{})}
 }
 
-// getIdle returns an idle connection to reuse, or nil when there is none.
-func (p *channelPool) getIdle() *channel {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.expireIdleLocked()
-	n := len(p.idle)
-	if n == 0 {
-		return nil
-	}
-	ch := p.idle[n-1]
-	p.idle = p.idle[:n-1]
-	return ch
+// wakeLocked wakes every goroutine waiting in acquire. Caller holds p.mu.
+func (p *channelPool) wakeLocked() {
+	close(p.notify)
+	p.notify = make(chan struct{})
 }
 
-// reserveSlot waits until a slot is free for a brand-new connection, then marks
-// it used. Slot accounting mirrors the resident set: an idle connection keeps
-// its slot until it is closed.
-func (p *channelPool) reserveSlot() error {
+// acquire takes an idle connection when one exists, otherwise it reserves a
+// slot for a brand-new one — dial is true then — waiting until a connection is
+// returned to the idle set, a slot is freed, or the pool shuts down. The wait
+// honours ctx, so a caller queued behind the cap gives up promptly instead of
+// pinning its execution resources on a pool that may never free up.
+func (p *channelPool) acquire(ctx context.Context) (ch *channel, dial bool, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for p.active >= p.mgr.maxConns && !p.closed {
-		p.cond.Wait()
+	for {
+		if p.closed {
+			return nil, false, net.ErrClosed
+		}
+		p.expireIdleLocked()
+		if n := len(p.idle); n > 0 {
+			ch := p.idle[n-1]
+			p.idle = p.idle[:n-1]
+			return ch, false, nil
+		}
+		if p.active < p.mgr.maxConns {
+			p.active++
+			return nil, true, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		notify := p.notify
+		p.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			p.mu.Lock()
+			return nil, false, ctx.Err()
+		case <-notify:
+		}
+		p.mu.Lock()
 	}
-	if p.closed {
-		return net.ErrClosed
-	}
-	p.active++
-	return nil
 }
 
 // releaseSlot frees a slot reserved by a connection that failed to dial.
 func (p *channelPool) releaseSlot() {
 	p.mu.Lock()
 	p.active--
-	p.cond.Signal()
+	p.wakeLocked()
 	p.mu.Unlock()
 }
 
-// reuse returns a healthy connection to the idle set, refreshing its clock.
+// reuse returns a healthy connection to the idle set, refreshing its clock. A
+// waiter may be parked waiting for exactly this connection, so the idle set
+// growing is a wakeup event.
 func (p *channelPool) reuse(ch *channel) {
 	ch.lastUsed = time.Now()
 	p.mu.Lock()
@@ -106,6 +126,7 @@ func (p *channelPool) reuse(ch *channel) {
 		return
 	}
 	p.idle = append(p.idle, ch)
+	p.wakeLocked()
 	p.mu.Unlock()
 }
 
@@ -114,7 +135,7 @@ func (p *channelPool) drop(ch *channel) {
 	_ = ch.conn.Close()
 	p.mu.Lock()
 	p.active--
-	p.cond.Signal()
+	p.wakeLocked()
 	p.mu.Unlock()
 }
 
@@ -131,17 +152,19 @@ func (p *channelPool) expireIdle() {
 func (p *channelPool) expireIdleLocked() {
 	now := time.Now()
 	kept := p.idle[:0]
+	closedAny := false
 	for _, ch := range p.idle {
 		if now.Sub(ch.lastUsed) > p.mgr.idleTimeout {
 			p.active--
 			_ = ch.conn.Close()
+			closedAny = true
 			continue
 		}
 		kept = append(kept, ch)
 	}
 	p.idle = kept
-	if len(kept) < cap(kept) {
-		p.cond.Signal()
+	if closedAny {
+		p.wakeLocked()
 	}
 }
 
@@ -150,7 +173,7 @@ func (p *channelPool) expireIdleLocked() {
 func (p *channelPool) close() {
 	p.mu.Lock()
 	p.closed = true
-	p.cond.Broadcast()
+	p.wakeLocked()
 	idle := p.idle
 	p.idle = nil
 	p.mu.Unlock()

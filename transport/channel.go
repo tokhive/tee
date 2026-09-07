@@ -347,13 +347,27 @@ func (m *ChannelManager) poolFor(req tee.Request) *channelPool {
 	return p
 }
 
-// acquire returns an open channel, reusing an idle one or dialing a new one.
+// acquire returns an open channel for one exchange: it reuses an idle pooled
+// connection when one exists, otherwise it dials a new one under a reserved
+// slot. When the per-host cap is reached it waits — honouring ctx cancellation
+// and pool shutdown — for a returned connection or a freed slot, so a caller
+// queued behind the cap takes over the connection a busy request leaves behind
+// instead of parking forever.
 func (m *ChannelManager) acquire(ctx context.Context, req tee.Request) (*channel, error) {
 	pool := m.poolFor(req)
-	if ch := pool.getIdle(); ch != nil {
+	ch, dial, err := pool.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !dial {
 		return ch, nil
 	}
-	return m.dial(ctx, pool, req)
+	conn, err := m.dialTCP(ctx, req)
+	if err != nil {
+		pool.releaseSlot()
+		return nil, err
+	}
+	return &channel{conn: conn, br: bufio.NewReader(conn), pool: pool}, nil
 }
 
 // release returns an open channel to its pool, or closes it when keep is false.
@@ -363,21 +377,6 @@ func (m *ChannelManager) release(ch *channel, keep bool) {
 		return
 	}
 	ch.pool.reuse(ch)
-}
-
-func (m *ChannelManager) dial(ctx context.Context, pool *channelPool, req tee.Request) (*channel, error) {
-	// Reserve a slot for a brand-new connection before dialing. This bounds the
-	// resident set per (provider, host); a caller blocked here waits until an
-	// existing connection dies and frees its slot.
-	if err := pool.reserveSlot(); err != nil {
-		return nil, err
-	}
-	conn, err := m.dialTCP(ctx, req)
-	if err != nil {
-		pool.releaseSlot()
-		return nil, err
-	}
-	return &channel{conn: conn, br: bufio.NewReader(conn), pool: pool}, nil
 }
 
 // dialTCP opens the raw pipe to req.Host and wraps it in TLS when the scheme
