@@ -645,6 +645,109 @@ func TestChannelWaiterHonoursCancellation(t *testing.T) {
 	}
 }
 
+// TestChannelPoolServesABurstWithinTheCap is the saturation smoke test: many
+// concurrent requests against a cap of two must all succeed without deadlock,
+// never exceed the cap on the wire, and reuse the same two connections for the
+// whole burst.
+func TestChannelPoolServesABurstWithinTheCap(t *testing.T) {
+	var mu sync.Mutex
+	var live, peak, total int
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch state {
+		case http.StateNew:
+			total++
+			live++
+			if live > peak {
+				peak = live
+			}
+		case http.StateClosed, http.StateHijacked:
+			live--
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	cm, err := NewChannelManager(ChannelConfig{
+		Scheme:          "http",
+		AllowPlaintext:  true,
+		MaxConnsPerHost: 2,
+	})
+	if err != nil {
+		t.Fatalf("NewChannelManager: %v", err)
+	}
+	defer func() { _ = cm.Close() }()
+
+	do := poolDo(cm, hostOf(srv))
+	const requests = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, requests)
+	for i := 0; i < requests; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- do(context.Background())
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+	}
+	mu.Lock()
+	gotPeak, gotTotal := peak, total
+	mu.Unlock()
+	if gotPeak > 2 {
+		t.Errorf("server saw %d simultaneous connections, want at most 2 (the cap)", gotPeak)
+	}
+	if gotTotal != 2 {
+		t.Errorf("server saw %d connections in total, want exactly 2 (the resident set reused across the burst)", gotTotal)
+	}
+}
+
+// TestChannelRequestsRefusedAfterClose pins Close as terminal: once the manager
+// is closed, new work must fail fast with net.ErrClosed instead of silently
+// minting fresh pools and connections that no sweeper would ever reap.
+func TestChannelRequestsRefusedAfterClose(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	cm, err := NewChannelManager(ChannelConfig{
+		Scheme:          "http",
+		AllowPlaintext:  true,
+		MaxConnsPerHost: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewChannelManager: %v", err)
+	}
+	defer func() { _ = cm.Close() }()
+
+	do := poolDo(cm, hostOf(srv))
+	if err := do(context.Background()); err != nil {
+		t.Fatalf("request before close: %v", err)
+	}
+	if err := cm.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := do(context.Background()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("request after close returned %v, want net.ErrClosed", err)
+	}
+	if _, err := cm.OpenSession(context.Background(), testReq(tee.Request{Method: "GET", Host: hostOf(srv), Path: "/v1/x"})); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("OpenSession after close returned %v, want net.ErrClosed", err)
+	}
+}
+
 // TestChannelWaiterReleasesWhenThePoolCloses covers the shutdown half of the
 // wait: a request queued behind the cap must return promptly when the manager
 // is closed, rather than sleeping on a pool that is gone.
