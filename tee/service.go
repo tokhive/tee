@@ -229,6 +229,12 @@ func NewService(cfg Config) (*Service, error) {
 // error from it stops the exchange; the receipt still describes everything
 // received up to that point, marked truncated.
 //
+// onStart, when given, receives the response start — the upstream status code
+// and the allowlisted response headers — exactly once, before the first chunk.
+// It is how the Hub learns that a stream is a 200 before it relays the first
+// byte, or that it is a 401/429 before it shows the user an error. The
+// receipt binds this start regardless of whether a callback is supplied.
+//
 // An error is returned only for refusals — jobs that were never put on the
 // wire. Once the request is sent, the outcome arrives as a Result whose
 // Receipt.Completion reports what happened, and the error is nil even when the
@@ -240,7 +246,7 @@ func NewService(cfg Config) (*Service, error) {
 // back a non-nil error in that case would invite the usual
 // `if err != nil { return }` and take the evidence with it. The invariant is
 // therefore that error is non-nil if and only if Result is nil.
-func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc) (*Result, error) {
+func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onStart ...StartFunc) (*Result, error) {
 	now := s.clock()
 
 	if s.submitterVerify != nil {
@@ -310,7 +316,7 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc) (*Res
 		Timeout:          s.requestTimeout,
 	}
 
-	return s.perform(ctx, request, job.Spec, specHash, decision, seq, onChunk)
+	return s.perform(ctx, request, job.Spec, specHash, decision, seq, onChunk, onStart)
 }
 
 // injectCredential decrypts the credential envelope carried on the job and
@@ -381,9 +387,32 @@ func (s *Service) perform(
 	decision policy.Decision,
 	seq uint64,
 	onChunk ChunkFunc,
+	onStart []StartFunc,
 ) (*Result, error) {
 	hasher := proof.NewStreamingHasher(spec.JobID)
 	truncated := false
+
+	// The response start: filter the upstream headers to the relay allowlist,
+	// hash them for the receipt, and (when the caller wants it) report them
+	// before the first chunk moves. The hash is computed before the callback
+	// so a callback that panics or errors cannot desynchronise the receipt
+	// from what the Hub was shown. A zero status means the transport never
+	// produced a response (e.g. a failed handshake): there is no start to
+	// report, and nothing to attest.
+	var started bool
+	var headerHash []byte
+	start := func(resp Response) {
+		if started || resp.StatusCode == 0 {
+			return
+		}
+		started = true
+		resp.Headers = ForwardResponseHeaders(resp.Headers)
+		h := HashResponseHeaders(resp.Headers)
+		headerHash = h[:]
+		if len(onStart) > 0 && onStart[0] != nil {
+			onStart[0](resp)
+		}
+	}
 	// Total bytes/chunks the provider actually sent, counted even past the
 	// cap. The StreamHash below covers only what was relayed (so the Hub can
 	// verify the prefix it forwarded), while these totals honestly record how
@@ -425,22 +454,27 @@ func (s *Service) perform(
 	}
 
 	startedAt := s.clock().Unix()
-	response, err := s.transport.Do(ctx, request, relay)
+	response, err := s.transport.Do(ctx, request, relay, start)
 	finishedAt := s.clock().Unix()
 
 	completion := proof.CompletionComplete
 	switch {
-	case err != nil && hasher.BytesWritten() == 0:
+	case err != nil && !started && hasher.BytesWritten() == 0:
 		completion = proof.CompletionFailed
 	case err != nil, truncated:
 		completion = proof.CompletionTruncated
 	}
 
-	// A status is trustworthy only once a response actually began. Clearing it
-	// after bytes arrived would erase a real 200 that merely ran long, and
-	// that status is part of what the Hub needs to be able to prove.
+	// A status is trustworthy only once the response actually began, and
+	// `started` — not the byte count — is the marker of a begun response: the
+	// transport fires start the moment it parses the headers, before any body
+	// byte. An error after that (headers arrived, body dropped) is a truncated
+	// response with a real status, which the receipt must keep attesting:
+	// clearing it would contradict the start the Hub was already shown, and
+	// the Hub would reject every such exchange. Only when the start never
+	// fired is there truly no status to attest.
 	statusCode := response.StatusCode
-	if err != nil && hasher.BytesWritten() == 0 {
+	if err != nil && !started {
 		statusCode = 0
 	}
 
@@ -473,6 +507,11 @@ func (s *Service) perform(
 		// which is what turns a pile of individually-valid receipts into a
 		// ledger whose completeness can be checked.
 		ProviderSeq: seq,
+
+		// The response start the Hub was shown. Present exactly when the
+		// exchange produced a response, which is also exactly when the Hub can
+		// hold this receipt against the status and headers it relayed.
+		ResponseHeadersHash: headerHash,
 	}
 
 	signed, err := s.signer.Sign(receipt)

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +35,14 @@ type Result struct {
 	// Chunks are the response bytes, in order. They are what the receipt's
 	// StreamHash commits to.
 	Chunks [][]byte
+	// Status is the upstream status code from the response-start frame. Zero
+	// when the exchange never produced a response, which is also when the
+	// binding checks below are skipped.
+	Status uint32
+	// Headers are the upstream response headers the TEE relayed in the
+	// response-start frame (the allowlist, see tee.ForwardResponseHeaders).
+	// The receipt's ResponseHeadersHash commits to exactly this set.
+	Headers map[string][]string
 	// Receipt is the signed proof. Verify it before relying on it.
 	Receipt proof.SignedReceipt
 }
@@ -47,11 +56,14 @@ type Result struct {
 type TEE interface {
 	// Execute runs a job and reports the forwarded chunks and the receipt.
 	// onChunk receives each response chunk as it arrives and may be nil.
+	// onStart, when given, receives the response start — upstream status plus
+	// the relayed headers — once, before the first chunk, so the Hub can
+	// commit its own response status before relaying any body byte.
 	//
 	// On error the Result is still returned when the TEE got far enough to
 	// produce one: a job that failed mid-flight has something to prove, and
 	// the Hub needs it to show it did not get what it was paying for.
-	Execute(ctx context.Context, spec jobs.Spec, body []byte, onChunk func([]byte) error) (Result, error)
+	Execute(ctx context.Context, spec jobs.Spec, body []byte, onChunk func([]byte) error, onStart ...func(tee.Response)) (Result, error)
 
 	// OpenSession establishes a streaming session to a provider through the
 	// TEE and returns an opaque, metered tunnel (read = downlink, write =
@@ -140,7 +152,7 @@ type credentialKeyCall struct {
 }
 
 // Execute implements TEE.
-func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onChunk func([]byte) error) (Result, error) {
+func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onChunk func([]byte) error, onStart ...func(tee.Response)) (Result, error) {
 	if t.URL == "" {
 		return Result{}, errors.New("hub: TEE URL is empty")
 	}
@@ -168,7 +180,7 @@ func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onCh
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return Result{}, fmt.Errorf("tee http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
-	return readSSE(resp.Body, onChunk)
+	return readSSE(resp.Body, onChunk, onStart...)
 }
 
 // CredentialKey implements CredentialService.
@@ -213,15 +225,20 @@ func (t *HTTPTEE) CredentialKey(ctx context.Context) (tee.InboxPublic, error) {
 // Chunks are collected as well as forwarded because the Hub settles against
 // them: it must be able to show the receipt attests exactly the bytes it
 // delivered, which needs the bytes, not just the fact of delivery.
-func readSSE(r io.Reader, onChunk func([]byte) error) (Result, error) {
+//
+// The start frame is parsed into the result and reported through onStart
+// before any chunk is forwarded, so the caller can commit its response status
+// ahead of the first body byte.
+func readSSE(r io.Reader, onChunk func([]byte) error, onStart ...func(tee.Response)) (Result, error) {
 	reader := bufio.NewReader(r)
 	var (
 		eventType string
 		data      strings.Builder
 		dataLines int
-		chunks    [][]byte
+		result    Result
 		receipt   string
 		teeErr    string
+		startErr  error
 	)
 	flush := func() {
 		switch eventType {
@@ -231,10 +248,24 @@ func readSSE(r io.Reader, onChunk func([]byte) error) (Result, error) {
 			// the stream hash stop matching the receipt.
 			if dataLines > 0 {
 				payload := data.String()
-				chunks = append(chunks, []byte(payload))
+				result.Chunks = append(result.Chunks, []byte(payload))
 				if onChunk != nil {
 					_ = onChunk([]byte(payload))
 				}
+			}
+		case tee.EventStart:
+			var frame struct {
+				Status  uint32              `json:"status"`
+				Headers map[string][]string `json:"headers,omitempty"`
+			}
+			if err := json.Unmarshal([]byte(data.String()), &frame); err != nil {
+				startErr = fmt.Errorf("decode response start frame: %w", err)
+				break
+			}
+			result.Status = frame.Status
+			result.Headers = frame.Headers
+			if len(onStart) > 0 && onStart[0] != nil {
+				onStart[0](tee.Response{StatusCode: frame.Status, Headers: frame.Headers})
 			}
 		case tee.EventReceipt:
 			receipt = data.String()
@@ -273,8 +304,9 @@ func readSSE(r io.Reader, onChunk func([]byte) error) (Result, error) {
 		}
 	}
 
-	result := Result{Chunks: chunks}
 	switch {
+	case startErr != nil:
+		return result, startErr
 	case teeErr != "":
 		return result, fmt.Errorf("%w: %s", ErrTEERefused, teeErr)
 	case receipt == "":

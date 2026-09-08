@@ -7,6 +7,7 @@ import (
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
 // These tests exercise the C2 business rules — lowest-price scheduling and the
@@ -165,6 +166,48 @@ func TestExecuteForModelCommitsAfterFirstRelayedByte(t *testing.T) {
 	}
 	if fake.Calls() != 1 {
 		t.Errorf("TEE calls = %d, want 1 (dear must not be tried after cheap relayed bytes)", fake.Calls())
+	}
+}
+
+func TestExecuteForModelCommitsAfterResponseStart(t *testing.T) {
+	// The cheapest provider answers with a response start — status 401, no
+	// body byte — and completes. The start already committed the user's
+	// connection (the caller wrote the 401 the moment onStart fired), so the
+	// Hub must NOT fall back: the next provider's bytes would be written under
+	// the first provider's status and headers.
+	set := ratesTable(map[string]RateCard{
+		"cheap": {PerRequestMicros: 100},
+		"dear":  {PerRequestMicros: 900},
+	})
+	fake := &ScriptedTEE{Reply: func(call int, spec jobs.Spec) (Result, error) {
+		if spec.Provider == "cheap" {
+			r := makeReceipt(uint64(call), nil, func(r *proof.Receipt) {
+				r.Provider = spec.Provider
+				r.StatusCode = 401
+			})
+			return Result{Status: 401, Headers: map[string][]string{"content-type": {"application/json"}}, Receipt: r}, nil
+		}
+		return cardReply(call, spec, 900, false)
+	}}
+	h, _ := New(Config{TEE: fake, Rates: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
+
+	var starts int
+	out, err := h.ExecuteForModel(context.Background(), "tenant", "m", nil, buildFor, nil,
+		func(tee.Response) { starts++ })
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := out.Receipt.Receipt.Provider; got != "cheap" {
+		t.Fatalf("chosen provider = %q, want %q (committed once the start was relayed)", got, "cheap")
+	}
+	if out.StatusCode != 401 {
+		t.Errorf("outcome status = %d, want 401", out.StatusCode)
+	}
+	if starts != 1 {
+		t.Errorf("onStart fired %d times, want 1", starts)
+	}
+	if fake.Calls() != 1 {
+		t.Errorf("TEE calls = %d, want 1 (dear must not be tried after cheap's start)", fake.Calls())
 	}
 }
 

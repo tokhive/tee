@@ -165,7 +165,7 @@ func (p *channelPool) close() {
 //
 // The returned status is meaningful even when err is non-nil: a request that
 // reached the provider has a status to attest even if the body never finished.
-func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([]byte) error, bufSize int) (keep bool, status tee.Response, err error) {
+func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([]byte) error, bufSize int, onStart []tee.StartFunc) (keep bool, status tee.Response, err error) {
 	ch.wrote = 0
 
 	requestBytes, err := buildRequestBytes(req)
@@ -218,7 +218,14 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 	if err != nil {
 		return false, tee.Response{}, fmt.Errorf("read response headers: %w", err)
 	}
-	status = tee.Response{StatusCode: uint32(resp.StatusCode)}
+	status = tee.Response{StatusCode: uint32(resp.StatusCode), Headers: resp.Header}
+
+	// The response start is reported the moment the headers are parsed, before
+	// a single body byte moves: the caller must be able to commit its own
+	// status (a 200 stream vs a 401 error) ahead of the first chunk.
+	if len(onStart) > 0 && onStart[0] != nil {
+		onStart[0](status)
+	}
 
 	// "Keep" is decided before reading the body: a response signalled close
 	// (resp.Close) must not be pooled, whatever happens to the bytes after.

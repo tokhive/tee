@@ -88,6 +88,9 @@ func testReceipt(t *testing.T) Receipt {
 		Completion:    CompletionComplete,
 		StartedAt:     time.Now().Add(-time.Second).Unix(),
 		FinishedAt:    time.Now().Unix(),
+		// A normal execution receipt binds the response start it relayed, so
+		// the shared fixture carries one.
+		ResponseHeadersHash: digestOf([]byte("response headers")),
 	}
 }
 
@@ -225,6 +228,7 @@ func TestValidateRejects(t *testing.T) {
 		{"short job id", func(r *Receipt) { r.JobID = r.JobID[:8] }, ErrInvalidJobID},
 		{"short spec hash", func(r *Receipt) { r.JobSpecHash = r.JobSpecHash[:16] }, ErrInvalidJobSpecHash},
 		{"short stream hash", func(r *Receipt) { r.StreamHash = r.StreamHash[:16] }, ErrInvalidStreamHash},
+		{"short response headers hash", func(r *Receipt) { r.ResponseHeadersHash = r.ResponseHeadersHash[:8] }, ErrInvalidHeaderHash},
 		{"zero completion", func(r *Receipt) { r.Completion = CompletionUnspecified }, ErrInvalidCompletion},
 		{"undefined completion", func(r *Receipt) { r.Completion = CompletionState(9) }, ErrInvalidCompletion},
 		{"zero start", func(r *Receipt) { r.StartedAt = 0 }, ErrInvalidTimeRange},
@@ -346,18 +350,19 @@ func TestVerifyRejectsTampering(t *testing.T) {
 	// Every field of the receipt is inside the signature, so mutating any of
 	// them must break verification.
 	mutations := map[string]func(*Receipt){
-		"job id":         func(r *Receipt) { r.JobID[0] ^= 0xff },
-		"job spec hash":  func(r *Receipt) { r.JobSpecHash[0] ^= 0xff },
-		"provider":       func(r *Receipt) { r.Provider = "evil" },
-		"method":         func(r *Receipt) { r.Method = "GET" },
-		"host":           func(r *Receipt) { r.Host = "evil.example" },
-		"path":           func(r *Receipt) { r.Path = "/admin" },
-		"status code":    func(r *Receipt) { r.StatusCode = 500 },
-		"stream hash":    func(r *Receipt) { r.StreamHash[0] ^= 0xff },
-		"chunk count":    func(r *Receipt) { r.ChunkCount++ },
-		"response bytes": func(r *Receipt) { r.ResponseBytes++ },
-		"completion":     func(r *Receipt) { r.Completion = CompletionTruncated },
-		"finished at":    func(r *Receipt) { r.FinishedAt++ },
+		"job id":                func(r *Receipt) { r.JobID[0] ^= 0xff },
+		"job spec hash":         func(r *Receipt) { r.JobSpecHash[0] ^= 0xff },
+		"provider":              func(r *Receipt) { r.Provider = "evil" },
+		"method":                func(r *Receipt) { r.Method = "GET" },
+		"host":                  func(r *Receipt) { r.Host = "evil.example" },
+		"path":                  func(r *Receipt) { r.Path = "/admin" },
+		"status code":           func(r *Receipt) { r.StatusCode = 500 },
+		"stream hash":           func(r *Receipt) { r.StreamHash[0] ^= 0xff },
+		"response headers hash": func(r *Receipt) { r.ResponseHeadersHash[0] ^= 0xff },
+		"chunk count":           func(r *Receipt) { r.ChunkCount++ },
+		"response bytes":        func(r *Receipt) { r.ResponseBytes++ },
+		"completion":            func(r *Receipt) { r.Completion = CompletionTruncated },
+		"finished at":           func(r *Receipt) { r.FinishedAt++ },
 	}
 
 	for name, mutate := range mutations {
