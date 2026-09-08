@@ -1,5 +1,11 @@
 # Real SEV-SNP TEE test on AWS (`cloudtest/snp/`)
 
+> **Fork limitation**: `build` requires `deploy/secure-boot/` populated with
+> the original repo's keys (`R.key` etc.), which a fork cannot obtain. In a
+> fork, skip this module and run the main `cloudtest/run.sh` flow with
+> `TOKENHIVE_TEE_PLATFORM=simulated` (the default) — the full business flow on
+> a real SNP instance, without real attestation.
+
 This module turns the existing `simulated` cloudtest into a **real** TEE run:
 it builds a two-tier SNP loader AMI whose measured app is a TokenHive
 attestation probe, boots that AMI on a confidential (`m6a`/`c6a`/`r6a`)

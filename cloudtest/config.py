@@ -11,8 +11,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-# The only region cloudtest launches machines in.
-DEFAULT_REGION = "us-west-2"
+# The only region cloudtest launches machines in. Pinned to eu-west-1
+# (Ireland) by operator policy; do not launch in other regions.
+DEFAULT_REGION = "eu-west-1"
 
 # Tag pair that marks every resource cloudtest owns. Deletion matches on both.
 TAG_OWNER = "tokenhive-TEE"

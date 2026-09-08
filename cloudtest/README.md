@@ -14,7 +14,7 @@ cloudtest/
 ├── delete.py          模块二：按双 tag 查找并删除实例（绝不读 hosts.json，支持 --dry-run）
 ├── delete_infra.py    独立工具：按双 tag 拆掉网络基础设施（VPC/子网/IGW/安全组/密钥对，平时不要用）
 ├── run.sh             编排器：build / create / test / delete / delete-infra / 全流程
-├── lib.sh             SSH/SCP/日志等公共函数
+├── lib.sh             SSH/rsync/日志等公共函数（上传用 rsync -zz zstd，优先 homebrew rsync）
 ├── remote/run-all.sh  在实例上执行的测试套件（装依赖、起服务、跑请求、审计、打包结果）
 ├── tests/test_unit.py 本地单元测试（fake EC2，不需要 boto3，不碰真实云）
 ├── hosts.json         生成的实例信息临时文件（gitignored）
@@ -63,8 +63,9 @@ KEEP_INSTANCE=true ./run.sh # 全流程但保留机器，便于手工排查
 |---|---|---|
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | 无 | 必填（不填则创建/删除直接失败） |
 | `TOKENHIVE_USER` | **无，必填** | 实例 user 标签值，删除时精确匹配它。这是区分不同操作员机器**唯一**的边界，必须每人一个唯一值，绝不共享默认值 |
-| `TOKENHIVE_REGION` | `us-west-2` | 唯一允许启动的区域 |
+| `TOKENHIVE_REGION` | `eu-west-1` | **唯一允许启动的区域（爱尔兰）**，勿改到其他区域 |
 | `TOKENHIVE_INSTANCE_TYPE` | `m6a.large` | 必须是 AMD 系列（m6a/c6a/r6a） |
+| `TOKENHIVE_TEE_PLATFORM` | `simulated` | 实例上 TEE 的运行平台（见下） |
 
 `TOKENHIVE_USER` 未设置时 shell 层和 Python 层都会直接失败退出（不会退回任何默认值）。
 
@@ -72,9 +73,19 @@ KEEP_INSTANCE=true ./run.sh # 全流程但保留机器，便于手工排查
 
 AWS 官方文档列出 SEV-SNP 支持 AMD 实例（m6a/c6a/r6a），且首批支持区域为
 us-east-2 与 eu-west-1 [$TRAE_REF](https://documentation.ubuntu.com/aws/aws-how-to/instances/launch-and-attest-amd-sev-snp-instances/)[$TRAE_REF](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_LaunchTemplateCpuOptionsRequest.md)。
-代码默认固定在 us-west-2（按你的要求）；若 AWS 在该区域尚未开放
-`AmdSevSnp=enabled`，`run_instances` 会直接返回错误，create 步骤会明确失败并
-提示。届时可临时把 `TOKENHIVE_REGION` 覆盖为官方支持区域，或等 AWS 扩区。
+代码默认固定在 **eu-west-1**（运营规定：只允许在此区域启停服务器）；若 AWS
+在该区域尚未开放 `AmdSevSnp=enabled`，`run_instances` 会直接返回错误，create
+步骤会明确失败并提示。
+
+## 关于 R.key / secure-boot（为什么默认 simulated）
+
+本仓库是 fork，拿不到原仓库的 secure-boot 密钥（`deploy/secure-boot/` 下的
+`R.key` 等产物，`deploy/snp-build.sh` 硬性要求）。因此 `cloudtest/snp/` 的
+**真实 SEV-SNP attestation** 路径（loader AMI 构建）在本 fork 不可运行。
+主流程 `./run.sh` 不受影响：它以 `TOKENHIVE_TEE_PLATFORM=simulated`（默认）在
+真实 AMD SEV-SNP 实例上跑完整的 Hub/TEE/MockProvider/Agent mTLS 业务流、收据
+与审计，只是不做真实 attestation，也不需要任何密钥材料。将来若拿到 R.key，
+把 `.env` 里 `TOKENHIVE_TEE_PLATFORM` 改回 `sevsnp` 并先 `snp.sh build` 即可。
 
 ## 单元测试
 

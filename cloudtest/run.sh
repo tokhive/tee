@@ -48,6 +48,19 @@ test() {
   [ -x bin/tee ] || build
   log "waiting for ssh on $ip"
   wait_ssh "$ip" || { log "ssh to $ip not reachable"; exit 1; }
+  # SEV-SNP instances boot slowly: the port can accept TCP while sshd is
+  # still starting, and a first banner exchange can time out. Probe with a
+  # real command until ssh answers (up to ~5 minutes), so the suite does not
+  # fail on the boot race.
+  for _ in $(seq 1 60); do
+    remote_exec "$ip" true 2>/dev/null && break
+    sleep 5
+  done
+  remote_exec "$ip" true || { log "ssh to $ip never answered"; exit 1; }
+  # Uploads go over rsync now; the Ubuntu cloud image ships it, but install it
+  # explicitly so a stripped-down image cannot break the transfer.
+  remote_exec "$ip" "command -v rsync >/dev/null || sudo apt-get install -y -qq rsync" \
+    || { log "could not ensure rsync on $ip"; exit 1; }
   rem="$(remote_exec "$ip" 'echo $HOME' | tr -d '\r')"
   [ -n "$rem" ] || { log "could not resolve remote home"; exit 1; }
 

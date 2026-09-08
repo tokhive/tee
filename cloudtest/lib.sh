@@ -49,15 +49,31 @@ wait_ssh() { # wait_ssh ip [attempts]
 SSH_OPTS=(-i "$SCRIPT_DIR/ssh-key.pem" -o StrictHostKeyChecking=no \
   -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR)
 
+# Prefer a modern rsync for uploads: macOS ships openrsync (rsync 2.6.9
+# protocol), which only does -z. Homebrew rsync 3.x and the remote Ubuntu
+# 24.04 rsync (3.2) both speak protocol 31+, so -zz (zstd) compresses far
+# better and faster than scp for the binaries. Fall back to plain -z.
+RSYNC=rsync
+for cand in /opt/homebrew/bin/rsync /usr/local/bin/rsync rsync; do
+  if command -v "$cand" >/dev/null 2>&1; then RSYNC="$cand"; break; fi
+done
+if "$RSYNC" --version 2>/dev/null | grep -q 'protocol version 3[0-9]'; then
+  RSYNC_COMPRESS=(-zz)
+else
+  RSYNC_COMPRESS=(-z)
+fi
+
 remote_exec() { # remote_exec ip command...
   local ip="$1"; shift
   ssh "${SSH_OPTS[@]}" "ubuntu@$ip" "$@"
 }
 
 remote_push() { # remote_push ip local remote
-  scp "${SSH_OPTS[@]}" "$2" "ubuntu@$1:$3"
+  "$RSYNC" -av "${RSYNC_COMPRESS[@]}" --progress \
+    -e "ssh ${SSH_OPTS[*]}" "$2" "ubuntu@$1:$3" || exit 1
 }
 
 remote_pull() { # remote_pull ip remote local
-  scp "${SSH_OPTS[@]}" "ubuntu@$1:$2" "$3"
+  "$RSYNC" -av "${RSYNC_COMPRESS[@]}" --progress \
+    -e "ssh ${SSH_OPTS[*]}" "ubuntu@$1:$2" "$3" || exit 1
 }

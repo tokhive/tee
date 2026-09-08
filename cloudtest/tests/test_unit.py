@@ -331,7 +331,8 @@ class ConfigTest(unittest.TestCase):
         try:
             cfg = config_mod.load()
             self.assertEqual(cfg.user, "alice")
-            self.assertEqual(cfg.region, "us-west-2")
+            # Operator policy: eu-west-1 (Ireland) is the only allowed region.
+            self.assertEqual(cfg.region, "eu-west-1")
         finally:
             del os.environ["TOKENHIVE_USER"]
 
