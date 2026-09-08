@@ -32,15 +32,18 @@ var ErrInvalidRateCard = errors.New("invalid rate card")
 // RateCard is a seller's price list, in integer micro-units (1e-6 of the
 // provider's currency unit). It is Hub-side commercial data reported by the
 // seller through the Hub's own onboarding, and the Hub applies it. The receipt
-// still attests the two quantities the card prices on: the completion state
-// (key 12) and the response size (key 11) come off the TEE receipt, and the
-// model name is the one the Hub declared for the job. So a charge remains
-// reproducible by anyone holding the receipt and the card the Hub used.
+// still attests the quantities the card prices on: the completion state (key
+// 12), the response size (key 11), and the request size (key 17) come off the
+// TEE receipt, and the model name is the one the Hub declared for the job. So
+// a charge remains reproducible by anyone holding the receipt and the card the
+// Hub used.
 type RateCard struct {
 	// PerRequestMicros is charged once for a request the provider completed.
 	PerRequestMicros uint64 `json:"per_request_micros,omitempty"`
-	// PerMegabyteMicros is charged per whole mebibyte of attested response
-	// bytes, rounded up, so the smallest non-empty response bills one unit.
+	// PerMegabyteMicros is charged per whole mebibyte of attested request and
+	// response bytes combined, rounded up, so the smallest non-empty exchange
+	// bills one unit. Response volume is capped at the job's own limit: bytes
+	// the TEE counted past the cap were never delivered and are never billed.
 	PerMegabyteMicros uint64 `json:"per_megabyte_micros,omitempty"`
 	// ModelPremiumMicros adds a surcharge keyed by the model the Hub declared
 	// in the job spec. An undeclared or unlisted model pays no premium.

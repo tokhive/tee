@@ -165,7 +165,9 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 	if !ok {
 		return SessionOutcome{}, fmt.Errorf("%w: %q", ErrUnknownProvider, spec.Provider)
 	}
-	charged, err := Price(card, model, rec)
+	// Sessions are never capped by the TEE, so the receipt's ResponseBytes is
+	// exactly what was relayed; pass zero so no cap is applied.
+	charged, err := Price(card, model, 0, rec)
 	if err != nil {
 		return SessionOutcome{}, fmt.Errorf("price session: %w", err)
 	}

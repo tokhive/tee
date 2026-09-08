@@ -322,7 +322,7 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 		return Outcome{Chunks: res.Chunks}, ErrStreamMismatch
 	}
 
-	charged, err := Price(card, model, res.Receipt.Receipt)
+	charged, err := Price(card, model, spec.MaxResponseBytes, res.Receipt.Receipt)
 	if err != nil {
 		return Outcome{Chunks: res.Chunks}, err
 	}

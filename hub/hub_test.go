@@ -110,10 +110,11 @@ func TestPrice(t *testing.T) {
 	}
 
 	cases := []struct {
-		name  string
-		model string
-		edit  func(*proof.Receipt)
-		want  uint64
+		name     string
+		model    string
+		maxBytes uint64
+		edit     func(*proof.Receipt)
+		want     uint64
 	}{
 		{name: "complete 200 with empty body", want: 1_000_000},
 		{name: "model premium applies", model: "large", want: 1_250_000},
@@ -134,6 +135,16 @@ func TestPrice(t *testing.T) {
 			want: 2_000_000,
 		},
 		{
+			name: "request bytes bill input volume",
+			edit: func(r *proof.Receipt) { r.RequestBytes = mebibyte },
+			want: 1_500_000,
+		},
+		{
+			name: "input and output share one rounded unit",
+			edit: func(r *proof.Receipt) { r.RequestBytes = mebibyte - 1; r.ResponseBytes = 1 },
+			want: 1_500_000,
+		},
+		{
 			// The provider declined. The exchange happened and is attested,
 			// but nothing was delivered, so nothing is owed.
 			name: "provider 401 earns nothing",
@@ -151,9 +162,49 @@ func TestPrice(t *testing.T) {
 			want: 0,
 		},
 		{
-			name: "truncated stream earns nothing",
+			// Headers arrived, then the connection died before a byte was
+			// relayed: from the buyer's side this is indistinguishable from a
+			// failed exchange, so it earns nothing.
+			name: "truncated with no delivered bytes earns nothing",
 			edit: func(r *proof.Receipt) { r.Completion = proof.CompletionTruncated },
 			want: 0,
+		},
+		{
+			// The seller paid the upstream for the prompt and the partial
+			// response, so the buyer pays for the delivered volume — but no
+			// per-request fee: margin is earned only on completed work.
+			name: "truncated earns volume for delivered bytes",
+			edit: func(r *proof.Receipt) {
+				r.Completion = proof.CompletionTruncated
+				r.ResponseBytes = 1
+			},
+			want: 500_000,
+		},
+		{
+			name: "truncated bills request volume too",
+			edit: func(r *proof.Receipt) {
+				r.Completion = proof.CompletionTruncated
+				r.RequestBytes = mebibyte
+				r.ResponseBytes = mebibyte
+			},
+			want: 1_000_000,
+		},
+		{
+			// The TEE counts everything the provider sent, including the bytes
+			// past the cap that were never relayed; those are not billable.
+			name:     "over-cap bytes are never billed",
+			maxBytes: mebibyte,
+			edit:     func(r *proof.Receipt) { r.ResponseBytes = 2 * mebibyte },
+			want:     1_500_000,
+		},
+		{
+			name:     "truncated over-cap bills only the delivered cap",
+			maxBytes: mebibyte,
+			edit: func(r *proof.Receipt) {
+				r.Completion = proof.CompletionTruncated
+				r.ResponseBytes = 2 * mebibyte
+			},
+			want: 500_000,
 		},
 		{
 			name: "failed exchange earns nothing",
@@ -172,7 +223,7 @@ func TestPrice(t *testing.T) {
 			if tc.edit != nil {
 				tc.edit(&r)
 			}
-			got, err := Price(card, tc.model, r)
+			got, err := Price(card, tc.model, tc.maxBytes, r)
 			if err != nil {
 				t.Fatalf("Price: %v", err)
 			}
@@ -194,7 +245,7 @@ func TestPriceOverflowIsRejectedNotWrapped(t *testing.T) {
 		ResponseBytes: 1 << 60,
 	}
 
-	got, err := Price(card, "", receipt)
+	got, err := Price(card, "", 0, receipt)
 	if !errors.Is(err, ErrPriceOverflow) {
 		t.Fatalf("Price error = %v, want ErrPriceOverflow", err)
 	}
