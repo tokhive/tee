@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -330,6 +331,28 @@ func TestTruncatedStreamIsNotTerminatedAsASuccess(t *testing.T) {
 	}
 	if strings.Contains(body, "[DONE]") {
 		t.Errorf("a truncated stream must not end with [DONE]: %q", body)
+	}
+}
+
+// TestAPIErrorStatusDistinguishesSupplyOutage locks the status mapping: a
+// market with every agent offline is 503 (the model may exist; the supply is
+// what is down), a model nobody serves is 404, and quota exhaustion is 429.
+func TestAPIErrorStatusDistinguishesSupplyOutage(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"supply down", fmt.Errorf("%w: model %q", hub.ErrNoProvidersOnline, "m"), http.StatusServiceUnavailable},
+		{"unknown model", fmt.Errorf("%w: model %q", hub.ErrNoProviderForModel, "m"), http.StatusNotFound},
+		{"quota", fmt.Errorf("%w: tenant %q", hub.ErrQuotaExceeded, "t"), http.StatusTooManyRequests},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := apiErrorStatus(tc.err); got != tc.want {
+				t.Errorf("apiErrorStatus(%v) = %d, want %d", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 

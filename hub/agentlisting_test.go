@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
@@ -87,6 +88,39 @@ func TestOneOfflineAgentDoesNotHideAnother(t *testing.T) {
 	}
 	if got, _ := h.card("dear"); got.PerRequestMicros != 400 {
 		t.Fatalf("dear card = %d, want 400", got.PerRequestMicros)
+	}
+}
+
+// TestAllAgentsOfflineIsSupplyDown distinguishes an empty market from an
+// unknown model: with the agent gate configured and not a single agent
+// online, the honest answer is ErrNoProvidersOnline — the whole supply is
+// down, temporarily — rather than ErrNoProviderForModel, which would read as
+// "this model never existed". The HTTP layer maps the former to 503.
+func TestAllAgentsOfflineIsSupplyDown(t *testing.T) {
+	h := scriptedHub(t, Config{
+		Rates:       ratesTable(map[string]RateCard{"cheap": {PerRequestMicros: 1000}}),
+		AgentSecret: []byte("gate-secret"),
+	})
+
+	if _, err := h.ExecuteForModel(context.Background(), "tenant", "m", nil, buildFor, nil); !errors.Is(err, ErrNoProvidersOnline) {
+		t.Fatalf("err = %v, want ErrNoProvidersOnline when no agent is online", err)
+	}
+}
+
+// TestModelNotServedByOnlineAgentsIsNotFound covers the other half of the
+// distinction: supply is up (an agent is online) but it declared a model list
+// the request is not in — the model is simply not on the market, which stays
+// a 404-class condition.
+func TestModelNotServedByOnlineAgentsIsNotFound(t *testing.T) {
+	h := scriptedHub(t, Config{
+		Rates:       ratesTable(map[string]RateCard{"cheap": {PerRequestMicros: 1000}}),
+		AgentSecret: []byte("gate-secret"),
+	})
+	offline := agentsOnlineWith(h, "cheap", RateCard{PerRequestMicros: 250}, []string{"other-model"})
+	defer offline()
+
+	if _, err := h.ExecuteForModel(context.Background(), "tenant", "m", nil, buildFor, nil); !errors.Is(err, ErrNoProviderForModel) {
+		t.Fatalf("err = %v, want ErrNoProviderForModel when online agents do not serve the model", err)
 	}
 }
 

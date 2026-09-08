@@ -16,6 +16,25 @@ import (
 // behind a provider-specific error.
 var ErrNoProviderForModel = errors.New("no provider serves this model")
 
+// ErrNoProvidersOnline means a Hub that hosts an agent gate has no agent
+// holding a tunnel at all: the entire supply is down, not the model unknown.
+// It is the honest answer when every listing dropped (agents are tested to
+// take their listing down the moment their control stream closes), and it
+// lets the HTTP layer answer 503 instead of a 404 that would read "this model
+// never existed".
+var ErrNoProvidersOnline = errors.New("no provider is online")
+
+// supplyError picks the honest description for an empty candidate list. With
+// an agent gate configured but not a single agent online, the whole market is
+// down — a temporary condition, not a nonexistent model. Otherwise the model
+// is simply not served by anything the Hub knows.
+func (h *Hub) supplyError(model string) error {
+	if len(h.agentSecret) > 0 && len(h.agents.onlineProviders()) == 0 {
+		return fmt.Errorf("%w: model %q", ErrNoProvidersOnline, model)
+	}
+	return fmt.Errorf("%w: model %q", ErrNoProviderForModel, model)
+}
+
 // providersForModel returns the providers the Hub can route a model to, ordered
 // by their effective book price for it (ascending), with ties broken by provider
 // name so the order is a pure function of supply and price.
@@ -184,12 +203,14 @@ func (h *Hub) SearchModels(query string) []ModelQuote {
 //
 // Fallback stops the moment the response is committed to a provider — either
 // its response start has been relayed (the caller has already written that
-// provider's status and headers) or its first body byte has. Once the user has
-// seen content from provider A, switching to provider B would splice two
-// providers' transcripts into one response — a stream no client could parse
-// and no receipt would cover. A provider that fails after committing is
-// therefore final: its (truncated) outcome is returned as-is, and the caller
-// reports what it got rather than silently switching horses mid-response.
+// provider's status and headers), its first body byte has, or the attempt
+// earned anything at all. Once the user has seen content from provider A,
+// switching to provider B would splice two providers' transcripts into one
+// response — a stream no client could parse and no receipt would cover — and
+// switching after a positively priced attempt would bill the buyer twice for
+// one answer. A provider that fails after committing is therefore final: its
+// (truncated) outcome is returned as-is, and the caller reports what it got
+// rather than silently switching horses mid-response.
 //
 // build produces the job spec for a given provider: the Hub decides who to ask,
 // but the caller supplies how to phrase the ask (host, headers, body binding)
@@ -199,7 +220,7 @@ func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []
 
 	providers := h.providersForModel(model)
 	if len(providers) == 0 {
-		return Outcome{}, fmt.Errorf("%w: model %q", ErrNoProviderForModel, model)
+		return Outcome{}, h.supplyError(model)
 	}
 
 	var (
@@ -252,14 +273,22 @@ func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []
 		if Billable(last.Receipt.Receipt) {
 			return last, nil
 		}
-		// Completed but not billable — a provider that declined or errored.
-		// Try the next candidate, unless its bytes already reached the user.
+		// Completed but not billable. A truncated attempt that delivered bytes
+		// still priced above zero and was settled inside Execute; paying the
+		// next provider too would bill the buyer twice, so any positively
+		// priced outcome is final. This matters when the caller passed no
+		// callbacks — with callbacks, the relayed check below catches it.
+		if last.Charged > 0 {
+			return last, nil
+		}
+		// Nothing was paid and nothing reached the user — a provider that
+		// declined or errored. Try the next candidate.
 		if relayed {
 			return last, nil
 		}
 	}
 	if !ran {
-		return Outcome{}, fmt.Errorf("%w: model %q", ErrNoProviderForModel, model)
+		return Outcome{}, h.supplyError(model)
 	}
 	return last, err
 }

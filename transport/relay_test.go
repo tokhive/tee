@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -63,6 +64,46 @@ func TestRelayStreamDeadlineInterruptsABlockedRead(t *testing.T) {
 	if _, err := blocked.Write([]byte("x")); err == nil {
 		t.Error("write on the deadline-ended stream returned nil error")
 	}
+}
+
+// TestClearingADeadlineInvalidatesFiredCallbacks pins the generation bump on
+// the clear path. The race it prevents: a deadline fires and its callback
+// starts running — timer.Stop() then returns false, so a clear that runs
+// before the callback's generation check must still invalidate it, or the
+// callback closes a stream whose deadline was cleared. A relayed exchange
+// finishing at the deadline boundary would otherwise hand back a connection
+// that is dead on arrival.
+//
+// GOMAXPROCS(1) makes the interleaving deterministic: the fired callback can
+// only run when this goroutine blocks, which is after the clear, so the
+// callback always observes the cleared (bumped) generation.
+func TestClearingADeadlineInvalidatesFiredCallbacks(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	c := &streamConn{}
+
+	// Arm a deadline in the past: the timer fires immediately, and with one P
+	// its callback cannot run ahead of the clear below.
+	if err := c.setDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	if c.gen != 1 {
+		t.Fatalf("gen = %d after arming, want 1", c.gen)
+	}
+
+	// Clear the deadline. Must advance the generation: Stop() cannot cancel a
+	// callback that has already fired, so the bump is the only thing between
+	// the stale callback and a stream closed against an explicit clear.
+	if err := c.setDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear deadline: %v", err)
+	}
+	if c.gen != 2 {
+		t.Fatalf("gen = %d after clearing, want 2: a clear must invalidate a fired callback", c.gen)
+	}
+
+	// Let the stale callback run. With the generation bumped it sees a
+	// mismatch and never touches the stream — a nil Stream here would panic on
+	// a close, which is the failure mode the old code produced.
+	time.Sleep(10 * time.Millisecond)
 }
 
 // TestRelayDialWithoutATunnelReturnsAnError is the TEE-03 regression: when the

@@ -169,6 +169,49 @@ func TestExecuteForModelCommitsAfterFirstRelayedByte(t *testing.T) {
 	}
 }
 
+func TestExecuteForModelStopsAfterPaidTruncatedAttempt(t *testing.T) {
+	// A truncated attempt that delivered bytes is settled inside Execute. If
+	// the scheduler then fell back to the next provider, the buyer would be
+	// billed for the truncated work AND the fallback's full answer, while the
+	// returned outcome would only show the second charge. This covers the
+	// no-callbacks caller, where the relayed-flag guard cannot fire (nothing
+	// is being relayed) — the positive price itself must be final.
+	set := ratesTable(map[string]RateCard{
+		"a": {PerRequestMicros: 100, PerMegabyteMicros: 500_000},
+		"b": {PerRequestMicros: 100, PerMegabyteMicros: 500_000},
+	})
+	truncated := chunks("x")
+	fake := &ScriptedTEE{Reply: func(call int, spec jobs.Spec) (Result, error) {
+		if call == 1 {
+			r := makeReceipt(uint64(call), truncated, func(r *proof.Receipt) {
+				r.Provider = spec.Provider
+				r.Completion = proof.CompletionTruncated
+			})
+			return Result{Chunks: truncated, Receipt: r}, nil
+		}
+		t.Fatal("scheduler dispatched a second provider after a positively priced attempt")
+		return Result{}, nil
+	}}
+	h, _ := New(Config{TEE: fake, Rates: set, Store: NewReceiptStore(t.TempDir()), Verify: acceptAll})
+
+	out, err := h.ExecuteForModel(context.Background(), "tenant", "m", nil, buildFor, nil)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if out.Receipt.Receipt.Completion != proof.CompletionTruncated {
+		t.Fatalf("completion = %v, want truncated (the paid attempt is the final one)", out.Receipt.Receipt.Completion)
+	}
+	if out.Charged != 500_000 {
+		t.Errorf("charged = %d, want 500_000 (volume for the relayed byte)", out.Charged)
+	}
+	if fake.Calls() != 1 {
+		t.Errorf("TEE calls = %d, want 1: no second provider after a paid truncation", fake.Calls())
+	}
+	if snap := h.Ledger().Snapshot(); snap.Settled != 1 {
+		t.Errorf("settled = %d, want 1: the buyer is billed exactly once", snap.Settled)
+	}
+}
+
 func TestExecuteForModelCommitsAfterResponseStart(t *testing.T) {
 	// The cheapest provider answers with a response start — status 401, no
 	// body byte — and completes. The start already committed the user's

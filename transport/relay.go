@@ -184,6 +184,14 @@ func (c *streamConn) SetWriteDeadline(t time.Time) error { return c.setDeadline(
 func (c *streamConn) setDeadline(t time.Time) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Every deadline change advances the generation — including a clear to
+	// zero. A fired timer's callback may already be running and parked on mu
+	// when Stop() returns false (it cannot stop a callback that has started);
+	// without the bump here it would then observe the same generation and
+	// close a stream whose deadline was cleared — a relayed exchange that
+	// finished at the deadline boundary would hand back a connection that is
+	// dead on arrival. The bump turns that stale callback into a no-op.
+	c.gen++
 	if c.timer != nil {
 		c.timer.Stop()
 		c.timer = nil
@@ -191,7 +199,6 @@ func (c *streamConn) setDeadline(t time.Time) error {
 	if t.IsZero() {
 		return nil
 	}
-	c.gen++
 	gen := c.gen
 	c.timer = time.AfterFunc(time.Until(t), func() {
 		c.mu.Lock()

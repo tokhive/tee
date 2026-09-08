@@ -46,17 +46,21 @@ func Billable(r proof.Receipt) bool {
 //
 // Every quantity is attested: completion state, request size, and response
 // size come off the receipt, and the model is the one the Hub declared into
-// the job spec, which the job spec hash binds. That makes a charge reproducible
-// by anyone holding the receipt and the card the Hub applied — a Hub that pays
-// a provider less than its published card specifies produces a number that
-// does not reconcile.
+// the job spec, which the job spec hash binds. The response volume is bounded
+// by relayedBytes — the length of the stream the Hub actually relayed, which
+// the receipt's StreamHash binds to exactly those bytes — so a charge stays
+// reproducible by anyone holding the receipt, the card, and the relayed
+// stream: a Hub that pays a provider less than its published card specifies
+// produces a number that does not reconcile.
 //
-// maxResponseBytes is the job's response cap, taken from the spec the receipt
-// was signed against. The TEE attests in ResponseBytes everything the provider
-// sent — including the bytes past the cap that were relayed to nobody — so
-// pricing must never bill past the cap: a buyer pays for what was delivered,
-// not what overflowed it. Pass zero when there is no cap to apply (streaming
-// sessions, whose ResponseBytes is exactly what was relayed).
+// relayedBytes is the actual delivered response length, not the job's cap.
+// The TEE rejects whole chunks that cross MaxResponseBytes (the overflow is
+// attested in ResponseBytes but relayed to nobody), so the delivered prefix
+// can end far below the cap — or at zero, when the first chunk is already too
+// large — and ResponseBytes can exceed it. Billing against either number
+// would charge the buyer for bytes never received; the relayed length is the
+// only one that is what the buyer got. For a streaming session, whose
+// ResponseBytes is exactly what was relayed, pass the relayed count as-is.
 //
 // What earns what:
 //   - A completed success (2xx, or session 101) earns the flat per-request fee,
@@ -72,7 +76,7 @@ func Billable(r proof.Receipt) bool {
 //
 // A receipt that earns nothing prices at zero rather than erroring: refusal to
 // pay is a normal outcome, not a failure.
-func Price(card RateCard, declaredModel string, maxResponseBytes uint64, r proof.Receipt) (uint64, error) {
+func Price(card RateCard, declaredModel string, relayedBytes uint64, r proof.Receipt) (uint64, error) {
 	if r.Completion != proof.CompletionComplete && r.Completion != proof.CompletionTruncated {
 		return 0, nil
 	}
@@ -80,9 +84,12 @@ func Price(card RateCard, declaredModel string, maxResponseBytes uint64, r proof
 		return 0, nil
 	}
 
+	// The receipt attests everything the provider sent; the Hub relayed a
+	// prefix of it. The buyer pays for the intersection: never more than the
+	// receipt claims, never more than was actually delivered.
 	delivered := r.ResponseBytes
-	if maxResponseBytes > 0 && delivered > maxResponseBytes {
-		delivered = maxResponseBytes
+	if relayedBytes < delivered {
+		delivered = relayedBytes
 	}
 	if r.Completion == proof.CompletionTruncated && delivered == 0 {
 		return 0, nil
