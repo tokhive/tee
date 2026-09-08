@@ -88,8 +88,24 @@ func main() {
 
 	store := hub.NewReceiptStore(filepath.Join(shared.ConfigDir(), "receipts"))
 
+	teeTLS, err := buildTEEClientTLS(*mtlsCA, *mtlsCert, *mtlsKey)
+	if err != nil {
+		log.Fatalf("tee mtls: %v", err)
+	}
+	// -audit never talks to -tee, so the https:// constraint on the execute
+	// channel does not apply to it; the mTLS client is still built so remote
+	// evidence fetches trust the same pinned RA-TLS certificate.
+	if teeTLS != nil && !strings.HasPrefix(*teeURL, "https://") && !*audit {
+		log.Fatalf("-mtls-ca pins the TEE certificate, so -tee must be an https:// URL (got %q)", *teeURL)
+	}
+	var httpClient *http.Client
+	var teeDialer *websocket.Dialer
+	if teeTLS != nil {
+		httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: teeTLS}}
+		teeDialer = &websocket.Dialer{TLSClientConfig: teeTLS}
+	}
 	if *audit {
-		runAudit(store, *provider, *allowed, *expectedApp, *policyHash, *evFetchURL)
+		runAudit(store, *provider, *allowed, *expectedApp, *policyHash, *evFetchURL, httpClient)
 		return
 	}
 
@@ -108,20 +124,6 @@ func main() {
 			log.Fatalf("quota: %v", err)
 		}
 	}
-
-	teeTLS, err := buildTEEClientTLS(*mtlsCA, *mtlsCert, *mtlsKey)
-	if err != nil {
-		log.Fatalf("tee mtls: %v", err)
-	}
-	if teeTLS != nil && !strings.HasPrefix(*teeURL, "https://") {
-		log.Fatalf("-mtls-ca pins the TEE certificate, so -tee must be an https:// URL (got %q)", *teeURL)
-	}
-	var httpClient *http.Client
-	var teeDialer *websocket.Dialer
-	if teeTLS != nil {
-		httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: teeTLS}}
-		teeDialer = &websocket.Dialer{TLSClientConfig: teeTLS}
-	}
 	teeClient := &hub.HTTPTEE{
 		URL:        *teeURL + "/v1/execute",
 		SessionURL: wsEndpoint(*teeURL, "/v1/session"),
@@ -129,7 +131,7 @@ func main() {
 		Client:     httpClient,
 		Dialer:     teeDialer,
 	}
-	verifier, err := buildVerifier(*allowed, *expectedApp, *policyHash, *evFetchURL)
+	verifier, err := buildVerifier(*allowed, *expectedApp, *policyHash, *evFetchURL, httpClient)
 	if err != nil {
 		log.Fatalf("attestation: %v", err)
 	}
@@ -239,8 +241,8 @@ func printLedger(ledger *hub.Ledger) {
 	}
 }
 
-func runAudit(store *hub.ReceiptStore, provider, allowed, expectedApp, policyHash, evFetchURL string) {
-	verifier, err := buildVerifier(allowed, expectedApp, policyHash, evFetchURL)
+func runAudit(store *hub.ReceiptStore, provider, allowed, expectedApp, policyHash, evFetchURL string, evClient *http.Client) {
+	verifier, err := buildVerifier(allowed, expectedApp, policyHash, evFetchURL, evClient)
 	if err != nil {
 		log.Fatalf("attestation: %v", err)
 	}
@@ -292,11 +294,29 @@ func buildTEEClientTLS(caFile, certFile, keyFile string) (*tls.Config, error) {
 // buildVerifier assembles the attestation trust root from the operator's
 // allowlist. A platform the operator advertises as trusted but that has no
 // evidence verifier wired here is a wiring error and fails loudly at startup,
-// not at the first receipt.
-func buildVerifier(allowed, expectedApp, policyHash, evFetchURL string) (*attest.Verifier, error) {
+// not at the first receipt. AWS SEV-SNP is additionally refused without a
+// valid application pin: platform authenticity alone is not an image trust
+// root, so an allowlist entry without -expected-app would accept receipts
+// from any hardware-valid SNP application.
+func buildVerifier(allowed, expectedApp, policyHash, evFetchURL string, evClient *http.Client) (*attest.Verifier, error) {
 	lists, err := splitCSV(allowed)
 	if err != nil {
 		return nil, err
+	}
+	for _, p := range lists {
+		if p != platform.PlatformAWSSEVSNP {
+			continue
+		}
+		digest := strings.TrimPrefix(expectedApp, "snp-app:")
+		if digest == expectedApp {
+			return nil, fmt.Errorf("-allowed-platforms includes %q: -expected-app must pin the attested application identity as snp-app:<sha256 hex>", platform.PlatformAWSSEVSNP)
+		}
+		if len(digest) != 64 {
+			return nil, fmt.Errorf("-expected-app %q is not a valid snp-app:<sha256 hex> pin", expectedApp)
+		}
+		if _, err := hex.DecodeString(digest); err != nil {
+			return nil, fmt.Errorf("-expected-app %q is not a valid snp-app:<sha256 hex> pin", expectedApp)
+		}
 	}
 	byPlatform := map[string]platform.EvidenceVerifier{
 		simulated.Platform: simulated.Verifier{},
@@ -308,7 +328,7 @@ func buildVerifier(allowed, expectedApp, policyHash, evFetchURL string) (*attest
 		platform.PlatformAlibabaCloud: alicloud.Verifier{},
 		platform.PlatformTencentCloud: tencent.Verifier{},
 	}
-	fetcher, err := buildFetcher(evFetchURL)
+	fetcher, err := buildFetcher(evFetchURL, evClient)
 	if err != nil {
 		return nil, err
 	}
@@ -355,15 +375,17 @@ func splitCSV(s string) ([]string, error) {
 // buildFetcher assembles the evidence retrieval path in resolution order: the
 // in-memory cache of epochs this process has verified, then the restart-surviving
 // local store, then an optional remote /v1/evidence endpoint. Each layer is
-// tried in turn until one holds the bytes.
-func buildFetcher(evFetchURL string) (attest.Fetcher, error) {
+// tried in turn until one holds the bytes. The remote layer reuses the Hub's
+// mTLS client so it trusts the same pinned RA-TLS certificate and presents the
+// same client certificate as the Hub↔TEE channel.
+func buildFetcher(evFetchURL string, evClient *http.Client) (attest.Fetcher, error) {
 	backend := &evidence.Chain{}
 	backend.Add(&evidenceCache)
 	if store, err := shared.LoadEvidenceStore(); err == nil {
 		backend.Add(store)
 	}
 	if evFetchURL != "" {
-		httpFetcher, err := evidence.NewHTTPFetcher(evFetchURL)
+		httpFetcher, err := evidence.NewHTTPFetcher(evFetchURL, evClient)
 		if err != nil {
 			return nil, err
 		}

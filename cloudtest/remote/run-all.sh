@@ -22,6 +22,21 @@ case "$TEE_PLATFORM" in
   *)      ALLOWED_PLATFORM=simulated ;;
 esac
 
+# The Hub must pin the attested application identity (snp-app:<digest>) before
+# it may trust aws-sev-snp. Real SNP evidence only exists under the loader,
+# which exports SNP_APP_HASH (bare hex digest of the measured bundle); refuse
+# to run when it is absent rather than let the Hub accept any SNP app.
+EXPECTED_APP=""
+if [ "$TEE_PLATFORM" = "sevsnp" ]; then
+  if [ -z "${SNP_APP_HASH:-}" ]; then
+    echo "!! TEE_PLATFORM=sevsnp requires SNP_APP_HASH (exported by the SNP loader)"
+    exit 1
+  fi
+  EXPECTED_APP="snp-app:$SNP_APP_HASH"
+fi
+EXPECTED_ARG=()
+[ -n "$EXPECTED_APP" ] && EXPECTED_ARG=(-expected-app "$EXPECTED_APP")
+
 echo "==> installing system dependencies"
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends ca-certificates curl >/dev/null
@@ -56,14 +71,17 @@ if [ ! -s "$SIM/tee-cert.pem" ]; then
   exit 1
 fi
 
+FAILED=0
 echo "==> driving 3 requests over mTLS (Hub pins the attested TEE cert)"
 ./hub -tee https://127.0.0.1:18090 -mtls-ca "$SIM/tee-cert.pem" \
   -credential sk-cloudtest-secret -n 3 -allowed-platforms "$ALLOWED_PLATFORM" \
-  >"$RESULTS/hub.log" 2>&1 || echo "!! hub run failed (see $RESULTS/hub.log)"
+  "${EXPECTED_ARG[@]}" >"$RESULTS/hub.log" 2>&1 \
+  || { echo "!! hub run failed (see $RESULTS/hub.log)"; tail -20 "$RESULTS/hub.log"; FAILED=1; }
 
 echo "==> auditing the receipt store as $ALLOWED_PLATFORM"
-./hub -audit -allowed-platforms "$ALLOWED_PLATFORM" >"$RESULTS/audit.log" 2>&1 \
-  || echo "!! audit failed (see $RESULTS/audit.log)"
+./hub -audit -allowed-platforms "$ALLOWED_PLATFORM" "${EXPECTED_ARG[@]}" \
+  >"$RESULTS/audit.log" 2>&1 \
+  || { echo "!! audit failed (see $RESULTS/audit.log)"; tail -20 "$RESULTS/audit.log"; FAILED=1; }
 
 echo "==> collecting artifacts"
 cp -r "$SIM/receipts" "$RESULTS/" 2>/dev/null || true
@@ -77,3 +95,4 @@ wait 2>/dev/null
 cd "$HOME"
 tar czf tokenhive-results.tar.gz -C tokenhive-results . 2>/dev/null
 echo "==> artifacts bundled at $HOME/tokenhive-results.tar.gz"
+exit "$FAILED"

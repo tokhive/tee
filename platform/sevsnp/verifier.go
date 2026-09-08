@@ -56,10 +56,12 @@ func (v Verifier) CheckEvidence(id platform.Identity) error {
 	return nil
 }
 
-// CheckEvidenceForDeployment is CheckEvidence. On a real SEV-SNP enclave the
-// policy configuration ships inside the measured image, so the hardware
-// measurement of the application image already covers it; there is no separate
-// deployment binding to assert. The parameter exists for interface symmetry.
+// CheckEvidenceForDeployment refuses deployment-bound verification. The
+// deployment's policy files are loaded at runtime from outside the measured
+// bundle, so this verifier cannot attest the supplied digest: accepting any
+// evidence here would let two deployments with different policies pass the
+// same hardware check. Callers that need the binding must pin the policy
+// digest where the platform can prove it.
 func (v Verifier) CheckEvidenceForDeployment(id platform.Identity, _ [32]byte) error {
-	return v.CheckEvidence(id)
+	return errors.New("aws sev-snp evidence cannot attest the deployment policy set: policy files are loaded at runtime, outside the measured bundle")
 }

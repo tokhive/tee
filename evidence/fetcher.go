@@ -83,13 +83,19 @@ type HTTPFetcher struct {
 }
 
 // NewHTTPFetcher returns a fetcher that resolves evidence from base,
-// e.g. "https://tee:18090".
-func NewHTTPFetcher(base string) (*HTTPFetcher, error) {
+// e.g. "https://tee:18090". client performs the requests: pass the
+// deployment's mTLS client (pinning the TEE's RA-TLS certificate and
+// presenting the Hub client certificate) when the endpoint is served with
+// -mtls, or nil for a default client.
+func NewHTTPFetcher(base string, client *http.Client) (*HTTPFetcher, error) {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	if base == "" {
 		return nil, fmt.Errorf("evidence: empty fetch base URL")
 	}
-	return &HTTPFetcher{baseURL: base, client: &http.Client{}}, nil
+	if client == nil {
+		client = &http.Client{}
+	}
+	return &HTTPFetcher{baseURL: base, client: client}, nil
 }
 
 // Fetch resolves id.EvidenceHash against the peer's /v1/evidence endpoint. The

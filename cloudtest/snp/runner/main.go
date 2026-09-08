@@ -59,9 +59,13 @@ func runProbe() int {
 		fmt.Fprintln(os.Stderr, "SNP_TEST_RESULT matched=no reason=verify error:", verr)
 		return 1
 	}
-	if !strings.EqualFold(app, appHash) {
+	// The verifier returns the identity in its documented snp-app:<hex> form,
+	// while SNP_APP_HASH is the bare loader-exported digest; strip the prefix
+	// before comparing.
+	recovered := strings.TrimPrefix(app, shared.SEVSNPAppPrefix)
+	if !strings.EqualFold(recovered, appHash) {
 		fmt.Fprintf(os.Stderr, "SNP_TEST_RESULT matched=no reason=hash-mismatch attestation_type=%s env_hash=%s recovered=%s\n",
-			attType, appHash, app)
+			attType, appHash, recovered)
 		return 1
 	}
 	fmt.Printf("SNP_TEST_RESULT matched=yes attestation_type=%s app_hash=%s\n", attType, appHash)

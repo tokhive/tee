@@ -118,7 +118,7 @@ func TestHTTPFetcherRoundTrip(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	f, err := NewHTTPFetcher(server.URL)
+	f, err := NewHTTPFetcher(server.URL, nil)
 	if err != nil {
 		t.Fatalf("NewHTTPFetcher: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestHTTPFetcherMiss(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
-	f, _ := NewHTTPFetcher(server.URL)
+	f, _ := NewHTTPFetcher(server.URL, nil)
 	_, err = f.Fetch(context.Background(), platform.Identity{EvidenceHash: sha256.Sum256([]byte("absent"))})
 	if !errors.Is(err, ErrNoEvidence) {
 		t.Fatalf("Fetch = %v, want ErrNoEvidence", err)
@@ -160,7 +160,7 @@ func TestHTTPFetcherRefusesWrongBytes(t *testing.T) {
 	defer server.Close()
 
 	id := platform.Identity{EvidenceHash: sha256.Sum256([]byte("expected"))}
-	f, _ := NewHTTPFetcher(server.URL)
+	f, _ := NewHTTPFetcher(server.URL, nil)
 	if _, err := f.Fetch(context.Background(), id); err == nil {
 		t.Fatal("Fetch accepted evidence that does not match the requested hash")
 	}
