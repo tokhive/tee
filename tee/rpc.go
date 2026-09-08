@@ -3,6 +3,7 @@ package tee
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,12 +14,29 @@ import (
 )
 
 // The Hub↔TEE interface is a single RPC: POST /v1/execute carrying a canonical
-// ExecuteRequest, answered by an SSE stream of response chunks terminated by a
-// receipt frame. Everything else — pricing, quota, scheduling — lives on the
-// Hub side of this seam.
+// ExecuteRequest, answered by an SSE stream with three kinds of frame in a
+// fixed order:
+//
+//  1. 响应开始 — event: start, one frame carrying the upstream status code and
+//     the allowlisted response headers (see ForwardResponseHeaders), emitted
+//     before any chunk. This is what lets the Hub decide how to handle the
+//     stream before its first byte: a 200 with text/event-stream is relayed
+//     as a stream, a 401 or 429 is surfaced as the error it is.
+//  2. 响应片段 — data: frames carrying the raw response body, unchanged. The
+//     receipt's stream hash commits to exactly these bytes.
+//  3. 执行结束 — event: receipt, the signed proof of the exchange. The receipt
+//     binds all three parts: the status (StatusCode), the forwarded headers
+//     (ResponseHeadersHash), and the body (StreamHash).
+//
+// Everything else — pricing, quota, scheduling — lives on the Hub side of
+// this seam.
 const (
 	// ExecuteContentType is the request content type of the single RPC.
 	ExecuteContentType = "application/cbor"
+
+	// EventStart names the first frame of a response: the upstream status code
+	// plus the response headers the Hub is allowed to see, as JSON.
+	EventStart = "start"
 
 	// EventReceipt names the final SSE frame, whose data is the base64 of a
 	// canonical SignedReceipt.
@@ -29,6 +47,15 @@ const (
 	// case loses the reason; they are deliberately distinct.
 	EventError = "error"
 )
+
+// startFrame is the JSON payload of an EventStart frame. Headers are a map so
+// the encoding matches Go's http.Header shape; values keep the order the
+// upstream sent them in. JSON escapes newlines, so the whole frame fits one
+// SSE data line.
+type startFrame struct {
+	Status  uint32              `json:"status"`
+	Headers map[string][]string `json:"headers,omitempty"`
+}
 
 // ExecuteRequest is the body of POST /v1/execute: a canonical JobSpec plus the
 // raw request bytes the TEE will send to the provider.
@@ -86,8 +113,14 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	}
+	onStart := func(resp Response) {
+		writeStartFrame(w, resp)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
 
-	res, err := svc.Execute(r.Context(), req.Job(), onChunk)
+	res, err := svc.Execute(r.Context(), req.Job(), onChunk, onStart)
 	if err != nil {
 		writeEvent(w, flusher, EventError, err.Error())
 		return
@@ -98,6 +131,22 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeEvent(w, flusher, EventReceipt, base64.StdEncoding.EncodeToString(enc))
+}
+
+// writeStartFrame emits the response-start frame: the upstream status and the
+// allowlisted headers, as JSON on a single data line. It is always written
+// before the first chunk frame, so a caller can commit its own response
+// status before relaying a single body byte.
+func writeStartFrame(w io.Writer, resp Response) {
+	frame := startFrame{Status: resp.StatusCode, Headers: resp.Headers}
+	enc, err := json.Marshal(frame)
+	if err != nil {
+		// Header names and values are strings; json.Marshal cannot fail on
+		// them. A defensive fallback keeps a corrupt header from killing the
+		// whole stream.
+		enc = []byte(`{"status":` + fmt.Sprint(resp.StatusCode) + `}`)
+	}
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", EventStart, enc)
 }
 
 // writeChunkFrame emits one response chunk as an SSE data event.

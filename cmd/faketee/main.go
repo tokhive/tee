@@ -41,17 +41,35 @@ var mockChunks = []string{
 // genuine one so the Hub-side logic is tested against real semantics.
 type scriptedTransport struct{}
 
-func (scriptedTransport) Do(ctx context.Context, req tee.Request, onChunk func([]byte) error) (tee.Response, error) {
+// fakeHeaders mirrors what a real OpenAI-compatible upstream sends on a 200:
+// the SSE content type. The 401/429 fault paths carry the JSON content type
+// and a retry hint, so the harness can assert the Hub relays them verbatim.
+var fakeHeaders = map[string][]string{
+	"content-type": {"text/event-stream"},
+}
+
+func (scriptedTransport) Do(ctx context.Context, req tee.Request, onChunk func([]byte) error, onStart ...tee.StartFunc) (tee.Response, error) {
 	fault := queryParam(req.Query, "fault")
+
+	start := func(status uint32, headers map[string][]string) tee.Response {
+		resp := tee.Response{StatusCode: status, Headers: headers}
+		if len(onStart) > 0 && onStart[0] != nil {
+			onStart[0](resp)
+		}
+		return resp
+	}
 
 	// Provider returned an error status. Like the real transport, this is NOT
 	// an error from the exchange's point of view — the bytes arrived, the
 	// provider just declined. The receipt records the status code.
 	switch fault {
 	case "401":
-		return tee.Response{StatusCode: 401}, nil
+		return start(401, map[string][]string{"content-type": {"application/json"}}), nil
 	case "429":
-		return tee.Response{StatusCode: 429}, nil
+		return start(429, map[string][]string{
+			"content-type": {"application/json"},
+			"retry-after":  {"30"},
+		}), nil
 	}
 
 	emit := func() error {
@@ -70,6 +88,7 @@ func (scriptedTransport) Do(ctx context.Context, req tee.Request, onChunk func([
 
 	// Normal completion.
 	if fault != "truncate" {
+		start(200, fakeHeaders)
 		if err := emit(); err != nil {
 			return tee.Response{StatusCode: 200}, err
 		}
@@ -79,6 +98,7 @@ func (scriptedTransport) Do(ctx context.Context, req tee.Request, onChunk func([
 	// Mid-stream disconnect: relay the first two chunks, then fail the
 	// connection the way a dropped provider socket would. The TEE attests the
 	// partial transcript as CompletionTruncated.
+	start(200, fakeHeaders)
 	for i, c := range mockChunks {
 		if i == 2 {
 			break

@@ -41,6 +41,9 @@ func TestSimReceiptWithinBudget(t *testing.T) {
 		PolicyHash:    make([]byte, 32),
 		RequestBytes:  128,
 		ProviderSeq:   1,
+		// The response-start binding is part of a normal execution receipt, so
+		// the budget gate must include it.
+		ResponseHeadersHash: make([]byte, 32),
 	}
 
 	signed, err := signer.Sign(receipt)

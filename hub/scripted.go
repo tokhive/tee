@@ -7,6 +7,7 @@ import (
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
 // ScriptedTEE is an in-memory stand-in for the TEE, for exercising Hub
@@ -42,10 +43,14 @@ type ScriptedTEE struct {
 
 // Execute implements TEE.
 //
-// Chunks are forwarded before an error is returned, matching the real TEE: a
-// job that failed mid-flight still delivered bytes, and the Hub has to be able
-// to prove what it got.
-func (s *ScriptedTEE) Execute(_ context.Context, spec jobs.Spec, _ []byte, onChunk func([]byte) error) (Result, error) {
+// A result whose Status is non-zero implies a response start: the receipt is
+// bound to that start (its ResponseHeadersHash is filled in from the result's
+// Headers, exactly as the real TEE signs what it forwarded), and onStart fires
+// before the chunks, matching the real TEE's frame order. Chunks are forwarded
+// before an error is returned, matching the real TEE: a job that failed
+// mid-flight still delivered bytes, and the Hub has to be able to prove what
+// it got.
+func (s *ScriptedTEE) Execute(_ context.Context, spec jobs.Spec, _ []byte, onChunk func([]byte) error, onStart ...func(tee.Response)) (Result, error) {
 	s.mu.Lock()
 	s.calls++
 	call := s.calls
@@ -55,12 +60,23 @@ func (s *ScriptedTEE) Execute(_ context.Context, spec jobs.Spec, _ []byte, onChu
 		return Result{}, errors.New("scripted tee has no Reply set")
 	}
 	res, err := s.Reply(call, spec)
+	if res.Status != 0 {
+		// Bind the receipt to the start the Hub is about to be shown. The
+		// receipt may already carry a hash (a test that crafts one); filling
+		// it only when empty would let a stale hash survive, so the start
+		// always wins — it is the ground truth for what the Hub acted on.
+		h := tee.HashResponseHeaders(res.Headers)
+		res.Receipt.Receipt.ResponseHeadersHash = h[:]
+		if len(onStart) > 0 && onStart[0] != nil {
+			onStart[0](tee.Response{StatusCode: res.Status, Headers: res.Headers})
+		}
+	}
 	for _, chunk := range res.Chunks {
 		if onChunk == nil {
 			break
 		}
 		if cerr := onChunk(chunk); cerr != nil {
-			return Result{Chunks: res.Chunks}, cerr
+			return Result{Chunks: res.Chunks, Status: res.Status, Headers: res.Headers}, cerr
 		}
 	}
 	return res, err

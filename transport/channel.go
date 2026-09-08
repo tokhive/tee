@@ -218,7 +218,7 @@ func (m *ChannelManager) reapIdle() {
 //
 // An error from onChunk aborts the read; the connection is discarded because
 // half a transcript must never be reused as if it were whole.
-func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(chunk []byte) error) (tee.Response, error) {
+func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(chunk []byte) error, onStart ...tee.StartFunc) (tee.Response, error) {
 	if m.isClosed() {
 		return tee.Response{}, net.ErrClosed
 	}
@@ -235,7 +235,7 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 	if err != nil {
 		return tee.Response{}, err
 	}
-	keep, status, err := ch.exchange(ctx, req, onChunk, m.readBufSize)
+	keep, status, err := ch.exchange(ctx, req, onChunk, m.readBufSize, onStart)
 	if err != nil && ch.wroteNothing() {
 		// A dead pooled socket cost this request nothing but the excursion.
 		// Nothing left the TEE, so re-dial exactly once instead of failing.
@@ -244,7 +244,7 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 		if err != nil {
 			return tee.Response{}, err
 		}
-		keep, status, err = ch.exchange(ctx, req, onChunk, m.readBufSize)
+		keep, status, err = ch.exchange(ctx, req, onChunk, m.readBufSize, onStart)
 	}
 	m.release(ch, keep)
 	return status, err

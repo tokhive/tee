@@ -59,9 +59,19 @@ type Request struct {
 // The body is never materialised here. It flows through the chunk callback as
 // it arrives so that a long stream can be relayed and digested without ever
 // being held in memory in full.
+//
+// Headers are the full upstream header set as parsed. The service filters it
+// down to the relay allowlist (see ForwardResponseHeaders) before the start
+// callback fires, so the Hub only ever sees headers the receipt will attest.
 type Response struct {
 	StatusCode uint32
+	Headers    map[string][]string
 }
+
+// StartFunc is the shape of the response-start callback. It is invoked once,
+// after the response headers have been parsed and before the first chunk, with
+// the status and the allowlisted headers the Hub may act on.
+type StartFunc func(Response)
 
 // Transport performs one provider request.
 //
@@ -71,10 +81,15 @@ type Response struct {
 // caller does not want the body at all — the service still digests it, which
 // is the whole point of the receipt.
 //
+// The start callback (variadic so existing callers that only move bytes are
+// unchanged) is invoked exactly once, after the response headers are parsed
+// and before the first chunk. nil or omitted means the caller discards the
+// start; the service still hashes the headers into the receipt either way.
+//
 // Implementations must not retry. A retry would send the credential twice and
 // produce a response that no longer corresponds to a single signed execution.
 type Transport interface {
-	Do(ctx context.Context, req Request, onChunk func(chunk []byte) error) (Response, error)
+	Do(ctx context.Context, req Request, onChunk func(chunk []byte) error, onStart ...StartFunc) (Response, error)
 }
 
 // ChunkFunc is the shape of the per-chunk callback. It exists so that callers

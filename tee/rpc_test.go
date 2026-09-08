@@ -7,6 +7,22 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 )
 
+// TestWriteStartFrame pins the exact bytes of the response-start frame: the
+// upstream status and the relayed headers as JSON on one data line, emitted
+// before the first chunk. The hub package parses this frame with encoding/json;
+// this test fixes the wire format so the two halves cannot drift.
+func TestWriteStartFrame(t *testing.T) {
+	var buf bytes.Buffer
+	writeStartFrame(&buf, Response{
+		StatusCode: 200,
+		Headers:    map[string][]string{"content-type": {"text/event-stream"}},
+	})
+	want := "event: start\ndata: {\"status\":200,\"headers\":{\"content-type\":[\"text/event-stream\"]}}\n\n"
+	if got := buf.String(); got != want {
+		t.Errorf("writeStartFrame() = %q, want %q", got, want)
+	}
+}
+
 // TestWriteChunkFrame pins the exact bytes the server writes for one chunk.
 //
 // The client is tested against the same encodings in the hub package, but that
