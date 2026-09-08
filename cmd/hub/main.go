@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -241,28 +242,56 @@ func printLedger(ledger *hub.Ledger) {
 	}
 }
 
+// runAudit verifies every stored receipt and reports ProviderSeq gaps. With an
+// empty -provider it audits the whole store; a gap exits non-zero so scripts
+// can fail on a missing receipt.
 func runAudit(store *hub.ReceiptStore, provider, allowed, expectedApp, policyHash, evFetchURL string, evClient *http.Client) {
 	verifier, err := buildVerifier(allowed, expectedApp, policyHash, evFetchURL, evClient)
 	if err != nil {
 		log.Fatalf("attestation: %v", err)
 	}
+	providers := []string{provider}
+	if provider == "" {
+		if providers, err = store.Providers(); err != nil {
+			log.Fatalf("audit: %v", err)
+		}
+		if len(providers) == 0 {
+			fmt.Println("no receipts stored")
+			return
+		}
+	}
+	failed := false
+	for _, p := range providers {
+		if !auditProvider(store, p, verifier) {
+			failed = true
+		}
+	}
+	if failed {
+		os.Exit(1)
+	}
+}
+
+// auditProvider verifies one provider's receipts; true means the store is
+// healthy (no gaps, no bad receipts).
+func auditProvider(store *hub.ReceiptStore, provider string, verifier *attest.Verifier) bool {
 	report, err := store.Audit(provider, verifier.VerifyFunc())
 	if err != nil {
-		log.Fatalf("audit: %v", err)
+		fmt.Printf("[%s] audit: %v\n", provider, err)
+		return false
 	}
 	if report.Total == 0 {
-		fmt.Printf("no receipts stored for provider %q\n", provider)
-		return
+		fmt.Printf("[%s] no receipts stored\n", provider)
+		return true
 	}
-	fmt.Printf("verified %d/%d receipts for provider %q (allowed platforms: %v)\n",
-		report.Verified, report.Total, provider, verifier.AllowedPlatforms())
-
+	fmt.Printf("[%s] verified %d/%d receipts (allowed platforms: %v)\n",
+		provider, report.Verified, report.Total, verifier.AllowedPlatforms())
 	if report.Complete() {
-		fmt.Printf("sequence complete: 1..%d, no gaps\n", report.MaxSeq)
-		return
+		fmt.Printf("    sequence complete: 1..%d, no gaps\n", report.MaxSeq)
+		return true
 	}
-	fmt.Printf(">>> GAP DETECTED: provider was used at least %d times but is missing receipts %v\n",
-		report.MaxSeq, report.Missing)
+	fmt.Printf(">>> [%s] GAP DETECTED: provider was used at least %d times but is missing receipts %v\n",
+		provider, report.MaxSeq, report.Missing)
+	return false
 }
 
 // buildTEEClientTLS assembles the Hub's client TLS config for the Hub↔TEE
