@@ -12,14 +12,6 @@
 //	-platform simulated   software attestation epoch (default; local sim)
 //	-platform sevsnp      AWS SEV-SNP RA-TLS epoch (real enclave). Compiled
 //	                      only with `-tags sevsnp`; see epoch_sevsnp.go.
-//	-platform alicloud    Alibaba Cloud confidential-computing adapter
-//	                      SKELETON. Compiled only with `-tags cloud`; fails
-//	                      closed unless -allow-untrusted (wiring only).
-//	-platform tencent     Tencent Cloud confidential-computing adapter
-//	                      SKELETON. Compiled only with `-tags cloud`; fails
-//	                      closed unless -allow-untrusted (wiring only).
-//	-allow-untrusted      cloud skeletons: sign with an UNATTESTED dev key so
-//	                      the wiring can be exercised before attestation lands.
 //	-evidence             embed attestation evidence in every receipt so each
 //	                      one verifies offline (default true; the simulation
 //	                      has no evidence cache to fetch from). Production sets
@@ -76,8 +68,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:18090", "listen address")
 	relay := flag.String("relay", "", "Hub TeeRelay WebSocket URL: every provider connection egresses as a stream over the Hub's reverse tunnel")
 	seqPath := flag.String("seq", "", "ProviderSeq store file (default <simdir>/seqstore.json)")
-	platformName := flag.String("platform", defaultPlatform, "attestation platform: simulated, sevsnp, alicloud, tencent")
-	allowUntrusted := flag.Bool("allow-untrusted", false, "cloud adapter skeletons only: admit work with an UNATTESTED dev identity (wiring tests; never in production)")
+	platformName := flag.String("platform", defaultPlatform, "attestation platform: simulated, sevsnp")
 	includeEvidence := flag.Bool("evidence", true, "embed attestation evidence in every receipt (false = resolve EvidenceHash via evidence retrieval)")
 	caFile := flag.String("ca", "", "root CA PEM for provider TLS; empty = sim test CA on simulated, system roots on sevsnp")
 	mtls := flag.Bool("mtls", false, "serve the Hub-facing API over mutual TLS: the platform's RA-TLS server certificate (sevsnp) or the sim test certificate (simulated), demanding a Hub client certificate")
@@ -111,7 +102,7 @@ func main() {
 		log.Fatalf("hash policy set: %v", err)
 	}
 
-	epoch, serverTLS, err := buildEpoch(*platformName, policySetHash, *allowUntrusted)
+	epoch, serverTLS, err := buildEpoch(*platformName, policySetHash)
 	if err != nil {
 		log.Fatalf("build platform epoch: %v", err)
 	}
@@ -242,7 +233,7 @@ func upstreamTLSConfig(platformName, caFile string) (*tls.Config, error) {
 		}
 		return &tls.Config{RootCAs: pool}, nil
 
-	case platformName == "sevsnp" || platformName == "alicloud" || platformName == "tencent":
+	case platformName == "sevsnp":
 		// System trust store: the ChannelManager treats a nil TLSClientConfig
 		// as platform defaults, so nil is the explicit "system roots" choice.
 		return nil, nil

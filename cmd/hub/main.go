@@ -323,8 +323,9 @@ func buildVerifier(allowed, expectedApp, policyHash, evFetchURL string, evClient
 		platform.PlatformAWSSEVSNP: sevsnp.Verifier{
 			ExpectedApp: expectedApp,
 		},
-		// Cloud adapter skeletons: wired so an allowlist entry is honest, but
-		// every receipt is refused until the attestation paths are implemented.
+		// Cloud skeleton verifiers, reserved for future support: wired so an
+		// allowlist entry is honest, but every receipt is refused with
+		// ErrAttestationNotImplemented until the attestation paths land.
 		platform.PlatformAlibabaCloud: alicloud.Verifier{},
 		platform.PlatformTencentCloud: tencent.Verifier{},
 	}

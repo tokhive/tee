@@ -26,8 +26,9 @@ import (
 // SEV-SNP host the whitelist ships inside the measured image, so the hardware
 // measurement covers it by construction; the parameter is threaded through for
 // API symmetry and is not otherwise used by the sevsnp branch.
-func buildEpoch(platformName string, policySetHash [32]byte, allowUntrusted bool) (platform.Epoch, *tls.Config, error) {
-	if platformName == "sevsnp" {
+func buildEpoch(platformName string, policySetHash [32]byte) (platform.Epoch, *tls.Config, error) {
+	switch platformName {
+	case "sevsnp":
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		adapter, err := sevsnp.NewAWS(ctx, sevsnp.Config{
@@ -41,13 +42,12 @@ func buildEpoch(platformName string, policySetHash [32]byte, allowUntrusted bool
 			return nil, nil, err
 		}
 		return snapshot, adapter.ServerTLSConfig(), nil
+	case "simulated":
+		epoch, err := buildSimulatedEpoch(policySetHash)
+		if err != nil {
+			return nil, nil, err
+		}
+		return epoch, shared.PlatformServerTLS(epoch), nil
 	}
-	if platformName == "alicloud" || platformName == "tencent" {
-		return nil, nil, fmt.Errorf("%s support is not in this binary; rebuild with `-tags cloud`", platformName)
-	}
-	epoch, err := buildSimulatedEpoch(policySetHash)
-	if err != nil {
-		return nil, nil, err
-	}
-	return epoch, shared.PlatformServerTLS(epoch), nil
+	return nil, nil, fmt.Errorf("unsupported platform %q: this build supports simulated and sevsnp", platformName)
 }
