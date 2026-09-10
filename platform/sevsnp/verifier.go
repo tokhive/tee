@@ -44,8 +44,17 @@ func (v Verifier) CheckEvidence(id platform.Identity) error {
 	}
 	// verifyCombined binds the SPKI into the report and proves the NitroTPM
 	// document, the AMD policy/TCB, and the cross-cloud measured application
-	// identity in one pass.
-	app, _, err := shared.VerifyCombinedSEVSNPAttestation(id.Evidence, id.PublicKeyDER)
+	// identity in one pass. Secure Boot evidence carries a distinct wire tag
+	// (the R-signed loader sets SNP_ATTESTATION_TYPE=secure-boot), so dispatch
+	// it to the event-log verifier that also proves the R-only boot policy;
+	// plain SEV2 evidence goes through the legacy tag.
+	var app string
+	var err error
+	if shared.IsSecureBootAttestation(id.Evidence) {
+		app, _, err = shared.VerifyCombinedSecureBootAttestation(id.Evidence, id.PublicKeyDER)
+	} else {
+		app, _, err = shared.VerifyCombinedSEVSNPAttestation(id.Evidence, id.PublicKeyDER)
+	}
 	if err != nil {
 		return fmt.Errorf("verify aws sev-snp evidence: %w", err)
 	}
