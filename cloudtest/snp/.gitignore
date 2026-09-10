@@ -1,0 +1,4 @@
+# Per-run/runtime state in the cross-host SNP harness: live instance bookkeeping
+# and the TLS/bootstrap secrets it mints. Never committed.
+.certs/
+__pycache__/

@@ -3,6 +3,7 @@
 ssh-key.pem
 ssh-key.pem.pub
 hosts.json
+crosshost.json
 logs/
 bin/
 __pycache__/
