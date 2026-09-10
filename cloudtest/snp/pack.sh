@@ -30,30 +30,16 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"   # reclaim-tee
 OUT_BUNDLE="${TOKENHIVE_OUT_BUNDLE:-${SCRIPT_DIR}/../bin/tokenhive-app-bundle.tar}"
 GO_TOOLCHAIN="${SNP_TEE_GO_TOOLCHAIN:-}"
 
-build_app() {
-    local dst="$1"
+# gobuild <pkg> <dst> [tags]: static linux/amd64 build shared by the real tee,
+# the diagnostic stub, and the supervisor-bundle services (hub/agent/mockprovider
+# have no sevsnp-specific code, only the tee passes tags).
+gobuild() {
+    local pkg="$1" dst="$2" tags="${3:-}"
     mkdir -p "$(dirname "${dst}")"
-    echo "[pack] compiling tokenhive/cmd/tee (sevsnp) -> ${dst}"
     ( cd "${REPO_ROOT}" && \
         GOTOOLCHAIN="${GO_TOOLCHAIN}" GOFLAGS=-mod=readonly GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-        go build -trimpath -tags 'sevsnp enclave osusergo netgo static_build' \
-        -ldflags "-s -w -buildid= -extldflags=-static" -o "${dst}" ./tokenhive/cmd/tee )
-    chmod 0755 "${dst}"
-}
-
-# build_stub produces a heartbeat-only ./app for boot diagnostics: the loader
-# starts broker+app copies of it that both just stay alive, so whether the
-# instance stays up is a pure signal about the boot chain, uninfluenced by any
-# tee startup logic. Enabled with TOKENHIVE_BUILD_STUB=1.
-build_stub() {
-    local dst="$1"
-    mkdir -p "$(dirname "${dst}")"
-    echo "[pack] compiling diagnostic stub ./app -> ${dst}"
-    ( cd "${REPO_ROOT}" && \
-        GOTOOLCHAIN="${GO_TOOLCHAIN}" GOFLAGS=-mod=readonly GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-        go build -trimpath \
-        -ldflags "-s -w -buildid= -extldflags=-static" \
-        -o "${dst}" ./tokenhive/cloudtest/snp/stub )
+        go build -trimpath ${tags:+-tags "$tags"} \
+        -ldflags "-s -w -buildid= -extldflags=-static" -o "${dst}" "${pkg}" )
     chmod 0755 "${dst}"
 }
 
@@ -71,13 +57,29 @@ bundle_ca() {
     fi
 }
 
-# cross_gcc is a plain linux/amd64 static build used for the additional services
-# in the supervisor bundle (hub/agent/mockprovider have no sevsnp-specific code).
-cross_gcc() { # cross_gcc <pkg> <dst>
-    ( cd "${REPO_ROOT}" && \
-        GOTOOLCHAIN="${GO_TOOLCHAIN}" GOFLAGS=-mod=readonly GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-        go build -trimpath -ldflags "-s -w -buildid= -extldflags=-static" -o "$2" "$1" )
-    chmod 0755 "$2"
+# bundle_mp stages the mock AI provider's TLS identity inside the bundle: the
+# CA is what the TEE trusts for the upstream leg (TEE_CA, no-sshd host), and
+# the cert/key let the in-bundle mock provider serve that same identity in
+# single-instance mode. The cross-host deploy sends the same files to the
+# ordinary host's mock provider.
+bundle_mp() {
+    local stage="$1"
+    if [[ -n "${SNP_MP_CA:-}" && -f "${SNP_MP_CA}" ]]; then
+        mkdir -p "${stage}/mtls"
+        cp "${SNP_MP_CA}" "${stage}/mtls/mp-ca.pem"
+        chmod 0644 "${stage}/mtls/mp-ca.pem"
+        echo "[pack] bundled mock-provider CA -> ./mtls/mp-ca.pem (${SNP_MP_CA})"
+    else
+        echo "[pack] warning: no SNP_MP_CA; TEE upstream TLS will use system roots"
+    fi
+    if [[ -n "${SNP_MP_CERT:-}" && -f "${SNP_MP_CERT}" && -n "${SNP_MP_KEY:-}" && -f "${SNP_MP_KEY}" ]]; then
+        cp "${SNP_MP_CERT}" "${stage}/mtls/mp-cert.pem"
+        cp "${SNP_MP_KEY}"  "${stage}/mtls/mp-key.pem"
+        chmod 0644 "${stage}/mtls/mp-cert.pem" "${stage}/mtls/mp-key.pem"
+        echo "[pack] bundled mock-provider identity -> ./mtls/mp-cert.pem + mp-key.pem"
+    else
+        echo "[pack] warning: SNP_MP_CERT/KEY missing; mock provider TLS will use a runtime-generated CA"
+    fi
 }
 
 # build_single packs a one-instance topology bundle: ./app is the supervisor
@@ -89,12 +91,14 @@ cross_gcc() { # cross_gcc <pkg> <dst>
 # Requires SNP_HUB_CA / SNP_HUB_CERT / SNP_HUB_KEY (the gencerts outputs).
 build_single() {
     local stage="$1"
-    cross_gcc ./tokenhive/cmd/single        "${stage}/app"
-    build_app "${stage}/svc/tee"            # sevsnp real tee
-    cross_gcc ./tokenhive/cmd/hub          "${stage}/svc/hub"
-    cross_gcc ./tokenhive/cmd/agent        "${stage}/svc/agent"
-    cross_gcc ./tokenhive/cmd/mockprovider "${stage}/svc/mockprovider"
+    echo "[pack] compiling supervisor ./app + svc/*"
+    gobuild ./tokenhive/cmd/single        "${stage}/app"
+    gobuild ./tokenhive/cmd/tee "${stage}/svc/tee" 'sevsnp enclave osusergo netgo static_build'
+    gobuild ./tokenhive/cmd/hub          "${stage}/svc/hub"
+    gobuild ./tokenhive/cmd/agent        "${stage}/svc/agent"
+    gobuild ./tokenhive/cmd/mockprovider "${stage}/svc/mockprovider"
     bundle_ca "${stage}"
+    bundle_mp "${stage}"
     if [[ -n "${SNP_HUB_CERT:-}" && -f "${SNP_HUB_CERT}" && -n "${SNP_HUB_KEY:-}" && -f "${SNP_HUB_KEY}" ]]; then
         cp "${SNP_HUB_CERT}" "${stage}/mtls/hub-cert.pem"
         cp "${SNP_HUB_KEY}"  "${stage}/mtls/hub-key.pem"
@@ -111,10 +115,12 @@ build() {
     if [[ "${TOKENHIVE_BUILD_SINGLE:-0}" == "1" ]]; then
         build_single "${stage}"
     elif [[ "${TOKENHIVE_BUILD_STUB:-0}" == "1" ]]; then
-        build_stub "${stage}/app"
+        gobuild ./tokenhive/cloudtest/snp/stub "${stage}/app"
     else
-        build_app "${stage}/app"
+        echo "[pack] compiling tokenhive/cmd/tee (sevsnp) -> app"
+        gobuild ./tokenhive/cmd/tee "${stage}/app" 'sevsnp enclave osusergo netgo static_build'
         bundle_ca "${stage}"
+        bundle_mp "${stage}"
     fi
     # Deterministic tar regardless of the host's tar flavor (macOS bsdtar has no
     # --sort; GNU tar lives in the image builder), so the bundle digest is

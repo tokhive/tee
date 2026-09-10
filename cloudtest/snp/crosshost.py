@@ -184,12 +184,12 @@ def main() -> None:
         except Exception:
             state = {}
 
-    # 1) Session basis: in single mode there is no ordinary host to launch.
-    if single:
-        host = state.get("host") or {}
-    elif host.get("instance_id") and host_state(ec2, host["instance_id"]) != "terminated":
+    # 1) Session basis: in single mode there is no ordinary host to launch; drop
+    # any stale host record so a later cross-host run starts from a clean slate.
+    host = (state.pop("host", None) or {}) if single else (state.get("host") or {})
+    if not single and host.get("instance_id") and host_state(ec2, host["instance_id"]) != "terminated":
         print(f"==> reusing ordinary host {host['instance_id']} @ {host.get('public_ip')}")
-    else:
+    elif not single:
         host_ami = latest_ami(ec2, cfg)
         print(f"==> launching ordinary host ({host_ami}) t3.small")
         inst = run_ordinary(ec2, cfg, host_ami, vpc_id, subnet_id, sg_id)
@@ -197,6 +197,7 @@ def main() -> None:
         host = {
             "instance_id": inst["InstanceId"],
             "public_ip": inst.get("PublicIpAddress", ""),
+            "private_ip": inst.get("PrivateIpAddress", ""),
             "role": "host",
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
@@ -206,24 +207,39 @@ def main() -> None:
     host_ip = host_ip or host.get("public_ip", "")
     print(f"  -> ordinary host public ip: {host_ip}")
 
+    # Records written before the private-ip fields existed may be missing them;
+    # backfill from AWS so reused instances still route the cross-host plane.
+    if host.get("instance_id") and not host.get("private_ip"):
+        host["private_ip"] = describe(ec2, host["instance_id"]).get("PrivateIpAddress", "")
+
     # 2) Confidential tee with user-data injected config. In single mode the tee
     # supervises everything on loopback, so no relay back to an external hub.
     tee = state.get("tee") or {}
+    if tee.get("instance_id") and not tee.get("private_ip"):
+        tee["private_ip"] = describe(ec2, tee["instance_id"]).get("PrivateIpAddress", "")
+    # Runtime config injected by the loader as EC2 user-data. TEE_RELAY (the
+    # reverse tunnel back to the external Hub) only exists in cross-host mode:
+    # the supervisor in single mode runs hub/agent/tee all on loopback and
+    # ignores it. Cross-host traffic uses the PRIVATE ips: both instances share
+    # one VPC/subnet/SG, and AWS group-pair SG rules only match in-VPC traffic —
+    # a public-ip dial from a group member is not matched and gets dropped.
+    host_priv = host.get("private_ip", "")
+    relay = f"TEE_RELAY=ws://{host_priv}:18085/v1/relay\n" if not single else ""
     userdata = (
         "TOKENHIVE_SIM_DIR=/tmp/tee\n"
         "TEE_ADDR=0.0.0.0:18090\n"
-        f"TEE_RELAY=ws://{host_ip}:18085/v1/relay\n"
+        f"{relay}"
         "TEE_PLATFORM=sevsnp\n"
         "TEE_MTLS=1\n"
         "TEE_MTLS_CLIENT_CA=/run/bundle/mtls/hub-ca.pem\n"
+        # The mock provider's CA rides in the measured bundle: the TEE trusts it
+        # for the upstream TLS leg, which is otherwise system roots on sevsnp.
+        "TEE_CA=/run/bundle/mtls/mp-ca.pem\n"
         "TEE_INIT_ADDR=0.0.0.0:18091\n"
         f"TEE_INIT_TOKEN={token}\n"
     )
     if single:
         userdata += "TOKENHIVE_SUPERVISE=1\n"
-        # A supervisor need not address a remote hub: hub/agent/tee all live in
-        # this instance and talk to loopback. Leave TEE_RELAY but it is unused in
-        # single mode.
         print("==> single-instance mode: whole loop inside the confidential tee")
     if tee.get("instance_id") and host_state(ec2, tee["instance_id"]) != "terminated":
         print(f"==> reusing confidential tee {tee['instance_id']} @ {tee.get('public_ip')}")
@@ -235,6 +251,7 @@ def main() -> None:
         tee = {
             "instance_id": inst["InstanceId"],
             "public_ip": inst.get("PublicIpAddress", ""),
+            "private_ip": inst.get("PrivateIpAddress", ""),
             "role": "tee",
             "ami_id": ami_id,
             "user_data_token": token,
@@ -250,13 +267,15 @@ def main() -> None:
     else:
         print(f"==> host {host['instance_id']} @ {host['public_ip']}")
         print(f"==> tee  {tee['instance_id']} @ {tee.get('public_ip')}")
-        print(f"==> tee relay ws://{host_ip}:18085/v1/relay; bootstrap http://<tee>:18091/v1/init-cert?token={token}")
+        print(f"==> tee relay ws://{host_priv}:18085/v1/relay; bootstrap http://<tee-priv>:18091/v1/init-cert?token={token}")
+
+
+def describe(ec2, iid: str) -> dict:
+    return ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
 
 
 def host_state(ec2, iid: str) -> str:
-    return ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0][
-        "State"
-    ]["Name"]
+    return describe(ec2, iid)["State"]["Name"]
 
 
 def boto3(service: str):

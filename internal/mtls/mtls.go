@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"os"
 	"time"
 
@@ -182,6 +183,59 @@ func GenHubClientCerts() (caPEM, certPEM, keyPEM []byte, err error) {
 	caPEM = pemEncode("CERTIFICATE", caDER)
 	certPEM = pemEncode("CERTIFICATE", cliDER)
 	keyPEM = pemEncode("EC PRIVATE KEY", mustMarshalEC(cliKey))
+	return caPEM, certPEM, keyPEM, nil
+}
+
+// GenMockProviderCerts generates a throwaway CA and a server certificate for
+// the mock AI provider. The CA is what the TEE must trust for the upstream TLS
+// leg; it is baked into the measured bundle (TEE_CA) so a real TEE on another
+// host can validate the provider without the CA crossing the no-sshd boundary
+// at runtime, while the cert/key deploy with the mock provider process.
+func GenMockProviderCerts() (caPEM, certPEM, keyPEM []byte, err error) {
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(201),
+		Subject:               pkix.Name{CommonName: "tokenhive-sim-provider-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	srvKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	srvTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(202),
+		Subject:      pkix.Name{CommonName: "tokenhive-sim-provider"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	}
+	srvDER, err := x509.CreateCertificate(rand.Reader, srvTmpl, caCert, &srvKey.PublicKey, caKey)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	caPEM = pemEncode("CERTIFICATE", caDER)
+	certPEM = pemEncode("CERTIFICATE", srvDER)
+	keyPEM = pemEncode("EC PRIVATE KEY", mustMarshalEC(srvKey))
 	return caPEM, certPEM, keyPEM, nil
 }
 

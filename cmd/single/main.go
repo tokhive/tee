@@ -90,6 +90,10 @@ func supervise() error {
 	if initToken == "" {
 		return fmt.Errorf("TOKENHIVE_SUPERVISE requires TEE_INIT_TOKEN")
 	}
+	appHash := os.Getenv("SNP_APP_HASH")
+	if appHash == "" {
+		return fmt.Errorf("SNP_APP_HASH not set by loader; cannot pin the attested app identity")
+	}
 	fetch := time.Now()
 	for {
 		if err := fetchTEECert(); err == nil {
@@ -99,10 +103,36 @@ func supervise() error {
 		}
 		time.Sleep(2 * time.Second)
 	}
-	start(hubCmd())
+	start(hubCmd(appHash))
 	start(agentCmd())
+	// Self-test: once hub + agent are up, drive ONE real chat request over the
+	// loopback so the single-instance run proves the whole business loop
+	// (hub -> tee mTLS -> relay -> agent -> mockprovider) actually answers,
+	// not just that every process happened to start.
+	go selfTest()
 	waitAll()
 	return nil
+}
+
+// selfTest polls the loopback hub until it answers, then sends one
+// chat/completions request and logs the HTTP status + response head. The
+// result stays visible in the loader console, which is the only observability
+// channel of a confidential instance (no sshd).
+func selfTest() {
+	body := `{"model":"sim-mock-0.5b","messages":[{"role":"user","content":"hello"}]}`
+	client := &http.Client{Timeout: 60 * time.Second}
+	for {
+		resp, err := client.Post("http://127.0.0.1:18085/v1/chat/completions",
+			"application/json", strings.NewReader(body))
+		if err == nil {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
+			logf("self-test: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(b)))
+			return
+		}
+		logf("self-test: hub not ready yet (%v); retrying", err)
+		time.Sleep(5 * time.Second)
+	}
 }
 
 func waitAll() {
@@ -131,13 +161,19 @@ func teeCmd() *exec.Cmd {
 }
 
 func mpCmd(port int) *exec.Cmd {
+	// Serve the fixed mock-provider identity from the bundle (mp-ca.pem is also
+	// what the tee trusts via TEE_CA), republishing its CA at <simdir>/ca.pem
+	// for the agent's model-list fetch.
 	c := cmd("svc/mockprovider", "-addr", fmt.Sprintf("127.0.0.1:%d", port),
-		"-tls", "-stats-addr", "127.0.0.1:18081")
+		"-tls", "-stats-addr", "127.0.0.1:18081",
+		"-ca", filepath.Join(bundleDir, "mtls", "mp-ca.pem"),
+		"-cert", filepath.Join(bundleDir, "mtls", "mp-cert.pem"),
+		"-key", filepath.Join(bundleDir, "mtls", "mp-key.pem"))
 	c.Env = withEnv("TOKENHIVE_SIM_DIR=" + simDir)
 	return c
 }
 
-func hubCmd() *exec.Cmd {
+func hubCmd(appHash string) *exec.Cmd {
 	c := cmd("svc/hub",
 		"-serve", "0.0.0.0:18085",
 		"-agent-key", agentKey,
@@ -147,6 +183,10 @@ func hubCmd() *exec.Cmd {
 		"-mtls-ca", teeCert,
 		"-mtls-cert", filepath.Join(bundleDir, "mtls", "hub-cert.pem"),
 		"-mtls-key", filepath.Join(bundleDir, "mtls", "hub-key.pem"),
+		// Real SNP receipts: the hub must trust the platform and pin the exact
+		// measured bundle (the loader exports its digest as SNP_APP_HASH).
+		"-allowed-platforms", "aws-sev-snp",
+		"-expected-app", "snp-app:"+appHash,
 	)
 	c.Env = withEnv("TOKENHIVE_SIM_DIR=" + simDir)
 	return c

@@ -23,6 +23,12 @@
 #   ./crosshost.sh down --dry-run   list what would be terminated, delete nothing
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # cloudtest/snp
+# The host shell may carry PYTHONHOME/PYTHONPATH injected by an unrelated tool
+# (e.g. a bundled Python runtime), which crashes BOTH the venv's python3 and any
+# bare `python3`/aws-CLI invocation in pack.sh and snp-build.sh with
+# "No module named 'encodings'". Drop them once at the top so every child step
+# runs under a clean interpreter instead of needing per-call `env -u` sprinkles.
+unset PYTHONHOME PYTHONPATH 2>/dev/null || true
 # shellcheck source=../lib.sh
 set -a; source "${HERE}/../lib.sh"; set +a
 load_env
@@ -40,6 +46,25 @@ py_cd() { ( cd "${CLOUDTEST}" && "${PY}" "$@"; ); }
 host_field() { "$PY" -c "import json,sys; print(json.load(open('$HOSTS'))['host']['$1'])"; }
 tee_field() { "$PY" -c "import json,sys; print(json.load(open('$HOSTS'))['tee']['$1'])"; }
 
+# dump_tee_console <public-ip>: print the confidential instance's console output
+# (the loader/attestation log) by locating it strictly through our own tags.
+dump_tee_console() {
+  py_cd - "$1" <<'PY'
+import boto3, sys
+from config import load
+cfg = load()
+ec2 = boto3.client("ec2", region_name=cfg.region)
+for r in ec2.describe_instances(Filters=[
+    {"Name": f"tag:{cfg.tag_owner}", "Values":[cfg.tag_owner_value]},
+    {"Name": f"tag:{cfg.tag_user}", "Values":[cfg.user]},
+])["Reservations"]:
+    for i in r["Instances"]:
+        if i.get("PublicIpAddress") == sys.argv[1]:
+            print(ec2.get_console_output(InstanceId=i["InstanceId"]).get("Output",""))
+            break
+PY
+}
+
 ami_id() {
   local name="${1:-snp-tokenhive}"
   py_cd - "${name}" <<'PY'
@@ -56,12 +81,27 @@ print(img[-1]["ImageId"])
 PY
 }
 
+# ensure_certs generates the Hub↔TEE and mock-provider TLS fixtures ONCE and
+# reuses them across every build: the CAs are baked into each AMI's bundle at
+# build time, and the same CAs must sign the client/server certs deployed
+# later. Regenerating certs in one build would silently invalidate AMIs built
+# earlier — their tee would reject the new hub client cert / provider cert.
+ensure_certs() {
+  if [ -f "${CERTS_DIR}/hub-ca.pem" ]; then
+    log "reusing TLS fixtures in ${CERTS_DIR}"
+    return
+  fi
+  mkdir -p "${CERTS_DIR}"
+  ( cd "${REPO_ROOT}" && go run ./tokenhive/cloudtest/snp/gencerts "${CERTS_DIR}" )
+  log "TLS fixtures -> ${CERTS_DIR}"
+}
+
 cmd_build() {
   log "step: build (certs + real-tee bundle + AMI + linux binaries)"
-  rm -rf "${CERTS_DIR}"; mkdir -p "${CERTS_DIR}"
-  ( cd "${REPO_ROOT}" && go run ./tokenhive/cloudtest/snp/gencerts "${CERTS_DIR}" )
-  log "hub mTLS certs -> ${CERTS_DIR}"
-  ( cd "${HERE}" && SNP_HUB_CA="${CERTS_DIR}/hub-ca.pem" ./pack.sh build )
+  ensure_certs
+  ( cd "${HERE}" && SNP_HUB_CA="${CERTS_DIR}/hub-ca.pem" \
+      SNP_MP_CA="${CERTS_DIR}/mp-ca.pem" SNP_MP_CERT="${CERTS_DIR}/mp-cert.pem" SNP_MP_KEY="${CERTS_DIR}/mp-key.pem" \
+      ./pack.sh build )
   local bundle; bundle="${TOKENHIVE_OUT_BUNDLE:-${CLOUDTEST}/bin/tokenhive-app-bundle.tar}"
   log "bundle digest: $(cd "${HERE}" && ./pack.sh digest "${bundle}")"
   ( cd "${DEPLOY_DIR}" && SNP_EXTERNAL_BUNDLE="${bundle}" SNP_ALLOW_DIRTY=1 ./snp-build.sh t aws tokenhive )
@@ -72,15 +112,17 @@ cmd_build() {
 
 cmd_build_single() {
   log "step: build (certs + supervisor bundle + AMI)"
-  rm -rf "${CERTS_DIR}"; mkdir -p "${CERTS_DIR}"
-  ( cd "${REPO_ROOT}" && go run ./tokenhive/cloudtest/snp/gencerts "${CERTS_DIR}" )
-  log "hub mTLS certs -> ${CERTS_DIR}"
-  # The supervisor bundle needs the Hub's TLS identity (hub-cert/key), which the
-  # cross-host bundle does not carry (hub runs on the ordinary host there).
+  ensure_certs
+  # The supervisor bundle needs the Hub's TLS identity (hub-cert/key) and the
+  # mock provider's TLS identity (mp-cert/key), which the cross-host bundle
+  # does not carry (hub and mockprovider run on the ordinary host there).
   ( cd "${HERE}" && TOKENHIVE_BUILD_SINGLE=1 \
       SNP_HUB_CA="${CERTS_DIR}/hub-ca.pem" \
       SNP_HUB_CERT="${CERTS_DIR}/hub-cert.pem" \
       SNP_HUB_KEY="${CERTS_DIR}/hub-key.pem" \
+      SNP_MP_CA="${CERTS_DIR}/mp-ca.pem" \
+      SNP_MP_CERT="${CERTS_DIR}/mp-cert.pem" \
+      SNP_MP_KEY="${CERTS_DIR}/mp-key.pem" \
       ./pack.sh build )
   local bundle; bundle="${TOKENHIVE_OUT_BUNDLE:-${CLOUDTEST}/bin/tokenhive-app-bundle.tar}"
   log "bundle digest: $(cd "${HERE}" && ./pack.sh digest "${bundle}")"
@@ -102,11 +144,26 @@ cmd_up() {
     printf '%s\n' "${token}" > "${CERTS_DIR}/init-token"
   fi
   ( cd "${HERE}" && "${PY}" crosshost.py "${a}" --token "${token}" ${single} ) | tee -a "${LOG_DIR}/run.log"
+  # Pin the attested app identity for the Hub: the AMI embeds the very tar file
+  # whose sha256 the loader exports as SNP_APP_HASH, so record it in state for
+  # the later deploy to pass as -expected-app (single mode reads the env instead).
+  local digest
+  digest="$(cd "${HERE}" && ./pack.sh digest "${CLOUDTEST}/bin/tokenhive-app-bundle.tar")"
+  printf '%s\n' "${digest#snp-app:}" | "${PY}" -c "
+import json, sys
+p = json.load(open('${HOSTS}'))
+p['tee']['app_hash'] = sys.stdin.read().strip()
+json.dump(p, open('${HOSTS}', 'w'), indent=2)
+" && log "tee app_hash -> ${digest}"
 }
 
 cmd_fetch() {
   local tip tok out
-  tip="$(tee_field public_ip)"; tok="$(cat "${CERTS_DIR}/init-token")"
+  # Cross-host traffic goes over the PRIVATE ips: both instances share the VPC
+  # subnet and the SG's group-pair rule only matches in-VPC traffic (a public-ip
+  # dial from a group member is dropped by AWS). ssh to the host still uses its
+  # public ip.
+  tip="$(tee_field private_ip)"; tok="$(cat "${CERTS_DIR}/init-token")"
   log "step: fetch tee RA-TLS cert from bootstrap ${tip}:18091"
   out="$(remote_exec "$(host_field public_ip)" bash <<EOF
 for _ in \$(seq 1 60); do
@@ -124,15 +181,19 @@ EOF
 }
 
 cmd_deploy() {
-  local hip tip cert
-  hip="$(host_field public_ip)"; tip="$(tee_field public_ip)"
-  log "step: deploy runtime to host ${hip} (tee ${tip})"
+  local hip tip cert app_hash
+  hip="$(host_field public_ip)"; tip="$(tee_field private_ip)"  # cross-host plane over private ips
+  app_hash="$(tee_field app_hash)"
+  log "step: deploy runtime to host ${hip} (tee ${tip}, app ${app_hash})"
   remote_exec "$hip" 'mkdir -p tee mtls' >/dev/null
   remote_push "$hip" "${CLOUDTEST}/bin/hub" "tee/hub" >/dev/null
   remote_push "$hip" "${CLOUDTEST}/bin/agent" "tee/agent" >/dev/null
   remote_push "$hip" "${CLOUDTEST}/bin/mockprovider" "tee/mockprovider" >/dev/null
   remote_push "$hip" "${CERTS_DIR}/hub-cert.pem" "mtls/hub-cert.pem" >/dev/null
   remote_push "$hip" "${CERTS_DIR}/hub-key.pem" "mtls/hub-key.pem" >/dev/null
+  remote_push "$hip" "${CERTS_DIR}/mp-ca.pem" "mtls/mp-ca.pem" >/dev/null
+  remote_push "$hip" "${CERTS_DIR}/mp-cert.pem" "mtls/mp-cert.pem" >/dev/null
+  remote_push "$hip" "${CERTS_DIR}/mp-key.pem" "mtls/mp-key.pem" >/dev/null
   # tee-cert.pem (pinned) lives in CERTS_DIR after fetch
   remote_push "$hip" "${CERTS_DIR}/tee-cert.pem" "mtls/tee-cert.pem" >/dev/null
 
@@ -144,11 +205,13 @@ export TOKENHIVE_SIM_DIR="\$HOME/tee"
 killall mockprovider hub agent 2>/dev/null || true
 mkdir -p "\$TOKENHIVE_SIM_DIR"
 chmod 755 ./tee/hub ./tee/agent ./tee/mockprovider
-./tee/mockprovider -addr 127.0.0.1:18080 -tls -stats-addr 127.0.0.1:18081 >tee/mp.log 2>&1 &
+./tee/mockprovider -addr 127.0.0.1:18080 -tls -stats-addr 127.0.0.1:18081 \
+  -ca mtls/mp-ca.pem -cert mtls/mp-cert.pem -key mtls/mp-key.pem >tee/mp.log 2>&1 &
 sleep 1
 ./tee/hub -serve 0.0.0.0:18085 -agent-key '${agent_key}' -host 127.0.0.1:18080 \
   -model sim-mock-0.5b -tee https://${tip}:18090 -mtls-ca mtls/tee-cert.pem \
-  -mtls-cert mtls/hub-cert.pem -mtls-key mtls/hub-key.pem >tee/hub.log 2>&1 &
+  -mtls-cert mtls/hub-cert.pem -mtls-key mtls/hub-key.pem \
+  -allowed-platforms aws-sev-snp -expected-app 'snp-app:${app_hash}' >tee/hub.log 2>&1 &
 sleep 1
 ./tee/agent -hub ws://127.0.0.1:18085/v1/agent -key '${agent_key}' -provider openai-sim \
   -token sk-xhost-secret -targets 127.0.0.1:18080 -ca "\$TOKENHIVE_SIM_DIR/ca.pem" >tee/agent.log 2>&1 &
@@ -173,26 +236,14 @@ EOF
 }
 
 cmd_verify() {
-  # In single mode there is no separate host: the supervisor's tee+hub+agent+
+  # Single-instance mode has no separate host: the supervisor's tee+hub+agent+
   # mockprovider all log to the loader console inside the confidential instance,
   # so verify just dumps that console (which also holds the attestation proof).
-  if ! grep -q '"host"' "${HOSTS}"; then
+  # The tee record carries mode=single from crosshost.py; a stale "host" key
+  # left over from an earlier cross-host run must not flip us into host mode.
+  if [[ "$(tee_field mode)" == "single" ]]; then
     log "step: verify single-instance mode (dump confidential tee console)"
-    local tip; tip="$(tee_field public_ip)"
-    py_cd - "${tip}" <<'PY'
-import boto3, sys
-from config import load
-cfg = load()
-ec2 = boto3.client("ec2", region_name=cfg.region)
-for r in ec2.describe_instances(Filters=[
-    {"Name": f"tag:{cfg.tag_owner}", "Values":[cfg.tag_owner_value]},
-    {"Name": f"tag:{cfg.tag_user}", "Values":[cfg.user]},
-])["Reservations"]:
-    for i in r["Instances"]:
-        if i.get("PublicIpAddress") == sys.argv[1]:
-            print(ec2.get_console_output(InstanceId=i["InstanceId"]).get("Output",""))
-            break
-PY
+    dump_tee_console "$(tee_field public_ip)"
     return
   fi
   log "step: verify logs on host"
@@ -201,23 +252,8 @@ echo "---- hub.log ----"; grep -E 'listening|relay|chat/completions' tee/hub.log
 echo "---- agent.log ----"; tail -6 tee/agent.log
 echo "---- mockprovider.log ----"; tail -4 tee/mp.log
 EOF
-  local tip; tip="$(tee_field public_ip)"
   log "step: dump confidential tee console (attestation proof)"
-  py_cd - "${tip}" <<'PY'
-import boto3, sys
-from config import load
-cfg = load()
-# locate the tee by public ip (hosts claim may be just ip)
-ec2 = boto3.client("ec2", region_name=cfg.region)
-for r in ec2.describe_instances(Filters=[
-    {"Name": f"tag:{cfg.tag_owner}", "Values":[cfg.tag_owner_value]},
-    {"Name": f"tag:{cfg.tag_user}", "Values":[cfg.user]},
-])["Reservations"]:
-    for i in r["Instances"]:
-        if i.get("PublicIpAddress") == sys.argv[1]:
-            print(ec2.get_console_output(InstanceId=i["InstanceId"]).get("Output",""))
-            break
-PY
+  dump_tee_console "$(tee_field public_ip)"
 }
 
 cmd_down() {
