@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
@@ -80,8 +81,25 @@ func NewFileCredentialStore(dir string) *FileCredentialStore {
 	return &FileCredentialStore{dir: dir}
 }
 
+// fileFor returns the on-disk path of a provider's envelope. It refuses any
+// name that is not a bare provider identifier: provider + ".json" is joined
+// onto the store directory, so an unvalidated name like "../rates" would read,
+// overwrite, or delete a file outside the store. The gate validates the name
+// too, but a store must not depend on its caller to keep a write inside its own
+// directory — that is the same rule ReceiptStore already enforces on Put.
+func (s *FileCredentialStore) fileFor(provider string) (string, error) {
+	if err := jobs.ValidateProviderName(provider); err != nil {
+		return "", err
+	}
+	return filepath.Join(s.dir, provider+".json"), nil
+}
+
 // Put implements CredentialStore.
 func (s *FileCredentialStore) Put(provider string, envelope tee.Envelope) error {
+	path, err := s.fileFor(provider)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
@@ -91,14 +109,18 @@ func (s *FileCredentialStore) Put(provider string, envelope tee.Envelope) error 
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(s.dir, provider+".json"), b, 0o600)
+	return os.WriteFile(path, b, 0o600)
 }
 
 // Get implements CredentialStore.
 func (s *FileCredentialStore) Get(provider string) (tee.Envelope, bool) {
+	path, err := s.fileFor(provider)
+	if err != nil {
+		return tee.Envelope{}, false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	b, err := os.ReadFile(filepath.Join(s.dir, provider+".json"))
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return tee.Envelope{}, false
 	}
@@ -111,7 +133,11 @@ func (s *FileCredentialStore) Get(provider string) (tee.Envelope, bool) {
 
 // Delete implements CredentialStore.
 func (s *FileCredentialStore) Delete(provider string) error {
+	path, err := s.fileFor(provider)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return os.Remove(filepath.Join(s.dir, provider+".json"))
+	return os.Remove(path)
 }

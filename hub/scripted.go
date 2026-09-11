@@ -2,6 +2,7 @@ package hub
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"sync"
 
@@ -126,6 +127,9 @@ func (s *ScriptedTEE) OpenCalls() int {
 func ScriptReceipt(chunks [][]byte, r proof.Receipt) proof.Receipt {
 	if len(r.JobID) == 0 {
 		r.JobID = make([]byte, proof.JobIDLength)
+		if _, err := rand.Read(r.JobID); err != nil {
+			panic("scripted receipt: random job id: " + err.Error())
+		}
 	}
 	hash := proof.HashResponseStream(r.JobID, chunks)
 	r.StreamHash = hash[:]

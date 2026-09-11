@@ -168,7 +168,7 @@ func e2eStack(t *testing.T, target string, srv *httptest.Server) (*tee.Service, 
 		Rates:       map[string]hub.RateCard{"openai": {PerRequestMicros: 100}},
 		Store:       memStore{},
 		Verify:      func(proof.SignedReceipt) error { return nil },
-		AgentSecret: []byte(agentSecret),
+		AgentKeys:   map[string][]byte{"openai": []byte(agentSecret)},
 		Credentials: &hub.HTTPTEE{BaseURL: teeSrv.URL},
 	})
 	if err != nil {

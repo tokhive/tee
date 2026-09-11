@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -34,6 +35,7 @@ func main() {
 	model := flag.String("model", "sim-mock-0.5b", "model name for the Hub to schedule (first frame)")
 	marker := flag.String("marker", "session-marker-17", "marker embedded in the first frame and echoed back")
 	wantEvents := flag.String("events", "session.updated,response.created,response.done", "comma-separated provider events each downlink frame must be")
+	tenant := flag.String("tenant", "tenant-t17", "user api key identifying the tenant (sent as X-TokenHive-Key)")
 	flag.Parse()
 
 	// The first frame drives provider selection (model) and carries the duplex
@@ -46,7 +48,10 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, *url, nil)
+	// The tenant key is the Hub's user-facing credential; the session route
+	// resolves it exactly as the request routes do.
+	hdr := http.Header{"X-TokenHive-Key": {*tenant}}
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, *url, hdr)
 	if err != nil {
 		fail("dial %s: %v", *url, err)
 	}

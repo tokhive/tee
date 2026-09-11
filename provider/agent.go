@@ -16,16 +16,21 @@
 // provider is end to end, and the agent sees only the encrypted bytes of a
 // session it is not party to.
 //
-// What the agent does enforce, and all it enforces:
+// What the agent enforces, and all it enforces:
 //
 //   - The allowlist. An agent that forwarded to arbitrary hosts would turn a
 //     contributor's machine into a general-purpose proxy; the allowlist keeps
 //     the exposure to "AI provider endpoints", which is what the contributor
 //     signed up for.
 //
-// Absent by design (production concerns, noted for later milestones):
-// connection caps, idle timeouts, and usage metering. The agent is a simulation
-// milestone component; a contributor-facing release needs all three.
+//   - A cap on how many relays it serves at once (MaxRelayConns), so one Hub
+//     cannot occupy the contributor's machine, plus an idle timeout on each
+//     relay (RelayIdle), so an abandoned stream cannot hold an upstream
+//     connection open forever.
+//
+//   - Byte counters over what it relayed (Stats). The bytes stay opaque — they
+//     are a TLS session the agent is not party to — so counts and outcomes are
+//     the only facts the contributor can be shown.
 package provider
 
 import (
@@ -127,12 +132,40 @@ type AgentConfig struct {
 	// agent sees only the encrypted bytes of a TLS session it is not party to.
 	// Never set in production; the relay must stay dumb.
 	Tap io.Writer
+
+	// MaxRelayConns caps how many relay streams the agent serves at once. Zero
+	// means no cap; the agent binary ships DefaultMaxRelayConns. Streams past
+	// the cap are refused outright rather than queued, so the Hub learns the
+	// machine is full and can route to another provider instead of waiting.
+	//
+	// It bounds the contributor's exposure, not the Hub's: the Hub's fair-share
+	// cap is per tenant and the TEE pools connections per provider, but only the
+	// agent can decide how much of its own machine and its own upstream
+	// connections it will commit.
+	MaxRelayConns int
+
+	// RelayIdle tears a relay stream down once it has carried no bytes in either
+	// direction for this long. Zero means no watchdog; the agent binary ships
+	// DefaultRelayIdle.
+	//
+	// It must sit above every bound the Hub and the TEE put on a job, so the
+	// agent never gives up on a stream its counterpart still considers live. The
+	// Hub ships -attempt-timeout 3m and the TEE -request-timeout 2m, which is
+	// where DefaultRelayIdle's 5m comes from.
+	RelayIdle time.Duration
 }
 
 // Agent is the Provider Agent reverse-tunnel client. It is safe to Run once.
 type Agent struct {
 	cfg AgentConfig
 	hdr http.Header
+
+	// slots bounds concurrently served relays; nil means no bound (see
+	// MaxRelayConns).
+	slots chan struct{}
+
+	// meter counts what the agent relayed and what it turned away (see Stats).
+	meter relayMeter
 
 	// models is the list resolved from ModelsURL before the first dial (see
 	// prepareModels). It stays empty when no automatic discovery is configured,
@@ -169,8 +202,15 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 		cfg.MaxReconnectDelay = 30 * time.Second
 	}
 	a := &Agent{cfg: cfg}
+	if cfg.MaxRelayConns > 0 {
+		a.slots = make(chan struct{}, cfg.MaxRelayConns)
+	}
 	a.hdr = http.Header{}
 	a.hdr.Set(hub.AgentKeyHeader, string(cfg.SharedKey))
+	// Name the provider on the dial-in too, so a Hub configured with
+	// per-provider keys can bind this tunnel to exactly this provider before
+	// upgrading. A Hub with only a shared key ignores the header.
+	a.hdr.Set(hub.AgentProviderHeader, cfg.Self.Provider)
 	return a, nil
 }
 
@@ -429,10 +469,13 @@ func (a *Agent) httpClient() *http.Client {
 	return &http.Client{Timeout: a.cfg.ConnectTimeout, Transport: transport}
 }
 
-// handleRelay bridges one Hub-opened relay stream to the named upstream. It runs
-// on its own goroutine (the tunnel spawns each open) and only ever moves bytes.
+// handleRelay decodes one Hub-opened relay and serves it: the frame names the
+// upstream to dial, the allowlist decides whether it may be dialed, and
+// serveRelay bridges the bytes. It runs on its own goroutine (the tunnel spawns
+// one per open) and only ever moves bytes.
 func (a *Agent) handleRelay(s *tunnel.Stream, open []byte) {
 	defer s.Close()
+
 	var up hub.UpstreamOpen
 	if err := json.Unmarshal(open, &up); err != nil {
 		return
@@ -440,22 +483,7 @@ func (a *Agent) handleRelay(s *tunnel.Stream, open []byte) {
 	if up.Host == "" || !a.allows(up.Host) {
 		return
 	}
-	outbound, err := a.dialTarget(up.Host)
-	if err != nil {
-		return
-	}
-	defer outbound.Close()
-
-	// After the relay opens, the only bytes on either wire are TLS records (the
-	// TEE's session with the provider). Mirror them to the tap, if configured,
-	// so a test can prove the agent relays ciphertext and never the credential
-	// the TEE injected inside that session.
-	var left, right ioReadWriteCloser = s, outbound
-	if a.cfg.Tap != nil {
-		left = tapRWC{rw: s, tap: a.cfg.Tap}
-		right = tapRWC{rw: outbound, tap: a.cfg.Tap}
-	}
-	tunnel.Bridge(left, right)
+	a.serveRelay(s, up)
 }
 
 // allows reports whether host is on the allowlist. Exact host:port match only:
@@ -484,29 +512,4 @@ func (a *Agent) dialTarget(host string) (net.Conn, error) {
 		return nil, fmt.Errorf("dial upstream %s: %w", host, err)
 	}
 	return conn, nil
-}
-
-// ioReadWriteCloser narrows a full ReadWriteCloser to the surface bridge needs,
-// so the tap wrapper and the raw stream both fit the same parameter.
-type ioReadWriteCloser interface {
-	io.Reader
-	io.Writer
-	io.Closer
-}
-
-// tapRWC mirrors every byte written through it to Tap. It is purely a
-// test/demo affordance (see AgentConfig.Tap) and is never used on a production
-// path, where the agent must stay a dumb byte pipe.
-type tapRWC struct {
-	rw  io.ReadWriteCloser
-	tap io.Writer
-}
-
-func (t tapRWC) Read(p []byte) (int, error) { return t.rw.Read(p) }
-func (t tapRWC) Close() error               { return t.rw.Close() }
-func (t tapRWC) Write(p []byte) (int, error) {
-	if t.tap != nil {
-		_, _ = t.tap.Write(p)
-	}
-	return t.rw.Write(p)
 }

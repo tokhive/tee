@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -20,13 +21,67 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
+// defaultRequestReadTimeout bounds how long a client may take to send a whole
+// request — request line, headers, and body — before the Hub gives up on it.
+//
+// ReadHeaderTimeout alone does not cover this: it stops a client that stalls in
+// the headers, but a client that sends headers promptly and then dribbles (or
+// never sends) the body it announced with Content-Length keeps a connection and
+// its goroutine for as long as it likes. The 16 MiB body cap bounds how much can
+// arrive, not how slowly.
+//
+// It is safe to set server-wide precisely because it bounds *reading the
+// request* and nothing else. The stdlib clears the read deadline once the body
+// is consumed (and on hijack, which is how the agent gate and the tee relay take
+// the connection), so a response that streams for minutes — every SSE answer —
+// is untouched; it is WriteTimeout, deliberately left zero, that would cut such
+// a stream. The value is generous because a request body may legitimately be
+// large and the client's uplink is not the Hub's to choose; the point is that it
+// is finite.
+const defaultRequestReadTimeout = 30 * time.Second
+
 // serveConfig is the routing the resident service hands to the scheduler: the
 // upstream it asks the TEE to reach, per provider.
 type serveConfig struct {
-	Addr  string // where the Hub listens for its users
-	Host  string // the AI service host:port (must be in every provider policy)
-	Query string // extra upstream query (fault injection, for the harness)
-	Max   uint64 // MaxResponseBytes cap passed to the TEE
+	Addr    string // where the Hub listens for its users
+	Host    string // the AI service host:port (must be in every provider policy)
+	Query   string // extra upstream query (fault injection, for the harness)
+	Max     uint64 // MaxResponseBytes cap passed to the TEE. For a request it caps the body; for a session it caps the downlink, so the session settles for what it delivered instead of being cut un-reconcilably by the Hub
+	Tenants tenantResolver
+}
+
+// tenantKeyHeader is the header a user presents to identify itself. It is the
+// Hub's user-facing counterpart to the agent gate's key header: a bearer
+// credential, held to the same rule (a mismatch is refused, never defaulted).
+const tenantKeyHeader = "X-TokenHive-Key"
+
+// tenantResolver maps a presented user key to the tenant it belongs to, which
+// is what quota and attribution key on.
+//
+// With a key map configured, only a provisioned key admits a request and the
+// tenant is the mapped name — the caller cannot choose who it is. Without one
+// the Hub runs open: the presented key is the tenant, which is the deliberate
+// dev stance (there is no provisioned identity to check against), but the key
+// is still required. Silently defaulting an absent key to one shared name would
+// make every headerless caller a single tenant — one shared quota bucket and
+// one indistinguishable attribution — which is worse than refusing them.
+type tenantResolver struct {
+	// keys maps a user API key to the tenant it authenticates as. Empty means
+	// open mode.
+	keys map[string]string
+}
+
+// resolve returns the tenant a request belongs to, and whether it may proceed.
+func (r tenantResolver) resolve(req *http.Request) (string, bool) {
+	key := req.Header.Get(tenantKeyHeader)
+	if key == "" {
+		return "", false
+	}
+	if len(r.keys) == 0 {
+		return key, true
+	}
+	tenant, ok := r.keys[key]
+	return tenant, ok
 }
 
 // userRoute describes one user-facing endpoint the Hub relays. The Hub is a
@@ -102,7 +157,26 @@ func runServe(h *hub.Hub, cfg serveConfig) {
 		cfg.Addr, routePaths(), sessionPath, modelsPath)
 	log.Printf("hub reverse-tunnel endpoints: agent gate %s, tee relay %s, credential key %s",
 		agentGatePath, teeRelayPath, credentialKeyPath)
-	log.Fatal(http.ListenAndServe(cfg.Addr, mux))
+	srv := newHubServer(cfg.Addr, mux, defaultRequestReadTimeout)
+	log.Fatal(srv.ListenAndServe())
+}
+
+// newHubServer builds the Hub's HTTP server. It is split out so a test can run
+// the real configuration with its own read timeout — a test cannot wait out the
+// shipped 30s to observe the bound.
+//
+// WriteTimeout stays zero on purpose: an SSE response has no bounded size or
+// duration, and a write deadline would cut a live stream mid-body. ReadTimeout
+// is set because it bounds only the read side of a request, which the stdlib
+// ends before the handler runs (see defaultRequestReadTimeout).
+func newHubServer(addr string, handler http.Handler, readTimeout time.Duration) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       120 * time.Second,
+	}
 }
 
 func routePaths() []string {
@@ -125,22 +199,36 @@ type userHandler struct {
 func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
 	if err != nil {
+		// A body that stopped arriving is the deadline the server set (see
+		// defaultRequestReadTimeout) expiring: the client stalled, which is a
+		// 408. Any other read failure is a body the Hub cannot use, which is a
+		// 400.
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			writeJSONError(w, http.StatusRequestTimeout, "request body timed out")
+			log.Printf("api path=%s err=body read timeout", c.route.Path)
+			return
+		}
 		writeJSONError(w, http.StatusBadRequest, "read body")
 		return
 	}
 	var req struct {
-		Model string `json:"model"`
+		Model    string `json:"model"`
+		Provider string `json:"provider,omitempty"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil || req.Model == "" {
 		writeJSONError(w, http.StatusBadRequest, "model is required")
 		return
 	}
 
-	// Tenant resolution is the v1 placeholder: the user API key is not yet a
-	// real auth system, so the caller identifies itself with a header.
-	tenant := r.Header.Get("X-TokenHive-Key")
-	if tenant == "" {
-		tenant = "tenant-api"
+	// Tenant resolution: the caller identifies itself with a key, which either
+	// resolves through the Hub's key map to its tenant or (in open mode) is the
+	// tenant. A request with no key, or a key the map does not hold, is refused
+	// before anything is dispatched.
+	tenant, ok := c.cfg.Tenants.resolve(r)
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "missing or invalid api key")
+		log.Printf("api model=%q path=%s err=unauthorized", req.Model, c.route.Path)
+		return
 	}
 
 	flusher, _ := w.(http.Flusher)
@@ -184,27 +272,33 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	isSuccess := func() bool { return status >= 200 && status < 300 }
 
 	var chunks int
-	outcome, err := c.h.ExecuteForModel(r.Context(), tenant, req.Model, body,
-		func(provider string) (jobs.Spec, error) {
-			return buildSpec(provider, c.cfg.Host, c.route.Path, c.cfg.Query, body, c.cfg.Max)
-		},
-		func(chunk []byte) error {
-			// The chunk is already the upstream's SSE bytes — mockprovider
-			// frames `data: {…}` and the data path relays raw body bytes, so
-			// re-wrapping here would emit `data: data: {…}` and break every
-			// OpenAI SDK. The Hub's only job is byte-pass-through.
-			commit(tee.Response{})
-			if _, werr := w.Write(chunk); werr != nil {
-				return werr
-			}
-			chunks++
-			if flusher != nil {
-				flusher.Flush()
-			}
-			return nil
-		},
-		commit)
-
+	onChunk := func(chunk []byte) error {
+		// The chunk is already the upstream's SSE bytes — mockprovider
+		// frames `data: {…}` and the data path relays raw body bytes, so
+		// re-wrapping here would emit `data: data: {…}` and break every
+		// OpenAI SDK. The Hub's only job is byte-pass-through.
+		commit(tee.Response{})
+		if _, werr := w.Write(chunk); werr != nil {
+			return werr
+		}
+		chunks++
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	}
+	var outcome hub.Outcome
+	if req.Provider != "" {
+		outcome, err = c.h.ExecuteForProvider(r.Context(), tenant, req.Model, req.Provider, body,
+			func(provider string) (jobs.Spec, error) {
+				return buildSpec(provider, c.cfg.Host, c.route.Path, c.cfg.Query, body, c.cfg.Max)
+			}, onChunk, commit)
+	} else {
+		outcome, err = c.h.ExecuteForModel(r.Context(), tenant, req.Model, body,
+			func(provider string) (jobs.Spec, error) {
+				return buildSpec(provider, c.cfg.Host, c.route.Path, c.cfg.Query, body, c.cfg.Max)
+			}, onChunk, commit)
+	}
 	if !started {
 		// Nothing was committed to the wire: either a dispatch failure, or
 		// every provider failed before its response began and the last attempt
@@ -264,13 +358,36 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // modelsHandler answers GET /v1/models: the buyer-facing market directory.
-// Each row is a model an online agent declared it can serve, priced at the
-// lowest current per-request book price. The optional ?q= query filters by a
-// case-insensitive substring of the model name, so a buyer can look up an
-// exact model or scan a family ("deepseek" returns every deepseek-* listing).
+//
+// The endpoint exposes two views. The default is the model-aggregated
+// directory: each model an online agent declared it can serve appears once, at
+// the lowest current per-request book price. The optional ?q= query filters
+// that view by a case-insensitive substring of the model name, so a buyer can
+// look up an exact model or scan a family ("deepseek" returns every
+// deepseek-* listing).
+//
+// Two declarations switch to the expanded market view, where the same model
+// served by two sources appears as two rows:
+//
+//	?provider=NAME      every model one source offers
+//	?model=NAME         every source offering a model (substring)
+//
+// A buyer who names no source gets the cheapest server by default; one who
+// names a source — either to survey it or to pin a request to it — gets that
+// source's rows.
 func modelsHandler(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		quotes := h.SearchModels(r.URL.Query().Get("q"))
+		query := r.URL.Query()
+		provider, model := query.Get("provider"), query.Get("model")
+		var quotes []hub.ModelQuote
+		switch {
+		case provider != "" || model != "":
+			quotes = h.MarketQuotes(provider, model)
+		case query.Get("q") != "":
+			quotes = h.SearchModels(query.Get("q"))
+		default:
+			quotes = h.ModelDirectory()
+		}
 		if quotes == nil {
 			quotes = []hub.ModelQuote{}
 		}
@@ -284,14 +401,19 @@ func modelsHandler(h *hub.Hub) http.HandlerFunc {
 // apiErrorStatus maps a dispatch failure to an HTTP status. A provider that
 // simply cannot serve the model is a 404; a market with every agent offline
 // is a 503 (the model may exist — the supply is what is down); quota
-// exhaustion is a 429; anything else is a 502 upstream failure.
+// exhaustion and an exceeded in-flight share are both 429 (the request was
+// fine, the tenant is already asking for as much as it may), and an exhausted
+// spend budget is a 402 (refusing on price is not the same complaint as
+// refusing on rate); anything else is a 502 upstream failure.
 func apiErrorStatus(err error) int {
 	switch {
 	case errors.Is(err, hub.ErrNoProviderForModel), errors.Is(err, hub.ErrUnknownProvider):
 		return http.StatusNotFound
 	case errors.Is(err, hub.ErrNoProvidersOnline):
 		return http.StatusServiceUnavailable
-	case errors.Is(err, hub.ErrQuotaExceeded):
+	case errors.Is(err, hub.ErrBudgetExceeded):
+		return http.StatusPaymentRequired
+	case errors.Is(err, hub.ErrQuotaExceeded), errors.Is(err, hub.ErrTooManyInflight):
 		return http.StatusTooManyRequests
 	default:
 		return http.StatusBadGateway
@@ -353,18 +475,24 @@ func (c *sessionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Model string `json:"model"`
+		Model    string `json:"model"`
+		Provider string `json:"provider,omitempty"`
 	}
 	if err := json.Unmarshal(first, &req); err != nil || req.Model == "" {
 		return
 	}
 
-	tenant := r.Header.Get("X-TokenHive-Key")
-	if tenant == "" {
-		tenant = "tenant-api"
+	tenant, ok := c.cfg.Tenants.resolve(r)
+	if !ok {
+		return
 	}
 
-	outcome, err := c.h.RunRealtime(r.Context(), tenant, req.Model, c.buildSession, &sessionLink{conn: conn, first: first})
+	var outcome hub.SessionOutcome
+	if req.Provider != "" {
+		outcome, err = c.h.RunRealtimeForProvider(r.Context(), tenant, req.Model, req.Provider, c.buildSession, &sessionLink{conn: conn, first: first})
+	} else {
+		outcome, err = c.h.RunRealtime(r.Context(), tenant, req.Model, c.buildSession, &sessionLink{conn: conn, first: first})
+	}
 	log.Printf("session model=%q tenant=%q provider=%q uplink=%d downlink=%d charged=%.2f commission=%.2f buyer=%.2f err=%v",
 		req.Model, tenant, outcome.Provider, outcome.UplinkBytes, outcome.DownlinkBytes,
 		float64(outcome.Charged)/microsPerUnit, float64(outcome.Commission)/microsPerUnit,

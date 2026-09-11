@@ -305,3 +305,58 @@ func TestSlowStreamIsResetWithoutStallingOthers(t *testing.T) {
 		t.Fatalf("reset stream buffered nothing; overflow path not exercised")
 	}
 }
+
+// TestStreamBoundRefusesExtraStreams pins the tunnel's stream cap: a peer that
+// opens more streams than the bound must be refused rather than admitted. Each
+// stream costs a goroutine and up to maxBuf of buffer, so without the bound one
+// runaway or hostile endpoint could exhaust the process's memory and scheduler.
+func TestStreamBoundRefusesExtraStreams(t *testing.T) {
+	a, b := net.Pipe()
+	// The serving side admits exactly one stream, so the second dial must be
+	// refused by the bound rather than by anything else.
+	cli := NewLimited(a, High, 1)
+	hub := New(b, Low)
+	hold := make(chan struct{})
+	defer func() {
+		close(hold)
+		_ = hub.Close()
+		_ = cli.Close()
+	}()
+	admitted := make(chan struct{}, 1)
+	cli.Serve(func(s *Stream, _ []byte) {
+		admitted <- struct{}{}
+		<-hold // occupy the only slot for the whole test
+	})
+
+	first, err := hub.Dial(nil)
+	if err != nil {
+		t.Fatalf("first dial: %v", err)
+	}
+	defer first.Close()
+	select {
+	case <-admitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first stream was never admitted")
+	}
+
+	second, err := hub.Dial(nil)
+	if err != nil {
+		t.Fatalf("second dial: %v", err)
+	}
+	defer second.Close()
+
+	// A refused open is answered with a close frame, so the dialer's stream
+	// ends in EOF instead of being silently admitted.
+	closed := make(chan struct{})
+	go func() {
+		buf := make([]byte, 8)
+		if _, rerr := second.Read(buf); rerr == io.EOF {
+			close(closed)
+		}
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the over-bound stream was admitted instead of refused")
+	}
+}

@@ -55,10 +55,10 @@ func (l *Ledger) NoteSettled(provider string, micros uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.settled++
-	l.revenue += micros
+	l.revenue = saturatingAdd(l.revenue, micros)
 	account := l.account(provider)
 	account.settled++
-	account.revenue += micros
+	account.revenue = saturatingAdd(account.revenue, micros)
 }
 
 // NoteCommission records the Hub's cut on a settled charge, in the same
@@ -66,9 +66,21 @@ func (l *Ledger) NoteSettled(provider string, micros uint64) {
 func (l *Ledger) NoteCommission(provider string, micros uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.commission += micros
+	l.commission = saturatingAdd(l.commission, micros)
 	account := l.account(provider)
-	account.commission += micros
+	account.commission = saturatingAdd(account.commission, micros)
+}
+
+// saturatingAdd sums two ledger totals without ever wrapping: an overflow
+// saturates at the maximum instead of flipping a lifetime revenue total into a
+// small number. An overflowed ledger is already unreportable; a wrapped one
+// would additionally be wrong in the direction of undercharging.
+func saturatingAdd(a, b uint64) uint64 {
+	s, ok := addChecked(a, b)
+	if !ok {
+		return ^uint64(0)
+	}
+	return s
 }
 
 func (l *Ledger) account(provider string) *providerAccount {

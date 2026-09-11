@@ -565,6 +565,11 @@ type Session struct {
 	hasher  *proof.StreamingHasher
 	started int64
 
+	// downLimit is the session's downlink cap, taken from Spec.MaxResponseBytes.
+	// Zero means no cap. Read enforces it so that the receipt digests exactly
+	// the bytes the caller received — see Read.
+	downLimit uint64
+
 	mu             sync.Mutex
 	requestBytes   uint64
 	responseBytes  uint64
@@ -630,9 +635,13 @@ func (s *Service) OpenSession(ctx context.Context, job Job) (*Session, error) {
 	}
 
 	// A session is a GET handshake with no body; the transport adds the
-	// Upgrade headers itself. MaxResponseBytes is deliberately not applied to
-	// the tunnel: it is bidirectional and unbounded, so the only honest metering
-	// is counting and digesting everything the provider sends.
+	// Upgrade headers itself. Spec.MaxResponseBytes is applied to the tunnel's
+	// downlink (see Session.Read): a session is bounded by bytes rather than by
+	// a body, and the Hub bounds its own relay with the same number, so the two
+	// cut at the same point and the receipt stays reconcilable with what the Hub
+	// moved. The policy's own MaxResponseBytes is not folded in here — it caps a
+	// job's response and the caller has already stated the session's bound in
+	// the spec, which the policy authorised on the way in.
 	request := Request{
 		Method:   job.Spec.Method,
 		Provider: job.Spec.Provider,
@@ -649,14 +658,15 @@ func (s *Service) OpenSession(ctx context.Context, job Job) (*Session, error) {
 	}
 
 	return &Session{
-		svc:      s,
-		spec:     job.Spec,
-		specHash: specHash,
-		decision: decision,
-		seq:      seq,
-		conn:     conn,
-		hasher:   proof.NewStreamingHasher(job.Spec.JobID),
-		started:  now.Unix(),
+		svc:       s,
+		spec:      job.Spec,
+		specHash:  specHash,
+		decision:  decision,
+		seq:       seq,
+		conn:      conn,
+		hasher:    proof.NewStreamingHasher(job.Spec.JobID),
+		started:   now.Unix(),
+		downLimit: job.Spec.MaxResponseBytes,
 	}, nil
 }
 
@@ -675,13 +685,45 @@ func (s *Session) Write(p []byte) (int, error) {
 // Read receives downlink bytes from the provider, counts them toward
 // ResponseBytes, and digests them into the receipt's StreamHash. The bytes are
 // opaque — frame interpretation is entirely the caller's.
+//
+// The session's downlink cap (Spec.MaxResponseBytes) is enforced here, and it is
+// enforced by not delivering the offending bytes rather than by delivering them
+// and trimming the count afterwards. Everything the caller is handed is
+// therefore exactly what the digest covers, so the receipt reconciles with the
+// relayed transcript byte for byte. That is load-bearing for billing: the Hub
+// bounds its own relay with the same number, and a TEE that had digested a byte
+// it never delivered would leave no prefix of its receipt matching what the Hub
+// actually moved — which is precisely why a capped session used to settle
+// nothing. Reaching the cap marks the session truncated, so it prices for the
+// bytes that were delivered and no more.
 func (s *Session) Read(p []byte) (int, error) {
+	s.mu.Lock()
+	limit := s.downLimit
+	used := s.responseBytes
+	s.mu.Unlock()
+
+	if limit > 0 && used >= limit {
+		// The bound is already spent. End the relay without reading, so the
+		// provider is never drained past what the receipt accounts for.
+		s.markTruncated()
+		return 0, io.EOF
+	}
+
 	n, err := s.conn.Read(p)
 	if n > 0 {
-		s.hasher.WriteChunk(p[:n])
+		if limit > 0 && used+uint64(n) > limit {
+			// The cap lands inside this read: hand over only the bytes up to
+			// it and drop the rest. The dropped bytes are never hashed, so they
+			// are not in the receipt either.
+			n = int(limit - used)
+		}
+		_ = s.hasher.WriteChunk(p[:n])
 		s.mu.Lock()
 		s.responseBytes += uint64(n)
 		s.chunkCount++
+		if limit > 0 && s.responseBytes >= limit {
+			s.truncated = true
+		}
 		s.mu.Unlock()
 	}
 	// A provider that drops the socket mid-session — anything but a clean EOF —
@@ -690,11 +732,17 @@ func (s *Session) Read(p []byte) (int, error) {
 	// session was still open when the wire vanished, so it is truncated, not
 	// complete. The flag is checked even when n == 0 for exactly that case.
 	if err != nil && !errors.Is(err, io.EOF) {
-		s.mu.Lock()
-		s.truncated = true
-		s.mu.Unlock()
+		s.markTruncated()
 	}
 	return n, err
+}
+
+// markTruncated records that the session's transcript is partial, so Receipt
+// signs it as CompletionTruncated rather than CompletionComplete.
+func (s *Session) markTruncated() {
+	s.mu.Lock()
+	s.truncated = true
+	s.mu.Unlock()
 }
 
 // Close tears down the underlying provider connection. Pending Reads on the

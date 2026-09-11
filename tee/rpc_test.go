@@ -2,6 +2,8 @@ package tee
 
 import (
 	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
@@ -88,5 +90,29 @@ func TestExecuteRequestRoundTrip(t *testing.T) {
 	}
 	if decoded.Job().Spec.Provider != original.Spec.Provider {
 		t.Error("Job() must carry the spec through")
+	}
+}
+
+// TestServeExecuteBoundsTheRequestBody pins the read limit on the single RPC:
+// the enclave must refuse an oversized body before it allocates for it. svc is
+// deliberately nil — the size check has to fire before the service is ever
+// consulted, so a nil service is the assertion that it did.
+func TestServeExecuteBoundsTheRequestBody(t *testing.T) {
+	oversize := bytes.Repeat([]byte("x"), MaxExecuteBody+1)
+	req := httptest.NewRequest(http.MethodPost, "/v1/execute", bytes.NewReader(oversize))
+	rec := httptest.NewRecorder()
+	ServeExecute(nil, rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize body status = %d, want 413", rec.Code)
+	}
+
+	// A body exactly at the cap is not oversize: it is a (here malformed)
+	// request that must be refused for its content, not its size.
+	atCap := bytes.Repeat([]byte("x"), MaxExecuteBody)
+	req = httptest.NewRequest(http.MethodPost, "/v1/execute", bytes.NewReader(atCap))
+	rec = httptest.NewRecorder()
+	ServeExecute(nil, rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("at-cap body status = %d, want 400 (decode failure, not 413)", rec.Code)
 	}
 }

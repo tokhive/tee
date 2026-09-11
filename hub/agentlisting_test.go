@@ -40,7 +40,7 @@ func agentsOnlineWith(h *Hub, provider string, price RateCard, models []string) 
 func TestListingFollowsTheAgent(t *testing.T) {
 	h := scriptedHub(t, Config{
 		Rates:       ratesTable(map[string]RateCard{"cheap": {PerRequestMicros: 1000}}),
-		AgentSecret: []byte("gate-secret"),
+		AgentKeys: map[string][]byte{"cheap": []byte("gate-secret")},
 	})
 
 	// The agent lists a price below the platform default for its provider.
@@ -74,7 +74,7 @@ func TestOneOfflineAgentDoesNotHideAnother(t *testing.T) {
 			"cheap": {PerRequestMicros: 1000},
 			"dear":  {PerRequestMicros: 900},
 		}),
-		AgentSecret: []byte("gate-secret"),
+		AgentKeys: map[string][]byte{"cheap": []byte("gate-secret")},
 	})
 
 	dropCheap := agentsOnline(h, "cheap", RateCard{PerRequestMicros: 100})
@@ -99,7 +99,7 @@ func TestOneOfflineAgentDoesNotHideAnother(t *testing.T) {
 func TestAllAgentsOfflineIsSupplyDown(t *testing.T) {
 	h := scriptedHub(t, Config{
 		Rates:       ratesTable(map[string]RateCard{"cheap": {PerRequestMicros: 1000}}),
-		AgentSecret: []byte("gate-secret"),
+		AgentKeys: map[string][]byte{"cheap": []byte("gate-secret")},
 	})
 
 	if _, err := h.ExecuteForModel(context.Background(), "tenant", "m", nil, buildFor, nil); !errors.Is(err, ErrNoProvidersOnline) {
@@ -114,7 +114,7 @@ func TestAllAgentsOfflineIsSupplyDown(t *testing.T) {
 func TestModelNotServedByOnlineAgentsIsNotFound(t *testing.T) {
 	h := scriptedHub(t, Config{
 		Rates:       ratesTable(map[string]RateCard{"cheap": {PerRequestMicros: 1000}}),
-		AgentSecret: []byte("gate-secret"),
+		AgentKeys: map[string][]byte{"cheap": []byte("gate-secret")},
 	})
 	offline := agentsOnlineWith(h, "cheap", RateCard{PerRequestMicros: 250}, []string{"other-model"})
 	defer offline()
@@ -148,7 +148,7 @@ func TestMarketTableWithoutAgents(t *testing.T) {
 func TestModelDirectoryListsDeclaredModels(t *testing.T) {
 	h := scriptedHub(t, Config{
 		Rates:       ratesTable(map[string]RateCard{"cheap": {PerRequestMicros: 100}}),
-		AgentSecret: []byte("gate-secret"),
+		AgentKeys: map[string][]byte{"cheap": []byte("gate-secret")},
 	})
 	offline := agentsOnlineWith(h, "cheap", RateCard{PerRequestMicros: 250},
 		[]string{"sim-mock-0.5b", "claude-sim-haiku"})
@@ -176,7 +176,7 @@ func TestModelDirectoryListsDeclaredModels(t *testing.T) {
 func TestSearchModelsMatchesExactAndSubstring(t *testing.T) {
 	h := scriptedHub(t, Config{
 		Rates:       ratesTable(map[string]RateCard{"cheap": {PerRequestMicros: 100}}),
-		AgentSecret: []byte("gate-secret"),
+		AgentKeys: map[string][]byte{"cheap": []byte("gate-secret")},
 	})
 	agentsOnlineWith(h, "cheap", RateCard{PerRequestMicros: 100},
 		[]string{"deepseek-pro", "deepseek-flash", "gpt-4o"})

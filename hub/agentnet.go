@@ -23,10 +23,11 @@ import (
 
 // Errors from the agent dial-in gate.
 var (
-	// ErrBadAgentKey means a connection presented a shared key that does not
-	// match the Hub's. The key is the only thing standing between a discovered
-	// relay endpoint and a free general-purpose proxy, so a mismatch is refused
-	// before any stream is accepted.
+	// ErrBadAgentKey means a connection presented a key that does not match the
+	// Hub's per-provider table for the provider it named. The key is the only
+	// thing standing between a discovered relay endpoint and a free
+	// general-purpose proxy, so a mismatch is refused before any stream is
+	// accepted.
 	ErrBadAgentKey = errors.New("agent dial-in: bad shared key")
 	// ErrAgentUnrecognized means a control stream registered a provider name the
 	// Hub has no rate for, inside a tunnel that already authenticated.
@@ -34,10 +35,18 @@ var (
 )
 
 // AgentKeyHeader is the HTTP header an agent sets on its dial-in request to
-// present the shared key. It is deliberate precedent over Authorization/Bearer
-// so the Hub's agent gate and the TEE's user-facing API never confuse their
-// audiences.
+// present the key provisioned for its provider. It is deliberate precedent
+// over Authorization/Bearer so the Hub's agent gate and the TEE's user-facing
+// API never confuse their audiences.
 const AgentKeyHeader = "X-TokenHive-Agent-Key"
+
+// AgentProviderHeader is the HTTP header an agent sets on its dial-in request
+// to name the provider it egresses for. It is what lets the gate look up the
+// per-provider key (see Hub.authenticateAgent) before the tunnel is upgraded,
+// and it is checked against the provider on the register stream so a key
+// issued for one provider cannot register as another. A dial-in without it
+// admits nothing.
+const AgentProviderHeader = "X-TokenHive-Provider"
 
 // deliverCredential stores an agent-registered envelope in the Hub's
 // credential store. The Hub holds only ciphertext — an envelope sealed to the
@@ -58,10 +67,18 @@ func (h *Hub) revokeCredential(provider string) {
 	_ = h.credentialStore.Delete(provider)
 }
 
-// agentKeyMatches compares a presented key to the Hub's shared secret in
-// constant time. The key arrives over the network, so mismatches must not leak
-// where they differ (cf. the agent's credential check, which follows the same
-// rule).
+// agentsEnabled reports whether this Hub hosts the agent gate at all — a
+// per-provider key map is configured. When it is false the Hub has no way to
+// hear from a dialing agent, so it schedules over its static market table
+// rather than live supply (and the buyer directory is empty).
+func (h *Hub) agentsEnabled() bool {
+	return len(h.agentKeys) > 0
+}
+
+// agentKeyMatches compares a presented key to the Hub's secret for a provider
+// in constant time. The key arrives over the network, so mismatches must not
+// leak where they differ (cf. the agent's credential check, which follows the
+// same rule).
 func agentKeyMatches(presented, secret []byte) bool {
 	if len(secret) == 0 {
 		return false

@@ -14,6 +14,8 @@
 //	-drop N       withhold the receipt carrying ProviderSeq N from the store
 //	              (simulates a Hub that hides a record from the provider)
 //	-quota N      cap a tenant at N requests per -window (0 = unlimited)
+//	-tenant-budgets T=M  cap tenant T's cumulative spend at M micro-units
+//	-tenant-inflight N   cap a tenant at N concurrent jobs (0 = unlimited)
 package main
 
 import (
@@ -28,6 +30,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,6 +61,15 @@ const microsPerUnit = 1_000_000
 // it has not seen evidence for.
 var evidenceCache attest.Cache
 
+// defaultTenantInflight is how many jobs one tenant may run at once unless the
+// operator says otherwise. Unlike the other tenant controls this one ships on:
+// it is the fairness control for a shared provider, and a Hub that leaves it
+// off hands whoever sends the most concurrent requests every connection that
+// provider has. Eight concurrent jobs is well inside what one buyer drives and
+// well inside the connection pool a provider's agent can hold, so several
+// tenants fit at once — which is the whole point.
+const defaultTenantInflight = 8
+
 func main() {
 	teeURL := flag.String("tee", "http://127.0.0.1:18090", "TEE base URL")
 	serveAddr := flag.String("serve", "", "run as the OpenAI-compatible HTTP service on this address (empty = one-shot CLI mode)")
@@ -69,13 +81,20 @@ func main() {
 	maxBytes := flag.Uint64("max", 1<<20, "MaxResponseBytes cap sent to the TEE (bytes)")
 	n := flag.Int("n", 1, "number of requests to send")
 	commission := flag.Int("commission", 0, "Hub commission in basis points (100 = 1%)")
+	maxJob := flag.Uint64("max-job-micros", 0, "per-job ceiling on what the buyer may be billed, in micro-units (0 = no ceiling)")
 	drop := flag.Int("drop", 0, "withhold the receipt with this ProviderSeq from the store (0 = none)")
 	quotaLimit := flag.Int64("quota", 0, "max requests per tenant per window (0 = unlimited)")
 	quotaWindow := flag.Duration("window", time.Minute, "quota window")
 	sessionTimeout := flag.Duration("session-timeout", 10*time.Minute, "max wall-clock lifetime of a streaming session (0 = unlimited)")
 	sessionMax := flag.Uint64("session-max", 1<<20, "max downlink bytes a streaming session may relay (0 = unlimited)")
+	sessionMaxUp := flag.Uint64("session-max-up", 1<<20, "max uplink bytes a streaming session may relay (0 = unlimited)")
 	sessionIdle := flag.Duration("session-idle", 30*time.Second, "tear a session down if the provider streams nothing this long (0 = no watchdog)")
-	agentKey := flag.String("agent-key", "", "shared key Provider Agents must present to dial in (required to make the Hub schedulable-by-online)")
+	attemptTimeout := flag.Duration("attempt-timeout", 3*time.Minute, "bound on one dispatch to a provider, including TEE time (0 = no bound; keep this above the TEE's -request-timeout)")
+	agentKeys := flag.String("agent-keys", "", "per-provider agent keys as provider=key[,provider=key]; binds each tunnel to exactly one provider (required in serve mode)")
+	relayKey := flag.String("relay-key", "", "key the TEE must present to dial /v1/relay (empty = unauthenticated relay)")
+	tenantKeys := flag.String("tenant-keys", "", "user api keys as key=tenant[,key=tenant]; the key is verified and resolves to its tenant (empty = open mode: the presented key is the tenant)")
+	tenantBudgets := flag.String("tenant-budgets", "", "per-tenant cumulative spend ceilings in micro-units, as tenant=micros[,tenant=micros]; a tenant absent from the map is uncapped")
+	tenantInflight := flag.Int("tenant-inflight", defaultTenantInflight, "how many jobs one tenant may run at once; keeps one buyer from occupying every connection a shared provider has (0 = unlimited)")
 	credential := flag.String("credential", "", "provider access token to register with the TEE before the request loop (simulation one-shot mode: the CLI holds the seller's token and delivers it sealed to -tee, as a dialing agent would through a resident Hub)")
 	audit := flag.Bool("audit", false, "audit the receipt store for gaps and verify signatures")
 	allowed := flag.String("allowed-platforms", "simulated", "comma-separated attestation platforms the Hub trusts (e.g. simulated,aws-sev-snp)")
@@ -125,6 +144,19 @@ func main() {
 			log.Fatalf("quota: %v", err)
 		}
 	}
+	perProviderKeys, err := parseAgentKeys(*agentKeys)
+	if err != nil {
+		log.Fatalf("agent-keys: %v", err)
+	}
+	tenants, err := parseTenantKeys(*tenantKeys)
+	if err != nil {
+		log.Fatalf("tenant-keys: %v", err)
+	}
+	budgets, err := parseBudgets(*tenantBudgets)
+	if err != nil {
+		log.Fatalf("tenant-budgets: %v", err)
+	}
+
 	teeClient := &hub.HTTPTEE{
 		URL:        *teeURL + "/v1/execute",
 		SessionURL: wsEndpoint(*teeURL, "/v1/session"),
@@ -137,18 +169,24 @@ func main() {
 		log.Fatalf("attestation: %v", err)
 	}
 	h, err := hub.New(hub.Config{
-		TEE:                 teeClient,
-		Rates:               rates,
-		Store:               store,
-		Verify:              verifier.VerifyFunc(),
-		Quota:               quota,
-		Commission:          uint64(*commission),
-		Withhold:            withholdSeq(*drop),
-		SessionTimeout:      *sessionTimeout,
-		SessionMaxDownBytes: *sessionMax,
-		SessionIdle:         *sessionIdle,
-		AgentSecret:         []byte(*agentKey),
-		Credentials:         teeClient,
+		TEE:                  teeClient,
+		Rates:                rates,
+		Store:                store,
+		Verify:               verifier.VerifyFunc(),
+		Quota:                quota,
+		Budgets:              budgets,
+		MaxInflightPerTenant: *tenantInflight,
+		Commission:           uint64(*commission),
+		MaxJobMicros:         *maxJob,
+		Withhold:             withholdSeq(*drop),
+		SessionTimeout:       *sessionTimeout,
+		SessionMaxDownBytes:  *sessionMax,
+		SessionMaxUpBytes:    *sessionMaxUp,
+		SessionIdle:          *sessionIdle,
+		AttemptTimeout:       *attemptTimeout,
+		AgentKeys:            perProviderKeys,
+		RelaySecret:          []byte(*relayKey),
+		Credentials:          teeClient,
 	})
 	if err != nil {
 		log.Fatalf("build hub: %v", err)
@@ -169,13 +207,20 @@ func main() {
 	}
 
 	// Resident user-facing mode: one OpenAI-compatible HTTP endpoint that routes
-	// by model through the lowest-price scheduler.
+	// by model through the lowest-price scheduler. Serving refuses to start
+	// without both the agent gate (per-provider keys) and the TEE relay key: a
+	// Hub exposed to the network with either unauthenticated is a free egress
+	// proxy through every seller's connection.
+	if err := requireServeKeys(*serveAddr, *agentKeys, *relayKey); err != nil {
+		log.Fatal(err)
+	}
 	if *serveAddr != "" {
 		runServe(h, serveConfig{
-			Addr:  *serveAddr,
-			Host:  *host,
-			Query: *query,
-			Max:   *maxBytes,
+			Addr:    *serveAddr,
+			Host:    *host,
+			Query:   *query,
+			Max:     *maxBytes,
+			Tenants: tenantResolver{keys: tenants},
 		})
 		return
 	}
@@ -201,6 +246,22 @@ func main() {
 		printOutcome(outcome)
 	}
 	printLedger(h.Ledger())
+}
+
+// requireServeKeys refuses to expose a Hub on the network without an
+// authenticated agent gate and an authenticated TEE relay. In CLI one-shot mode
+// (no -serve) nothing is exposed, so neither key is required.
+func requireServeKeys(serveAddr, agentKeys, relayKey string) error {
+	if serveAddr == "" {
+		return nil
+	}
+	if agentKeys == "" {
+		return errors.New("serve mode requires -agent-keys (per-provider agent keys)")
+	}
+	if relayKey == "" {
+		return errors.New("serve mode requires -relay-key (TEE relay authentication)")
+	}
+	return nil
 }
 
 // wsEndpoint rewrites the TEE's http(s) base into the ws(s) WebSocket URL its
@@ -432,6 +493,82 @@ func withholdSeq(seq int) func(uint64) bool {
 	}
 	target := uint64(seq)
 	return func(seq uint64) bool { return seq == target }
+}
+
+// parsePairs splits a "key=value,key=value" flag into its entries, rejecting a
+// malformed entry rather than silently ignoring it.
+func parsePairs(spec string) ([][2]string, error) {
+	if spec == "" {
+		return nil, nil
+	}
+	var out [][2]string
+	for _, entry := range strings.Split(spec, ",") {
+		k, v, ok := strings.Cut(entry, "=")
+		if !ok || k == "" || v == "" {
+			return nil, fmt.Errorf("entry %q is not key=value", entry)
+		}
+		out = append(out, [2]string{k, v})
+	}
+	return out, nil
+}
+
+// parseBudgets turns the -tenant-budgets flag into the per-tenant cumulative
+// ceilings. A malformed entry is a startup failure rather than a silently
+// dropped cap: a typo must not leave a tenant unbudgeted by accident.
+func parseBudgets(spec string) (map[string]uint64, error) {
+	pairs, err := parsePairs(spec)
+	if err != nil {
+		return nil, err
+	}
+	if pairs == nil {
+		return nil, nil
+	}
+	budgets := make(map[string]uint64, len(pairs))
+	for _, p := range pairs {
+		micros, err := strconv.ParseUint(p[1], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("tenant %q: ceiling %q is not a number", p[0], p[1])
+		}
+		budgets[p[0]] = micros
+	}
+	return budgets, nil
+}
+
+// parseAgentKeys turns the -agent-keys flag into the per-provider key map. A
+// provider name that could never be registered is rejected here, so a typo is a
+// startup failure rather than a key that silently matches nothing.
+func parseAgentKeys(spec string) (map[string][]byte, error) {
+	pairs, err := parsePairs(spec)
+	if err != nil {
+		return nil, err
+	}
+	if pairs == nil {
+		return nil, nil
+	}
+	keys := make(map[string][]byte, len(pairs))
+	for _, p := range pairs {
+		if err := jobs.ValidateProviderName(p[0]); err != nil {
+			return nil, err
+		}
+		keys[p[0]] = []byte(p[1])
+	}
+	return keys, nil
+}
+
+// parseTenantKeys turns the -tenant-keys flag into the user key -> tenant map.
+func parseTenantKeys(spec string) (map[string]string, error) {
+	pairs, err := parsePairs(spec)
+	if err != nil {
+		return nil, err
+	}
+	if pairs == nil {
+		return nil, nil
+	}
+	keys := make(map[string]string, len(pairs))
+	for _, p := range pairs {
+		keys[p[0]] = p[1]
+	}
+	return keys, nil
 }
 
 func buildSpec(provider, host, path, query string, body []byte, maxBytes uint64) (jobs.Spec, error) {

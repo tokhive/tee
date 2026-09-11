@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
@@ -39,16 +40,32 @@ var (
 	ErrUnknownProvider = errors.New("no rate published for provider")
 	// ErrQuotaExceeded means the tenant was refused before dispatch.
 	ErrQuotaExceeded = errors.New("tenant quota exhausted")
+	// ErrBudgetExceeded means the tenant's cumulative spend has reached the
+	// ceiling the Hub holds for it. Like the quota it is refused before
+	// dispatch, so the provider is never asked to spend a credential on a job
+	// the buyer cannot pay for.
+	ErrBudgetExceeded = errors.New("tenant budget exhausted")
 	// ErrStreamMismatch means the receipt attests bytes other than the ones
 	// the Hub forwarded. Either the Hub is lying about what it delivered or
 	// the TEE is not describing the same exchange; neither is settleable.
 	ErrStreamMismatch = errors.New("receipt attests different bytes than the Hub forwarded")
+	// ErrJobPriceExceeded means a job priced above the Hub's per-job ceiling.
+	// It is a Hub policy refusal, not a provider fault: the exchange happened
+	// and its receipt is kept (so the execution is not hidden from the
+	// provider), but no money moves, because the Hub will not bill a buyer for
+	// a job it did not bound. Retrying another provider cannot help — the
+	// ceiling is what it is.
+	ErrJobPriceExceeded = errors.New("job priced above the hub's per-job ceiling")
 	// ErrResponseStartMismatch means the response-start frame the Hub acted
 	// on — the status it showed the user and the headers it relayed — is not
 	// the exchange the receipt attests. Like ErrStreamMismatch it is a
 	// contradiction between what the Hub did and what the TEE signed, so
 	// nothing is settled against it.
 	ErrResponseStartMismatch = errors.New("response start does not match the receipt")
+	// ErrDuplicateSettlement means a receipt for a job this Hub already settled
+	// was presented again. One JobID settles exactly once; a repeat is either a
+	// broken caller or a double-charge attempt, and neither books a second time.
+	ErrDuplicateSettlement = errors.New("job already settled")
 )
 
 // Config assembles a Hub.
@@ -82,6 +99,16 @@ type Config struct {
 	// stop a credential being drained should not be on unless asked for.
 	Quota *Quota
 
+	// Budgets caps each tenant's cumulative spend, keyed by tenant, in the same
+	// micro-units as a rate card. A tenant absent from the map has no ceiling —
+	// the deliberate opt-out described on Quota — and is never tracked, so the
+	// table is bounded by what is provisioned here.
+	//
+	// It is the cumulative counterpart of MaxJobMicros: that bounds one job,
+	// this bounds the sum. Without it a seller whose card prices just under the
+	// per-job ceiling can bill a buyer indefinitely.
+	Budgets map[string]uint64
+
 	// Commission sets the fixed fraction the Hub takes over every settled
 	// charge, in basis points. 100 is 1%, 1000 is 10%, zero means the Hub takes
 	// no commission.
@@ -91,8 +118,50 @@ type Config struct {
 	// separate total. The provider always earns exactly what its rate card says.
 	Commission uint64
 
+	// MaxJobMicros caps what a single job may bill the buyer, in the same
+	// integer micro-units as a rate card. Zero (the default) means no ceiling,
+	// which is the deliberate opt-out described on Quota — a control that
+	// exists to stop a hostile seller's rate card from draining a buyer should
+	// not be on unless asked for.
+	//
+	// It is the buyer-side counterpart of the seller-side RateCard: the card
+	// says what a seller may charge, the ceiling says what the Hub will pass on.
+	// Without it a seller's volume rate is bounded only by MaxRateMicros, which
+	// is large enough that a hidden per-megabyte price can still produce a
+	// crippling bill. A job that prices above the ceiling is refused at
+	// settlement: its receipt is stored (the execution is never invisible) but
+	// nothing is charged or paid (see ErrJobPriceExceeded).
+	MaxJobMicros uint64
+
+	// MaxInflightPerTenant caps how many jobs one tenant may run at the same
+	// time. Zero (the default) means no cap, the deliberate opt-out described
+	// on Quota; the hub binary ships a default so a deployment is fair unless
+	// it opts out.
+	//
+	// It is the fairness control for a shared provider, and the only layer that
+	// can enforce one: the TEE pools provider connections per (provider, host)
+	// and never learns which tenant a job belongs to (the tenant is not in the
+	// JobSpec, so it is not attested). Without a cap, one tenant can hold every
+	// slot a shared provider has — a streaming session does so for its whole
+	// life — and leave the market's other buyers queueing behind it.
+	//
+	// The cap is on concurrency, not on rate: a tenant may run any number of
+	// jobs over time, just not more than its share at one instant. Requests and
+	// sessions share the one count, because they draw on the same pool.
+	MaxInflightPerTenant int
+
 	// Clock returns the current time. Defaults to time.Now.
 	Clock func() time.Time
+
+	// AttemptTimeout bounds one dispatch to a provider, including the time the
+	// TEE spends on it. Zero (the default) means the caller's context is the
+	// only bound. The TEE already bounds a single exchange (its request
+	// timeout), which is what stops a deliberately slow provider from holding a
+	// job open forever; this is the Hub-side backstop for a TEE that stops
+	// answering for any other reason. It must be set longer than the TEE's own
+	// bound, or the Hub would cut exchanges the TEE would have completed — and
+	// therefore bill a truncation the provider did not cause.
+	AttemptTimeout time.Duration
 
 	// Withhold, if set, suppresses the receipt carrying a given ProviderSeq
 	// from the store. It exists so a test can play a Hub that hides an
@@ -102,19 +171,33 @@ type Config struct {
 
 	// SessionTimeout bounds a streaming session's wall-clock lifetime; zero
 	// means no time bound. SessionMaxDownBytes caps the bytes relayed downlink;
-	// zero means no byte bound. SessionIdle is the downlink-stall watchdog — if
-	// the provider streams nothing for this long the session is torn down; zero
-	// disables the stall watchdog. These three are the Hub's own bounds: the TEE
-	// deliberately applies none to a session (it is a transparent relay), so
-	// unbounded consumption stays on the Hub's side of the wire.
+	// zero means no byte bound. SessionMaxUpBytes caps the bytes relayed
+	// uplink; zero means no byte bound. SessionIdle is the downlink-stall
+	// watchdog — if the provider streams nothing for this long the session is
+	// torn down; zero disables the stall watchdog. These four are the Hub's own
+	// bounds: the TEE deliberately applies none to a session (it is a
+	// transparent relay), so unbounded consumption stays on the Hub's side of
+	// the wire.
 	SessionTimeout      time.Duration
 	SessionMaxDownBytes uint64
+	SessionMaxUpBytes   uint64
 	SessionIdle         time.Duration
 
-	// AgentSecret is the shared key a Provider Agent must present to dial in
-	// through the reverse-tunnel gate. Nil disables agent registration, which is
-	// a deliberate stance for a Hub that only runs against scripted stand-ins.
-	AgentSecret []byte
+	// AgentKeys is the per-provider key map a Provider Agent must present to
+	// dial in through the reverse-tunnel gate (AgentProviderHeader + AgentKeyHeader).
+	// A dial-in must name a provider and present exactly the key registered for
+	// it, which is what binds a tunnel to a provider: no seller can come online
+	// as another without their key, displace their tunnel, or collect the
+	// revenue routed to that name. Empty disables agent registration — the
+	// deliberate stance for a Hub that only runs against scripted stand-ins.
+	AgentKeys map[string][]byte
+
+	// RelaySecret is the key the TEE must present to dial the TeeRelay
+	// endpoint (RelayKeyHeader). The relay bridges any stream into any online
+	// agent's tunnel, so an unauthenticated one is an open egress proxy
+	// through every seller's connection. Nil leaves it open — the deliberate
+	// stance for a Hub whose TEE is only reachable by the operator.
+	RelaySecret []byte
 
 	// Credentials is the TEE's credential plane (see CredentialService): its
 	// only job is to publish the TEE's inbox public key, which provider agents
@@ -139,18 +222,28 @@ type Hub struct {
 	verify     func(proof.SignedReceipt) error
 	ledger     *Ledger
 	quota      *Quota
+	budget     *Budget
+	flight     *flightLimiter
 	commission CommissionRate
+	maxJob     uint64
 	clock      func() time.Time
 	withhold   func(uint64) bool
 
+	attemptTimeout time.Duration
+
 	sessionTimeout      time.Duration
 	sessionMaxDownBytes uint64
+	sessionMaxUpBytes   uint64
 	sessionIdle         time.Duration
 
 	agents          *agentRegistry
-	agentSecret     []byte
+	agentKeys       map[string][]byte
+	relaySecret     []byte
 	credentials     CredentialService
 	credentialStore CredentialStore
+
+	settledMu sync.Mutex
+	settled   map[string]struct{}
 }
 
 // New builds a Hub, refusing to construct one that would settle incorrectly.
@@ -171,6 +264,20 @@ func New(cfg Config) (*Hub, error) {
 	if ledger == nil {
 		ledger = NewLedger()
 	}
+	var budget *Budget
+	if len(cfg.Budgets) > 0 {
+		built, err := NewBudget(cfg.Budgets)
+		if err != nil {
+			return nil, err
+		}
+		budget = built
+	}
+	// A nil limiter admits everything, so an unconfigured Hub carries no
+	// per-tenant bookkeeping at all.
+	var flight *flightLimiter
+	if cfg.MaxInflightPerTenant > 0 {
+		flight = newFlightLimiter(cfg.MaxInflightPerTenant, MaxFlightTenants)
+	}
 	clock := cfg.Clock
 	if clock == nil {
 		clock = time.Now
@@ -186,18 +293,27 @@ func New(cfg Config) (*Hub, error) {
 		verify:     cfg.Verify,
 		ledger:     ledger,
 		quota:      cfg.Quota,
+		budget:     budget,
+		flight:     flight,
 		commission: CommissionRate{BasisPoints: cfg.Commission},
+		maxJob:     cfg.MaxJobMicros,
 		clock:      clock,
 		withhold:   cfg.Withhold,
 
+		attemptTimeout: cfg.AttemptTimeout,
+
 		sessionTimeout:      cfg.SessionTimeout,
 		sessionMaxDownBytes: cfg.SessionMaxDownBytes,
+		sessionMaxUpBytes:   cfg.SessionMaxUpBytes,
 		sessionIdle:         cfg.SessionIdle,
 
 		agents:          newAgentRegistry(),
-		agentSecret:     cfg.AgentSecret,
+		agentKeys:       cfg.AgentKeys,
+		relaySecret:     cfg.RelaySecret,
 		credentials:     cfg.Credentials,
 		credentialStore: credentialStore,
+
+		settled: make(map[string]struct{}),
 	}, nil
 }
 
@@ -262,6 +378,44 @@ func (h *Hub) card(provider string) (RateCard, bool) {
 	return card, ok
 }
 
+// admitTenant applies the Hub's pre-dispatch controls for a tenant: the
+// cumulative budget, then the request quota.
+//
+// The budget is checked first on purpose. It is the money gate, and a tenant
+// whose budget is exhausted must not also burn a rate-limit slot — the request
+// is going to be refused either way, and consuming the slot would push the
+// tenant's next (affordable) request out of its window. Both checks run before
+// dispatch, so a refused request never consumes a ProviderSeq.
+func (h *Hub) admitTenant(tenant string) error {
+	if h.budget != nil && !h.budget.Allow(tenant) {
+		return fmt.Errorf("%w: tenant %q", ErrBudgetExceeded, tenant)
+	}
+	if h.quota != nil && !h.quota.Allow(tenant, h.clock()) {
+		return fmt.Errorf("%w: tenant %q", ErrQuotaExceeded, tenant)
+	}
+	return nil
+}
+
+// chargeTenant records a settled bill against the tenant's budget. It is called
+// exactly where the ledger settles, never where the Hub merely priced a job it
+// refused to bill: a refusal moves no money and must not consume budget.
+func (h *Hub) chargeTenant(tenant string, micros uint64) {
+	if h.budget != nil {
+		h.budget.Record(tenant, micros)
+	}
+}
+
+// attemptContext derives the per-attempt context from the caller's, bounding
+// one dispatch with the Hub's attempt window. A zero window leaves the
+// caller's context untouched and returns a no-op cancel, so callers can always
+// defer it.
+func (h *Hub) attemptContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if h.attemptTimeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, h.attemptTimeout)
+}
+
 // Outcome is what one request through the Hub produced.
 type Outcome struct {
 	// Receipt is the verified receipt. Zero if the job never reached the TEE.
@@ -283,7 +437,8 @@ type Outcome struct {
 	Stored bool
 }
 
-// Execute runs one job: check quota, dispatch, verify, price, settle, store.
+// Execute runs one job: check budget and quota, dispatch, verify, price,
+// settle, store.
 //
 // model is the Hub's own pricing key, deliberately out-of-band from the job
 // spec: the TEE only establishes and holds the provider connection, so it
@@ -291,10 +446,10 @@ type Outcome struct {
 // request to perform". The Hub selects and prices providers from the model it
 // resolved locally.
 //
-// The ordering is load-bearing in three places. Quota is checked before
-// dispatch, so a refused request never consumes a ProviderSeq — if it did,
-// ordinary rate limiting would punch holes in the provider's sequence and be
-// indistinguishable from the Hub hiding executions. The receipt is verified
+// The ordering is load-bearing in three places. Budget and quota are checked
+// before dispatch, so a refused request never consumes a ProviderSeq — if it
+// did, ordinary rate limiting would punch holes in the provider's sequence and
+// be indistinguishable from the Hub hiding executions. The receipt is verified
 // before anything is charged, so a forged receipt cannot move money. And the
 // receipt is stored before the ledger settles, so money books only when the
 // provider's audit record is durable: a store failure means the exchange did
@@ -303,9 +458,11 @@ type Outcome struct {
 // a double charge).
 func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec, body []byte,
 	onChunk func([]byte) error, onStart ...func(tee.Response)) (Outcome, error) {
-	if h.quota != nil && !h.quota.Allow(tenant, h.clock()) {
-		return Outcome{}, fmt.Errorf("%w: tenant %q", ErrQuotaExceeded, tenant)
+	release, err := h.beginJob(tenant)
+	if err != nil {
+		return Outcome{}, err
 	}
+	defer release()
 
 	card, ok := h.card(spec.Provider)
 	if !ok {
@@ -316,12 +473,18 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 	// TEE can authenticate the upstream request. This happens per dispatch,
 	// from the store, so the Hub never holds the token itself — only the
 	// ciphertext an agent registered.
-	spec, err := h.attachCredential(spec)
+	spec, err = h.attachCredential(spec)
 	if err != nil {
 		return Outcome{}, err
 	}
 
 	h.ledger.NoteDispatch(spec.Provider)
+
+	// Bound this one dispatch (see AttemptTimeout). Each attempt gets a fresh
+	// window, so a slow provider that eats the whole window does not also
+	// consume the fallback's.
+	ctx, cancel := h.attemptContext(ctx)
+	defer cancel()
 
 	res, err := h.tee.Execute(ctx, spec, body, onChunk, onStart...)
 	if err != nil {
@@ -372,6 +535,20 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, fmt.Errorf("%w: charged %d plus commission %d",
 			ErrPriceOverflow, charged, commission)
 	}
+	if h.maxJob > 0 && buyer > h.maxJob {
+		// The buyer would be billed more than the Hub's per-job ceiling. The
+		// exchange really happened, so its receipt is kept — the provider must
+		// still be able to audit every use of its credential, and a hole in
+		// the sequence would read as a hidden execution — but nothing moves:
+		// no charge, no commission, no settlement. The caller gets the priced
+		// outcome so it can show what was refused.
+		if serr := h.store.Put(spec.Provider, res.Receipt); serr != nil {
+			return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer},
+				fmt.Errorf("store receipt: %w", serr)
+		}
+		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer, Stored: true},
+			fmt.Errorf("%w: buyer %d exceeds %d", ErrJobPriceExceeded, buyer, h.maxJob)
+	}
 	seq := res.Receipt.Receipt.ProviderSeq
 	if h.withhold != nil && h.withhold(seq) {
 		// A withheld receipt is the test seam for a Hub that hides an
@@ -379,8 +556,13 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 		// stored, so the provider can prove the gap. The normal path stores
 		// before settling; this path skips the store deliberately, not because
 		// it failed.
+		if !h.claimSettlement(res.Receipt.Receipt.JobID) {
+			return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer},
+				fmt.Errorf("%w: job %x", ErrDuplicateSettlement, res.Receipt.Receipt.JobID)
+		}
 		h.ledger.NoteSettled(spec.Provider, charged)
 		h.ledger.NoteCommission(spec.Provider, commission)
+		h.chargeTenant(tenant, buyer)
 		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer}, nil
 	}
 	if err := h.store.Put(spec.Provider, res.Receipt); err != nil {
@@ -393,9 +575,37 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 	}
 	// Store first, then settle: the ledger is in-memory and cannot fail, so
 	// once Put has succeeded the settlement is guaranteed to be recorded.
+	if !h.claimSettlement(res.Receipt.Receipt.JobID) {
+		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer, Stored: true},
+			fmt.Errorf("%w: job %x", ErrDuplicateSettlement, res.Receipt.Receipt.JobID)
+	}
 	h.ledger.NoteSettled(spec.Provider, charged)
 	h.ledger.NoteCommission(spec.Provider, commission)
+	h.chargeTenant(tenant, buyer)
 	return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer, Stored: true}, nil
+}
+
+// maxSettledJobs caps the in-memory dedup table. Beyond it the table is reset
+// and the dedup window restarts: JobIDs are generated by the Hub, so a repeated
+// settlement across a reset is no more plausible than a colliding JobID.
+const maxSettledJobs = 1 << 18
+
+// claimSettlement records that a job's receipt is being settled, returning
+// false when the same JobID was already settled by this Hub. It is the
+// defensive half of "one JobID settles exactly once": the TEE signs each job
+// once, so a second settlement of the same JobID is a broken caller or a
+// double-charge attempt, and the Hub refuses to book it twice.
+func (h *Hub) claimSettlement(jobID []byte) bool {
+	h.settledMu.Lock()
+	defer h.settledMu.Unlock()
+	if _, dup := h.settled[string(jobID)]; dup {
+		return false
+	}
+	if len(h.settled) >= maxSettledJobs {
+		h.settled = make(map[string]struct{})
+	}
+	h.settled[string(jobID)] = struct{}{}
+	return true
 }
 
 // receiptMatchesStart reports whether a receipt attests the response start the

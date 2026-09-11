@@ -53,6 +53,11 @@ type miniHub struct {
 	registrations chan hub.AgentRegister
 	relays        chan *tunnel.Stream
 	stop          chan struct{}
+
+	// relayCount is how many relay streams the gate opens per registration.
+	// Every test but the connection-cap one wants the single stream that comes
+	// with a registration; that one needs several at the same instant.
+	relayCount int
 }
 
 func (h *miniHub) handler(w http.ResponseWriter, r *http.Request) {
@@ -72,16 +77,18 @@ func (h *miniHub) handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.registrations <- reg
-		// Open a relay stream toward the agent naming the upstream to dial. The
-		// agent bridges it; we hand the pipe to the test.
-		meta, _ := json.Marshal(hub.UpstreamOpen{Host: echoHostFor(reg.Provider)})
-		relay, err := mux.Dial(meta)
-		if err != nil {
-			return
-		}
 		// Drain the control stream so it stays open (the agent's lease).
 		go func() { _, _ = io.Copy(io.Discard, control) }()
-		h.relays <- relay
+		// Open relay streams toward the agent naming the upstream to dial. The
+		// agent bridges them; we hand the pipes to the test.
+		meta, _ := json.Marshal(hub.UpstreamOpen{Host: echoHostFor(reg.Provider)})
+		for i := 0; i < h.relayCount; i++ {
+			relay, err := mux.Dial(meta)
+			if err != nil {
+				return
+			}
+			h.relays <- relay
+		}
 	})
 	// Keep the tunnel alive for the test's lifetime: block the handler instead of
 	// letting it return (which would close the connection out from under the
@@ -91,12 +98,17 @@ func (h *miniHub) handler(w http.ResponseWriter, r *http.Request) {
 	_ = conn.Close()
 }
 
-func startMiniHub(t *testing.T) (*miniHub, string) {
+func startMiniHub(t *testing.T) (*miniHub, string) { return startMiniHubRelays(t, 1) }
+
+// startMiniHubRelays is startMiniHub with the gate opening n relay streams per
+// registration, for tests about how many the agent will serve at once.
+func startMiniHubRelays(t *testing.T, n int) (*miniHub, string) {
 	t.Helper()
 	mh := &miniHub{
 		registrations: make(chan hub.AgentRegister, 4),
-		relays:        make(chan *tunnel.Stream, 4),
+		relays:        make(chan *tunnel.Stream, 8),
 		stop:          make(chan struct{}),
+		relayCount:    n,
 	}
 	srv := httptest.NewServer(http.HandlerFunc(mh.handler))
 	t.Cleanup(func() {
@@ -251,6 +263,257 @@ func TestAgentRefusesOutsideAllowlist(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("relay stream neither echoed nor closed for an off-allowlist host")
+	}
+}
+
+// probeRelay writes msg down a relay and reports whether it came back. It
+// deliberately does not close the relay: the caller decides when the stream —
+// and the agent's slot behind it — is released, which is what lets a test hold
+// one relay open while probing others.
+func probeRelay(t *testing.T, relay *tunnel.Stream, msg []byte) <-chan bool {
+	t.Helper()
+	result := make(chan bool, 1)
+	go func() {
+		back := make([]byte, len(msg))
+		if _, err := relay.Write(msg); err != nil {
+			result <- false
+			return
+		}
+		_, err := io.ReadFull(relay, back)
+		result <- err == nil && bytes.Equal(back, msg)
+	}()
+	return result
+}
+
+// waitProbe waits for a probe to finish. A relay the agent refused, or one it
+// gave up on, ends the read without an echo, so a probe always completes for
+// both outcomes — a probe that never completes is a hang, not a refusal.
+func waitProbe(t *testing.T, result <-chan bool) bool {
+	t.Helper()
+	select {
+	case ok := <-result:
+		return ok
+	case <-time.After(5 * time.Second):
+		t.Fatal("a relay neither echoed nor closed")
+		return false
+	}
+}
+
+// relayEchoes writes msg down a relay and reports whether it came back, closing
+// the relay either way.
+func relayEchoes(t *testing.T, relay *tunnel.Stream, msg []byte) bool {
+	t.Helper()
+	defer relay.Close()
+	return waitProbe(t, probeRelay(t, relay, msg))
+}
+
+// TestAgentRefusesRelaysBeyondItsConnectionCap pins the contributor-side bound:
+// the agent serves at most MaxRelayConns streams at once and refuses the rest
+// outright. Refusing rather than queueing is what lets the Hub see that the
+// machine is full and route the job to another provider, instead of waiting on
+// one that has already said no.
+func TestAgentRefusesRelaysBeyondItsConnectionCap(t *testing.T) {
+	echo := startEchoUpstream(t)
+	mh, gateURL := startMiniHubRelays(t, 3)
+
+	a, err := NewAgent(AgentConfig{
+		HubGateURL:     gateURL,
+		SharedKey:      []byte(testAgentSecret),
+		Self:           hub.AgentRegister{Provider: echo},
+		AllowedTargets: []string{echo},
+		ReconnectDelay: 50 * time.Millisecond,
+		MaxRelayConns:  1,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx) }()
+	<-mh.registrations
+
+	relays := make([]*tunnel.Stream, 0, 3)
+	for i := 0; i < 3; i++ {
+		select {
+		case r := <-mh.relays:
+			relays = append(relays, r)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("hub opened only %d of 3 relays", i)
+		}
+	}
+
+	// Probe all three without closing any: the relay that won the slot must
+	// still be holding it while the other two are handled, which is the state
+	// the cap is about. Closing as we went could hand the slot to the next relay
+	// and let a second one be served.
+	results := make([]<-chan bool, len(relays))
+	for i, r := range relays {
+		results[i] = probeRelay(t, r, []byte("one-slot"))
+	}
+	served := 0
+	for _, res := range results {
+		if waitProbe(t, res) {
+			served++
+		}
+	}
+	for _, r := range relays {
+		_ = r.Close()
+	}
+
+	if served != 1 {
+		t.Fatalf("%d of 3 relays were served, want exactly 1 (the cap)", served)
+	}
+	stats := a.Stats()
+	if stats.Accepted != 1 {
+		t.Errorf("accepted = %d, want 1", stats.Accepted)
+	}
+	if stats.Refused != 2 {
+		t.Errorf("refused = %d, want 2", stats.Refused)
+	}
+}
+
+// TestAgentWithoutARelayCapServesEveryStream pins the opt-out: a zero cap means
+// no bound and no bookkeeping, the same shape the Hub's controls use.
+func TestAgentWithoutARelayCapServesEveryStream(t *testing.T) {
+	echo := startEchoUpstream(t)
+	mh, gateURL := startMiniHubRelays(t, 3)
+
+	a, err := NewAgent(AgentConfig{
+		HubGateURL:     gateURL,
+		SharedKey:      []byte(testAgentSecret),
+		Self:           hub.AgentRegister{Provider: echo},
+		AllowedTargets: []string{echo},
+		ReconnectDelay: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	if a.slots != nil {
+		t.Fatalf("an agent with no configured cap built a slot table: %+v", a.slots)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx) }()
+	<-mh.registrations
+
+	msg := []byte("no-cap")
+	for i := 0; i < 3; i++ {
+		var relay *tunnel.Stream
+		select {
+		case relay = <-mh.relays:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("hub opened only %d of 3 relays", i)
+		}
+		if !relayEchoes(t, relay, msg) {
+			t.Fatalf("relay %d was refused despite no configured cap", i)
+		}
+	}
+	if got := a.Stats().Refused; got != 0 {
+		t.Fatalf("refused = %d, want 0 with no cap configured", got)
+	}
+}
+
+// TestAgentClosesAnIdleRelay pins the idle watchdog: a relay that carries
+// nothing is torn down by the agent itself. Nothing else would do it — a tunnel
+// stream has no read deadline (its Read parks on a condition variable), so a
+// relay whose peer has gone quiet stays parked, holding the contributor's
+// upstream connection, until something closes it.
+func TestAgentClosesAnIdleRelay(t *testing.T) {
+	echo := startEchoUpstream(t)
+	mh, gateURL := startMiniHub(t)
+
+	a, err := NewAgent(AgentConfig{
+		HubGateURL:     gateURL,
+		SharedKey:      []byte(testAgentSecret),
+		Self:           hub.AgentRegister{Provider: echo},
+		AllowedTargets: []string{echo},
+		ReconnectDelay: 50 * time.Millisecond,
+		RelayIdle:      100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx) }()
+	<-mh.registrations
+
+	var relay *tunnel.Stream
+	select {
+	case relay = <-mh.relays:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hub did not open a relay stream")
+	}
+	defer relay.Close()
+
+	// Send nothing at all. The echo upstream only answers what it is given, so
+	// the relay carries no bytes in either direction and the watchdog must fire.
+	closed := make(chan error, 1)
+	go func() { _, err := relay.Read(make([]byte, 1)); closed <- err }()
+	select {
+	case err := <-closed:
+		if err == nil {
+			t.Fatal("idle relay delivered bytes")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the agent never closed the idle relay")
+	}
+	if got := a.Stats().IdleClosed; got != 1 {
+		t.Fatalf("idle-closed = %d, want 1", got)
+	}
+}
+
+// TestAgentMetersRelayedBytes pins the usage counters: a contributor can see how
+// many relays their machine carried and how many bytes crossed it. That is all
+// there is to see — the bytes are a TLS session the agent is not party to — and
+// it is what makes the machine's contribution auditable by its owner.
+func TestAgentMetersRelayedBytes(t *testing.T) {
+	echo := startEchoUpstream(t)
+	mh, gateURL := startMiniHub(t)
+
+	a, err := NewAgent(AgentConfig{
+		HubGateURL:     gateURL,
+		SharedKey:      []byte(testAgentSecret),
+		Self:           hub.AgentRegister{Provider: echo},
+		AllowedTargets: []string{echo},
+		ReconnectDelay: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewAgent: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = a.Run(ctx) }()
+	<-mh.registrations
+
+	var relay *tunnel.Stream
+	select {
+	case relay = <-mh.relays:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hub did not open a relay stream")
+	}
+	defer relay.Close()
+
+	msg := []byte("count-these-bytes")
+	go func() { _, _ = relay.Write(msg) }()
+	back := make([]byte, len(msg))
+	if _, err := io.ReadFull(relay, back); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+
+	// Poll: the counters are written by the bridge's own goroutines, so the echo
+	// arriving on this side does not order the last Add.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		stats := a.Stats()
+		if stats.Accepted == 1 && stats.Active == 1 && stats.Peak == 1 &&
+			stats.RequestBytes == uint64(len(msg)) && stats.ResponseBytes == uint64(len(msg)) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stats = %s, want 1 relay active and %d bytes each way", stats, len(msg))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

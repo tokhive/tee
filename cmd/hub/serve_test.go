@@ -3,10 +3,13 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
@@ -385,5 +388,217 @@ func TestModelsEndpointShape(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if body := strings.TrimSpace(rec.Body.String()); body != `{"models":[]}` {
 		t.Fatalf("filtered empty directory body = %q, want {\"models\":[]}", body)
+	}
+}
+
+// TestUserRouteRequiresATenantKey pins the user-side gate: a request with no
+// key is refused rather than silently attributed to one shared anonymous
+// tenant, and a configured key map both authenticates a provisioned key and
+// rejects an unknown one.
+func TestUserRouteRequiresATenantKey(t *testing.T) {
+	route := userRoutes[0]
+	const body = `{"model":"sim-mock-0.5b"}`
+
+	run := func(resolver tenantResolver, key string) int {
+		t.Helper()
+		h := newServeTestHub(t, []byte("data: {\"id\":\"chatcmpl-sim1\"}\n\n"))
+		handler := &userHandler{
+			h:     h,
+			cfg:   serveConfig{Host: "127.0.0.1:18080", Max: 1 << 20, Tenants: resolver},
+			route: route,
+		}
+		req := httptest.NewRequest(http.MethodPost, route.Path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if key != "" {
+			req.Header.Set(tenantKeyHeader, key)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if got := run(tenantResolver{}, ""); got != http.StatusUnauthorized {
+		t.Errorf("no key in open mode = %d, want 401", got)
+	}
+	if got := run(tenantResolver{}, "tenant-x"); got != http.StatusOK {
+		t.Errorf("open mode with a key = %d, want 200", got)
+	}
+	keys := tenantResolver{keys: map[string]string{"sk-good": "tenant-real"}}
+	if got := run(keys, "sk-wrong"); got != http.StatusUnauthorized {
+		t.Errorf("unknown key with a key map = %d, want 401", got)
+	}
+	if got := run(keys, "sk-good"); got != http.StatusOK {
+		t.Errorf("provisioned key = %d, want 200", got)
+	}
+}
+
+// TestProviderFieldPinsTheSource locks the request-side source selection: a
+// route body that names a provider is honored exactly — an unknown source is
+// refused (404) rather than silently routed to a substitute, and a serving
+// source passes through. This is what lets a buyer ask for a specific AI
+// source, not just the cheapest.
+func TestProviderFieldPinsTheSource(t *testing.T) {
+	h := newServeTestHub(t, []byte("data: {\"id\":\"chatcmpl-sim1\"}\n\n"))
+	route := userRoutes[0]
+	cfg := serveConfig{Host: "127.0.0.1:18080", Query: "", Max: 1 << 20}
+
+	// cheap-sim is on the fixture market table and serves sim-mock-0.5b: a
+	// pinned dispatch to it succeeds. nobody is not a server: the dispatch is
+	// refused before any provider answers, exactly like an unknown model.
+	run := func(body string) int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, route.Path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(tenantKeyHeader, "tenant-test")
+		rec := httptest.NewRecorder()
+		handler := &userHandler{h: h, cfg: cfg, route: route}
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if got := run(`{"model":"sim-mock-0.5b","provider":"cheap-sim"}`); got != http.StatusOK {
+		t.Fatalf("pinned request to a serving provider = %d, want 200", got)
+	}
+	if got := run(`{"model":"sim-mock-0.5b","provider":"nobody"}`); got != http.StatusNotFound {
+		t.Fatalf("pinned request to an unknown provider = %d, want 404 (must not fall back)", got)
+	}
+	if got := run(`{"model":"sim-mock-0.5b","provider":"cheap-sim"}`); got != http.StatusOK {
+		t.Fatalf("pinned request again = %d, want 200", got)
+	}
+}
+
+// TestProviderFieldIsOptional pins that a route body without a provider still
+// works: the buyer who names only a model gets the cheapest server, exactly as
+// before this feature.
+func TestProviderFieldIsOptional(t *testing.T) {
+	body, _ := postBody(t, userRoutes[0], `{"model":"sim-mock-0.5b","messages":[{"role":"user","content":"hi"}]}`)
+	if !strings.Contains(body, "chatcmpl-sim1") {
+		t.Fatalf("provider-less request did not relay: %q", body)
+	}
+}
+
+// TestModelsEndpointProviderAndModelFilters pins that /v1/models honors the
+// expanded market view through the wire: ?provider= narrows to one source and
+// ?model= to one model family. The envelope is the same JSON shape; the row
+// semantics live in the hub package's MarketQuotes tests.
+func TestModelsEndpointProviderAndModelFilters(t *testing.T) {
+	h := newServeTestHub(t, []byte("x"))
+	handler := modelsHandler(h)
+
+	run := func(path string) string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", path, rec.Code)
+		}
+		return strings.TrimSpace(rec.Body.String())
+	}
+
+	// With no provider argument and no agent gate, every filtered view is the
+	// empty list — same envelope, non-null.
+	for _, path := range []string{
+		modelsPath + "?provider=cheap-sim",
+		modelsPath + "?model=sim-mock",
+		modelsPath + "?provider=cheap-sim&model=sim-mock",
+	} {
+		if body := run(path); body != `{"models":[]}` {
+			t.Fatalf("%s = %q, want {\"models\":[]}", path, body)
+		}
+	}
+}
+
+// TestTenantResolverMapsKeyToTenant pins that a provisioned key resolves to its
+// tenant rather than being used verbatim: otherwise a caller could name any
+// tenant by presenting any key.
+func TestTenantResolverMapsKeyToTenant(t *testing.T) {
+	r := tenantResolver{keys: map[string]string{"sk-good": "tenant-real"}}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.Header.Set(tenantKeyHeader, "sk-good")
+	if tenant, ok := r.resolve(req); !ok || tenant != "tenant-real" {
+		t.Fatalf("resolve = %q,%t, want tenant-real,true", tenant, ok)
+	}
+}
+
+// TestStalledRequestBodyIsCutOff pins the request read deadline against a real
+// server: a client that announces a body with Content-Length and then never
+// sends it must not hold the connection (and a goroutine) indefinitely. The
+// shipped timeout is 30s — far too long to wait for in a test — so this runs the
+// same server configuration with a short one.
+func TestStalledRequestBodyIsCutOff(t *testing.T) {
+	const stallTimeout = 150 * time.Millisecond
+	route := userRoutes[0]
+
+	handler := &userHandler{
+		h:     newServeTestHub(t, []byte("data: {\"id\":\"chatcmpl-sim1\"}\n\n")),
+		cfg:   serveConfig{Host: "127.0.0.1:18080", Max: 1 << 20},
+		route: route,
+	}
+	srv := httptest.NewUnstartedServer(handler)
+	srv.Config = newHubServer("", handler, stallTimeout)
+	srv.Start()
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Headers arrive; the body they announce never does.
+	if _, err := fmt.Fprintf(conn,
+		"POST %s HTTP/1.1\r\nHost: hub.test\r\n%s: tenant-test\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n",
+		route.Path, tenantKeyHeader); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	raw, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if !strings.Contains(string(raw), "408") {
+		t.Fatalf("response = %q, want a 408 for a stalled body", raw)
+	}
+}
+
+// TestReadTimeoutDoesNotTruncateAResponseStream pins why the read deadline is
+// safe to set server-wide: it bounds reading the request, so a response that
+// takes longer to finish than the timeout — every SSE answer does — still
+// arrives whole. It is WriteTimeout, deliberately left zero, that would cut such
+// a stream.
+func TestReadTimeoutDoesNotTruncateAResponseStream(t *testing.T) {
+	const readTimeout = 100 * time.Millisecond
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Consume the request as the real routes do, so the deadline the server
+		// armed on the body is the one under test.
+		_, _ = io.Copy(io.Discard, r.Body)
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, "first")
+		flusher.Flush()
+		// Write the second half well after the read timeout has elapsed.
+		time.Sleep(3 * readTimeout)
+		_, _ = io.WriteString(w, "second")
+		flusher.Flush()
+	})
+
+	srv := httptest.NewUnstartedServer(handler)
+	srv.Config = newHubServer("", handler, readTimeout)
+	srv.Start()
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"m"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stream: %v", err)
+	}
+	if string(body) != "firstsecond" {
+		t.Fatalf("streamed body = %q, want both halves: a read timeout must not cut a response", body)
 	}
 }

@@ -40,10 +40,12 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/transport"
@@ -75,6 +77,13 @@ func main() {
 	// routing (relay URL, ports, bootstrap token) comes from VM metadata.
 	addr := flag.String("addr", envOr("TEE_ADDR", "127.0.0.1:18090"), "listen address")
 	relay := flag.String("relay", envOr("TEE_RELAY", ""), "Hub TeeRelay WebSocket URL: every provider connection egresses as a stream over the Hub's reverse tunnel")
+	// The relay key is part of the same env-driven surface: the measured app
+	// authenticates to the Hub's TeeRelay with it, so a Hub that only admits an
+	// authenticated egress path cannot be bypassed by anything that reaches the
+	// listener, and the instance can be pointed at that Hub by metadata alone.
+	relayKey := flag.String("relay-key", envOr("TEE_RELAY_KEY", ""), "key to present to the Hub's TeeRelay endpoint (empty = the Hub requires none)")
+	maxConns := flag.Int("max-conns", envOrInt("TEE_MAX_CONNS", 0), "max resident provider connections per (provider, host) (0 = default 32)")
+	requestTimeout := flag.Duration("request-timeout", envOrDuration("TEE_REQUEST_TIMEOUT", 2*time.Minute), "bound on a single provider exchange, including streaming sessions (0 = no bound)")
 	seqPath := flag.String("seq", os.Getenv("TEE_SEQ"), "ProviderSeq store file (default <simdir>/seqstore.json)")
 	platformName := flag.String("platform", envOr("TEE_PLATFORM", defaultPlatform), "attestation platform: simulated, sevsnp")
 	includeEvidence := flag.Bool("evidence", envOrBool("TEE_EVIDENCE", true), "embed attestation evidence in every receipt (false = resolve EvidenceHash via evidence retrieval)")
@@ -152,6 +161,8 @@ func main() {
 	cm, err := transport.NewChannelManager(transport.ChannelConfig{
 		Scheme:          "https",
 		RelayURL:        *relay,
+		RelayHeaders:    relayHeaders(*relayKey),
+		MaxConnsPerHost: *maxConns,
 		TLSClientConfig: upstreamTLS,
 	})
 	if err != nil {
@@ -171,11 +182,12 @@ func main() {
 	signer.IncludeEvidence = *includeEvidence
 
 	svc, err := tee.NewService(tee.Config{
-		Policies:  policies,
-		Transport: cm,
-		Signer:    signer,
-		Seq:       store,
-		InboxKey:  inbox,
+		Policies:       policies,
+		Transport:      cm,
+		Signer:         signer,
+		Seq:            store,
+		InboxKey:       inbox,
+		RequestTimeout: *requestTimeout,
 	})
 	if err != nil {
 		log.Fatalf("build service: %v", err)
@@ -236,7 +248,28 @@ func main() {
 
 	log.Printf("tee (platform=%s, includeEvidence=%t) listening on http://%s",
 		*platformName, *includeEvidence, *addr)
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	srv := &http.Server{
+		Addr:    *addr,
+		Handler: mux,
+		// ReadHeaderTimeout drops a client that stalls in the request line or
+		// headers instead of pinning a connection. ReadTimeout and WriteTimeout
+		// stay zero: /v1/session hijacks its connection into a long-lived
+		// WebSocket, and /v1/execute answers with an SSE stream, so neither
+		// endpoint has a bounded read or write window a deadline could safely
+		// describe. The execute body itself is bounded inside ServeExecute.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
+}
+
+// relayHeaders builds the headers the TEE presents when dialing the Hub's
+// relay endpoint. An empty key means the Hub's relay requires none.
+func relayHeaders(key string) http.Header {
+	if key == "" {
+		return nil
+	}
+	return http.Header{hub.RelayKeyHeader: {key}}
 }
 
 // upstreamTLSConfig returns the TLS trust roots for provider connections.
@@ -289,6 +322,35 @@ func envOrBool(name string, fallback bool) bool {
 		return fallback
 	}
 	return b
+}
+
+// envOrInt parses an environment variable as an integer, falling back when it is
+// unset (or not a valid integer). It keeps the connection cap configurable by
+// instance metadata without a rebuild, like the other measured-app flags.
+func envOrInt(name string, fallback int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+// envOrDuration parses an environment variable as a Go duration, falling back
+// when it is unset (or not a valid duration).
+func envOrDuration(name string, fallback time.Duration) time.Duration {
+	v := os.Getenv(name)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fallback
+	}
+	return d
 }
 
 // serveInitCert runs the TOFU bootstrap listener: a plain-HTTP server whose only

@@ -47,6 +47,14 @@ const (
 	maxBuf     = 8 << 20 // inbound buffering cap per stream; further data resets that stream
 )
 
+// DefaultMaxStreams bounds how many streams one tunnel carries at once.
+// Per-stream inbound buffering is already capped (maxBuf), but the *number* of
+// streams is not, so without a bound a peer could mint streams until the
+// process exhausted memory or goroutines — each stream costs a goroutine and
+// up to maxBuf of buffer. A Hub relays one stream per in-flight request, so
+// this is generous for real load and only bites a runaway or hostile peer.
+const DefaultMaxStreams = 1024
+
 var (
 	// ErrClosed means the multiplexer itself has shut down: every stream is
 	// broken and no new one can be opened.
@@ -89,17 +97,28 @@ type Multiplexer struct {
 	nextID  uint64
 	idBit   uint64
 
+	// maxStreams bounds len(streams); zero means unlimited.
+	maxStreams int
+
 	// openHandler is invoked for each stream the peer opens. Set with Serve.
 	openHandler func(*Stream, []byte)
 }
 
-// New returns a multiplexer over conn; a single goroutine reads and
-// demultiplexes inbound frames.
+// New returns a multiplexer over conn with the default stream bound; a single
+// goroutine reads and demultiplexes inbound frames.
 func New(conn Connection, side Endpoint) *Multiplexer {
+	return NewLimited(conn, side, DefaultMaxStreams)
+}
+
+// NewLimited is New with an explicit cap on concurrent streams. A
+// non-positive maxStreams means unlimited, which is only appropriate for a
+// tunnel whose peer is fully trusted.
+func NewLimited(conn Connection, side Endpoint, maxStreams int) *Multiplexer {
 	m := &Multiplexer{
-		conn:    conn,
-		streams: make(map[uint64]*Stream),
-		idBit:   uint64(side) << 63,
+		conn:       conn,
+		streams:    make(map[uint64]*Stream),
+		idBit:      uint64(side) << 63,
+		maxStreams: maxStreams,
 	}
 	go m.readLoop()
 	return m
@@ -258,6 +277,16 @@ func (m *Multiplexer) acceptOpen(id uint64, payload []byte) {
 	}
 	if m.streams[id] != nil { // duplicate id: misbehaving peer, drop it
 		m.mu.Unlock()
+		return
+	}
+	if m.maxStreams > 0 && len(m.streams) >= m.maxStreams {
+		// The tunnel is already at its stream bound. Refuse the open rather
+		// than admit another goroutine and buffer: the peer is told with a
+		// close frame, off the read loop because writing can block on a
+		// stalled carrier. A refused stream costs one short-lived write and
+		// nothing else.
+		m.mu.Unlock()
+		go func() { _ = m.writeFrame(KindClose, id, nil) }()
 		return
 	}
 	s := newStream(m, id)

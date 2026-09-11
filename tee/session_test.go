@@ -1,6 +1,7 @@
 package tee
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"testing"
@@ -46,14 +47,91 @@ func newSessionForTest(t *testing.T, conn SessionConn) *Session {
 	}
 	policyHash := make([]byte, 32)
 	return &Session{
-		svc:      env.service,
-		spec:     spec,
-		specHash: hash,
-		decision: policy.Decision{PolicyHash: policyHash},
-		seq:      1,
-		conn:     conn,
-		hasher:   proof.NewStreamingHasher(spec.JobID),
-		started:  baseTime.Unix(),
+		svc:       env.service,
+		spec:      spec,
+		specHash:  hash,
+		decision:  policy.Decision{PolicyHash: policyHash},
+		seq:       1,
+		conn:      conn,
+		hasher:    proof.NewStreamingHasher(spec.JobID),
+		started:   baseTime.Unix(),
+		downLimit: spec.MaxResponseBytes,
+	}
+}
+
+// drainSession reads until the session ends, returning everything delivered.
+func drainSession(t *testing.T, ss *Session) []byte {
+	t.Helper()
+	var got []byte
+	buf := make([]byte, 64)
+	for i := 0; i < 1000; i++ {
+		n, err := ss.Read(buf)
+		got = append(got, buf[:n]...)
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				t.Fatalf("read: %v", err)
+			}
+			return got
+		}
+	}
+	t.Fatal("session never ended")
+	return nil
+}
+
+// TestSessionEnforcesTheDownlinkCap pins the property the Hub's billing depends
+// on: the TEE delivers no more than Spec.MaxResponseBytes and digests exactly
+// what it delivered. A byte that were counted (or digested) but not handed over
+// would leave the receipt describing a transcript no relay could have produced,
+// and a session cut at its cap could never be settled.
+func TestSessionEnforcesTheDownlinkCap(t *testing.T) {
+	conn := &fakeSessionConn{readData: []byte("0123456789"), readErr: io.EOF}
+	ss := newSessionForTest(t, conn)
+	ss.downLimit = 4
+
+	got := drainSession(t, ss)
+	if string(got) != "0123" {
+		t.Fatalf("delivered %q, want exactly the 4 bytes the cap allows", got)
+	}
+
+	result, err := ss.Receipt()
+	if err != nil {
+		t.Fatalf("receipt: %v", err)
+	}
+	if !result.Truncated {
+		t.Fatal("reaching the cap must mark the session truncated")
+	}
+	if got := result.Receipt.Receipt.Completion; got != proof.CompletionTruncated {
+		t.Fatalf("completion = %v, want truncated", got)
+	}
+	if result.ResponseBytes != 4 {
+		t.Fatalf("attested response bytes = %d, want 4 (the delivered prefix only)", result.ResponseBytes)
+	}
+	// The digest must cover exactly the delivered bytes — that is what lets the
+	// Hub match its own relayed transcript against the receipt.
+	want := proof.HashResponseStream(ss.spec.JobID, [][]byte{got})
+	if !bytes.Equal(result.Receipt.Receipt.StreamHash, want[:]) {
+		t.Fatal("receipt digest does not cover exactly the delivered bytes")
+	}
+}
+
+// TestSessionWithoutACapRunsToTheProviderEnd is the counterpart: no cap means
+// the whole transcript is delivered and digested, and a clean EOF stays
+// complete.
+func TestSessionWithoutACapRunsToTheProviderEnd(t *testing.T) {
+	conn := &fakeSessionConn{readData: []byte("all of it"), readErr: io.EOF}
+	ss := newSessionForTest(t, conn)
+	ss.downLimit = 0
+
+	got := drainSession(t, ss)
+	if string(got) != "all of it" {
+		t.Fatalf("delivered %q, want the whole transcript", got)
+	}
+	result, err := ss.Receipt()
+	if err != nil {
+		t.Fatalf("receipt: %v", err)
+	}
+	if result.Truncated {
+		t.Fatal("an uncapped session ending on a clean EOF must stay complete")
 	}
 }
 
