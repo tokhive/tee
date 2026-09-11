@@ -26,15 +26,21 @@ var (
 	// teardown tail, not a lie, and does not forfeit the session (see
 	// relaySession).
 	ErrSessionStreamMismatch = errors.New("session receipt attests different bytes than the Hub relayed")
-	// ErrSessionLimitExceeded means the Hub stopped relaying because a
-	// configured bound (downlink bytes) was hit. Unlike a request — whose cap is
-	// enforced by the TEE, which can attest the exact truncated prefix — a
-	// session's byte cap is enforced here on the Hub, over a tunnel the TEE
-	// deliberately does not truncate. Everything the TEE already forwarded past
-	// the cap is in its digest but was never relayed, so the Hub cannot produce
-	// a receipt that matches it. Truncation therefore ends the session and earns
-	// nothing; it is a bound, not a billable event (matching "断流 0 计价").
-	ErrSessionLimitExceeded = errors.New("session exceeded the Hub's relay bound")
+	// ErrSessionLimitExceeded means the Hub's downlink backstop fired: the TEE
+	// relayed past the bound the two agreed on through Spec.MaxResponseBytes.
+	//
+	// It is a fault, not a normal bound. A session's cap travels on its spec and
+	// is enforced by the TEE, which digests exactly what it delivers; the Hub's
+	// sessionMaxDownBytes is aligned to that number (see boundSession), so the
+	// TEE always cuts first and the receipt reconciles with what the Hub
+	// relayed. This error therefore means the TEE broke its own attested bound:
+	// it forwarded bytes the Hub never moved, so its digest no longer covers a
+	// transcript the Hub can produce — and since the response digest is a plain
+	// hash rather than a prefix-verifiable one, no prefix of it can be checked
+	// either. Nothing is settled, because there is nothing to settle *against*:
+	// a buyer must not be charged on a number no receipt supports. A TEE that
+	// honours its cap never produces this.
+	ErrSessionLimitExceeded = errors.New("the TEE relayed past the session's agreed downlink bound")
 )
 
 // upGrant is how long relaySession waits for an in-flight uplink to finish
@@ -71,7 +77,9 @@ type SessionOutcome struct {
 //
 // build frames the session spec for one provider (host, path, Session flag);
 // the caller supplies it once because that framing is identical across
-// providers.
+// providers. The built spec's downlink cap is then tightened to the Hub's own
+// session bound (see boundSession) — the two must be the same number for a
+// capped session to reconcile.
 func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
 
@@ -88,6 +96,7 @@ func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 		if berr != nil {
 			return nil, jobs.Spec{}, fmt.Errorf("build session spec for %q: %w", provider, berr)
 		}
+		spec = h.boundSession(spec)
 		spec, aerr := h.attachCredential(spec)
 		if aerr != nil {
 			return nil, jobs.Spec{}, fmt.Errorf("attach credential for %q: %w", provider, aerr)
@@ -103,17 +112,49 @@ func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 	return nil, jobs.Spec{}, fmt.Errorf("%w: model %q", ErrNoProviderForModel, model)
 }
 
+// boundSession returns spec with its downlink cap tightened to the Hub's own
+// session bound, so the TEE stops relaying exactly where the Hub would.
+//
+// The two numbers must agree or a capped session cannot be reconciled. The TEE
+// enforces Spec.MaxResponseBytes on the downlink and digests exactly what it
+// delivers (tee.Session.Read); the Hub enforces its own sessionMaxDownBytes and
+// digests exactly what it relays. If the Hub's bound were the tighter of the
+// two it would cut the tunnel first, its digest would cover a prefix the TEE's
+// does not, and — since the response digest is a plain hash rather than a
+// prefix-verifiable one — nothing the TEE signs could be matched against what
+// the Hub moved. Aligning them means the TEE always cuts first, its receipt
+// covers exactly the relayed bytes, and the session settles for what it
+// delivered.
+//
+// The Hub only ever tightens, never widens: widening the caller's cap could
+// raise it above the provider policy's own limit, which the TEE refuses
+// outright (policy.AuthorizeAt). A zero Hub bound means "no bound of mine", so
+// the caller's cap stands alone, exactly as before.
+func (h *Hub) boundSession(spec jobs.Spec) jobs.Spec {
+	if h.sessionMaxDownBytes == 0 {
+		return spec
+	}
+	if spec.MaxResponseBytes == 0 || h.sessionMaxDownBytes < spec.MaxResponseBytes {
+		spec.MaxResponseBytes = h.sessionMaxDownBytes
+	}
+	return spec
+}
+
 // RunRealtime drives a streaming session end to end: select the cheapest
 // provider for model, open the tunnel through the TEE, relay the user's frames,
 // and settle the terminal receipt. It returns the settled outcome together with
 // the relay error (if the session was cut short by a bound or a transport
 // failure).
 //
-// The Hub applies its own session bounds here — a wall-clock timeout, a
-// downlink byte cap, and a downlink-stall watchdog — because the TEE
-// deliberately applies none to a session (it is a transparent relay). Keeping
-// unbounded resource consumption out of the account book and on the Hub's side
-// of the wire.
+// The Hub applies its own session bounds here — a wall-clock timeout, an
+// uplink byte bound, a downlink byte backstop, and a downlink-stall watchdog.
+// The wall-clock, uplink and stall bounds are the Hub's because the TEE applies
+// none of them to a session: it is a transparent relay, and keeping unbounded
+// consumption out of the account book is the Hub's job. The downlink bound is
+// the exception — it travels on the session spec and is enforced by the TEE, so
+// that the byte count in the receipt is one the Hub can actually reconcile (see
+// boundSession); the Hub's own copy is only a backstop for a TEE that breaks
+// that contract.
 func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 	build func(provider string) (jobs.Spec, error), link RealtimeLink) (SessionOutcome, error) {
 
@@ -147,9 +188,11 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 		h.sessionMaxUpBytes, h.sessionMaxDownBytes, h.sessionIdle)
 
 	if errors.Is(relErr, ErrSessionLimitExceeded) {
-		// The Hub answered its own byte bound. The tunnel is already torn down;
-		// settle nothing: no receipt can be reconciled (see ErrSessionLimitExceeded),
-		// so nothing is charged and no receipt is stored. Report the frame it cut.
+		// The Hub's backstop answered: the TEE relayed past the bound its own
+		// spec declared, so the tunnel is already torn down and its digest
+		// covers bytes this Hub never moved. Settle nothing — no receipt can be
+		// reconciled against the relayed transcript (see
+		// ErrSessionLimitExceeded) — and report the frame that cut it.
 		return SessionOutcome{Provider: spec.Provider, UplinkBytes: up, DownlinkBytes: down}, relErr
 	}
 
@@ -243,7 +286,9 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 // uplink bound is enforced by simply not reading further from the user, which
 // ends the session normally: nothing was truncated on the provider's side, so
 // the receipt still reconciles and the session still settles for what crossed.
-// The downlink bound is different — see ErrSessionLimitExceeded.
+// The downlink bound is different — it is a backstop, not the operative cap; a
+// healthy session is cut by the TEE at the same number and settles for the
+// bytes it delivered. See ErrSessionLimitExceeded.
 //
 // relaySession returns as soon as the downlink side resolves (or the session
 // times out), because that is when the receipt has been produced. The uplink

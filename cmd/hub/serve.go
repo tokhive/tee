@@ -26,7 +26,7 @@ type serveConfig struct {
 	Addr    string // where the Hub listens for its users
 	Host    string // the AI service host:port (must be in every provider policy)
 	Query   string // extra upstream query (fault injection, for the harness)
-	Max     uint64 // MaxResponseBytes cap passed to the TEE
+	Max     uint64 // MaxResponseBytes cap passed to the TEE. For a request it caps the body; for a session it caps the downlink, so the session settles for what it delivered instead of being cut un-reconcilably by the Hub
 	Tenants tenantResolver
 }
 
