@@ -15,6 +15,7 @@
 //	              (simulates a Hub that hides a record from the provider)
 //	-quota N      cap a tenant at N requests per -window (0 = unlimited)
 //	-tenant-budgets T=M  cap tenant T's cumulative spend at M micro-units
+//	-tenant-inflight N   cap a tenant at N concurrent jobs (0 = unlimited)
 package main
 
 import (
@@ -41,6 +42,15 @@ import (
 // integers.
 const microsPerUnit = 1_000_000
 
+// defaultTenantInflight is how many jobs one tenant may run at once unless the
+// operator says otherwise. Unlike the other tenant controls this one ships on:
+// it is the fairness control for a shared provider, and a Hub that leaves it
+// off hands whoever sends the most concurrent requests every connection that
+// provider has. Eight concurrent jobs is well inside what one buyer drives and
+// well inside the connection pool a provider's agent can hold, so several
+// tenants fit at once — which is the whole point.
+const defaultTenantInflight = 8
+
 func main() {
 	teeURL := flag.String("tee", "http://127.0.0.1:18090", "TEE base URL")
 	serveAddr := flag.String("serve", "", "run as the OpenAI-compatible HTTP service on this address (empty = one-shot CLI mode)")
@@ -66,6 +76,7 @@ func main() {
 	relayKey := flag.String("relay-key", "", "key the TEE must present to dial /v1/relay (empty = unauthenticated relay)")
 	tenantKeys := flag.String("tenant-keys", "", "user api keys as key=tenant[,key=tenant]; the key is verified and resolves to its tenant (empty = open mode: the presented key is the tenant)")
 	tenantBudgets := flag.String("tenant-budgets", "", "per-tenant cumulative spend ceilings in micro-units, as tenant=micros[,tenant=micros]; a tenant absent from the map is uncapped")
+	tenantInflight := flag.Int("tenant-inflight", defaultTenantInflight, "how many jobs one tenant may run at once; keeps one buyer from occupying every connection a shared provider has (0 = unlimited)")
 	credential := flag.String("credential", "", "provider access token to register with the TEE before the request loop (simulation one-shot mode: the CLI holds the seller's token and delivers it sealed to -tee, as a dialing agent would through a resident Hub)")
 	audit := flag.Bool("audit", false, "audit the receipt store for gaps and verify signatures")
 	flag.Parse()
@@ -112,24 +123,25 @@ func main() {
 		BaseURL:    *teeURL,
 	}
 	h, err := hub.New(hub.Config{
-		TEE:                 teeClient,
-		Rates:               rates,
-		Store:               store,
-		Verify:              verifyReceipt,
-		Quota:               quota,
-		Budgets:             budgets,
-		Commission:          uint64(*commission),
-		MaxJobMicros:        *maxJob,
-		Withhold:            withholdSeq(*drop),
-		SessionTimeout:      *sessionTimeout,
-		SessionMaxDownBytes: *sessionMax,
-		SessionMaxUpBytes:   *sessionMaxUp,
-		SessionIdle:         *sessionIdle,
-		AttemptTimeout:      *attemptTimeout,
-		AgentSecret:         []byte(*agentKey),
-		AgentKeys:           perProviderKeys,
-		RelaySecret:         []byte(*relayKey),
-		Credentials:         teeClient,
+		TEE:                  teeClient,
+		Rates:                rates,
+		Store:                store,
+		Verify:               verifyReceipt,
+		Quota:                quota,
+		Budgets:              budgets,
+		MaxInflightPerTenant: *tenantInflight,
+		Commission:           uint64(*commission),
+		MaxJobMicros:         *maxJob,
+		Withhold:             withholdSeq(*drop),
+		SessionTimeout:       *sessionTimeout,
+		SessionMaxDownBytes:  *sessionMax,
+		SessionMaxUpBytes:    *sessionMaxUp,
+		SessionIdle:          *sessionIdle,
+		AttemptTimeout:       *attemptTimeout,
+		AgentSecret:          []byte(*agentKey),
+		AgentKeys:            perProviderKeys,
+		RelaySecret:          []byte(*relayKey),
+		Credentials:          teeClient,
 	})
 	if err != nil {
 		log.Fatalf("build hub: %v", err)

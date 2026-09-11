@@ -80,12 +80,34 @@ type SessionOutcome struct {
 // providers. The built spec's downlink cap is then tightened to the Hub's own
 // session bound (see boundSession) — the two must be the same number for a
 // capped session to reconcile.
+//
+// The tenant's in-flight share is taken here and travels with the returned
+// connection, because a session does not finish when this call returns: it runs
+// until the connection closes, holding a provider connection the whole time. A
+// caller must close it, or the slot — and the pool slot behind it — is held
+// until the process exits.
 func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
 
-	if err := h.admitTenant(tenant); err != nil {
+	release, err := h.beginJob(tenant)
+	if err != nil {
 		return nil, jobs.Spec{}, err
 	}
+	conn, spec, err := h.openSessionForModel(ctx, model, build)
+	if err != nil {
+		// Nothing came up, so the share this admission reserved goes straight
+		// back: a failed open is not a running job and must not hold one.
+		release()
+		return nil, jobs.Spec{}, err
+	}
+	return newFlightConn(conn, release), spec, nil
+}
+
+// openSessionForModel opens the session itself, without admitting the tenant.
+// It is split out so admission happens once, above, and so the slot it reserves
+// is still in hand when the caller decides whether the session came up.
+func (h *Hub) openSessionForModel(ctx context.Context, model string,
+	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
 
 	providers := h.providersForModel(model)
 	if len(providers) == 0 {

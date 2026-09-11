@@ -128,6 +128,23 @@ type Config struct {
 	// nothing is charged or paid (see ErrJobPriceExceeded).
 	MaxJobMicros uint64
 
+	// MaxInflightPerTenant caps how many jobs one tenant may run at the same
+	// time. Zero (the default) means no cap, the deliberate opt-out described
+	// on Quota; the hub binary ships a default so a deployment is fair unless
+	// it opts out.
+	//
+	// It is the fairness control for a shared provider, and the only layer that
+	// can enforce one: the TEE pools provider connections per (provider, host)
+	// and never learns which tenant a job belongs to (the tenant is not in the
+	// JobSpec, so it is not attested). Without a cap, one tenant can hold every
+	// slot a shared provider has — a streaming session does so for its whole
+	// life — and leave the market's other buyers queueing behind it.
+	//
+	// The cap is on concurrency, not on rate: a tenant may run any number of
+	// jobs over time, just not more than its share at one instant. Requests and
+	// sessions share the one count, because they draw on the same pool.
+	MaxInflightPerTenant int
+
 	// Clock returns the current time. Defaults to time.Now.
 	Clock func() time.Time
 
@@ -208,6 +225,7 @@ type Hub struct {
 	ledger     *Ledger
 	quota      *Quota
 	budget     *Budget
+	flight     *flightLimiter
 	commission CommissionRate
 	maxJob     uint64
 	clock      func() time.Time
@@ -254,6 +272,12 @@ func New(cfg Config) (*Hub, error) {
 		}
 		budget = built
 	}
+	// A nil limiter admits everything, so an unconfigured Hub carries no
+	// per-tenant bookkeeping at all.
+	var flight *flightLimiter
+	if cfg.MaxInflightPerTenant > 0 {
+		flight = newFlightLimiter(cfg.MaxInflightPerTenant, MaxFlightTenants)
+	}
 	clock := cfg.Clock
 	if clock == nil {
 		clock = time.Now
@@ -270,6 +294,7 @@ func New(cfg Config) (*Hub, error) {
 		ledger:     ledger,
 		quota:      cfg.Quota,
 		budget:     budget,
+		flight:     flight,
 		commission: CommissionRate{BasisPoints: cfg.Commission},
 		maxJob:     cfg.MaxJobMicros,
 		clock:      clock,
@@ -432,9 +457,11 @@ type Outcome struct {
 // a double charge).
 func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec, body []byte,
 	onChunk func([]byte) error, onStart ...func(tee.Response)) (Outcome, error) {
-	if err := h.admitTenant(tenant); err != nil {
+	release, err := h.beginJob(tenant)
+	if err != nil {
 		return Outcome{}, err
 	}
+	defer release()
 
 	card, ok := h.card(spec.Provider)
 	if !ok {
@@ -445,7 +472,7 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 	// TEE can authenticate the upstream request. This happens per dispatch,
 	// from the store, so the Hub never holds the token itself — only the
 	// ciphertext an agent registered.
-	spec, err := h.attachCredential(spec)
+	spec, err = h.attachCredential(spec)
 	if err != nil {
 		return Outcome{}, err
 	}

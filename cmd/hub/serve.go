@@ -335,9 +335,10 @@ func modelsHandler(h *hub.Hub) http.HandlerFunc {
 // apiErrorStatus maps a dispatch failure to an HTTP status. A provider that
 // simply cannot serve the model is a 404; a market with every agent offline
 // is a 503 (the model may exist — the supply is what is down); quota
-// exhaustion is a 429 and an exhausted spend budget is a 402 (refusing on
-// price is not the same complaint as refusing on rate); anything else is a 502
-// upstream failure.
+// exhaustion and an exceeded in-flight share are both 429 (the request was
+// fine, the tenant is already asking for as much as it may), and an exhausted
+// spend budget is a 402 (refusing on price is not the same complaint as
+// refusing on rate); anything else is a 502 upstream failure.
 func apiErrorStatus(err error) int {
 	switch {
 	case errors.Is(err, hub.ErrNoProviderForModel), errors.Is(err, hub.ErrUnknownProvider):
@@ -346,7 +347,7 @@ func apiErrorStatus(err error) int {
 		return http.StatusServiceUnavailable
 	case errors.Is(err, hub.ErrBudgetExceeded):
 		return http.StatusPaymentRequired
-	case errors.Is(err, hub.ErrQuotaExceeded):
+	case errors.Is(err, hub.ErrQuotaExceeded), errors.Is(err, hub.ErrTooManyInflight):
 		return http.StatusTooManyRequests
 	default:
 		return http.StatusBadGateway
