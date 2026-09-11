@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,25 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
+
+// defaultRequestReadTimeout bounds how long a client may take to send a whole
+// request — request line, headers, and body — before the Hub gives up on it.
+//
+// ReadHeaderTimeout alone does not cover this: it stops a client that stalls in
+// the headers, but a client that sends headers promptly and then dribbles (or
+// never sends) the body it announced with Content-Length keeps a connection and
+// its goroutine for as long as it likes. The 16 MiB body cap bounds how much can
+// arrive, not how slowly.
+//
+// It is safe to set server-wide precisely because it bounds *reading the
+// request* and nothing else. The stdlib clears the read deadline once the body
+// is consumed (and on hijack, which is how the agent gate and the tee relay take
+// the connection), so a response that streams for minutes — every SSE answer —
+// is untouched; it is WriteTimeout, deliberately left zero, that would cut such
+// a stream. The value is generous because a request body may legitimately be
+// large and the client's uplink is not the Hub's to choose; the point is that it
+// is finite.
+const defaultRequestReadTimeout = 30 * time.Second
 
 // serveConfig is the routing the resident service hands to the scheduler: the
 // upstream it asks the TEE to reach, per provider.
@@ -137,19 +157,26 @@ func runServe(h *hub.Hub, cfg serveConfig) {
 		cfg.Addr, routePaths(), sessionPath, modelsPath)
 	log.Printf("hub reverse-tunnel endpoints: agent gate %s, tee relay %s, credential key %s",
 		agentGatePath, teeRelayPath, credentialKeyPath)
-	srv := &http.Server{
-		Addr:    cfg.Addr,
-		Handler: mux,
-		// ReadHeaderTimeout is the slowloris defence: a client that stalls in
-		// the request line or headers is dropped instead of pinning a
-		// connection indefinitely. ReadTimeout and WriteTimeout stay zero on
-		// purpose — neither a large request body nor an SSE response has a
-		// bounded size or duration here, and a write deadline would cut live
-		// streams mid-body.
+	srv := newHubServer(cfg.Addr, mux, defaultRequestReadTimeout)
+	log.Fatal(srv.ListenAndServe())
+}
+
+// newHubServer builds the Hub's HTTP server. It is split out so a test can run
+// the real configuration with its own read timeout — a test cannot wait out the
+// shipped 30s to observe the bound.
+//
+// WriteTimeout stays zero on purpose: an SSE response has no bounded size or
+// duration, and a write deadline would cut a live stream mid-body. ReadTimeout
+// is set because it bounds only the read side of a request, which the stdlib
+// ends before the handler runs (see defaultRequestReadTimeout).
+func newHubServer(addr string, handler http.Handler, readTimeout time.Duration) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       readTimeout,
 		IdleTimeout:       120 * time.Second,
 	}
-	log.Fatal(srv.ListenAndServe())
 }
 
 func routePaths() []string {
@@ -172,6 +199,15 @@ type userHandler struct {
 func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
 	if err != nil {
+		// A body that stopped arriving is the deadline the server set (see
+		// defaultRequestReadTimeout) expiring: the client stalled, which is a
+		// 408. Any other read failure is a body the Hub cannot use, which is a
+		// 400.
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			writeJSONError(w, http.StatusRequestTimeout, "request body timed out")
+			log.Printf("api path=%s err=body read timeout", c.route.Path)
+			return
+		}
 		writeJSONError(w, http.StatusBadRequest, "read body")
 		return
 	}

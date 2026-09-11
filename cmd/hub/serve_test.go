@@ -3,10 +3,13 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
@@ -438,5 +441,87 @@ func TestTenantResolverMapsKeyToTenant(t *testing.T) {
 	req.Header.Set(tenantKeyHeader, "sk-good")
 	if tenant, ok := r.resolve(req); !ok || tenant != "tenant-real" {
 		t.Fatalf("resolve = %q,%t, want tenant-real,true", tenant, ok)
+	}
+}
+
+// TestStalledRequestBodyIsCutOff pins the request read deadline against a real
+// server: a client that announces a body with Content-Length and then never
+// sends it must not hold the connection (and a goroutine) indefinitely. The
+// shipped timeout is 30s — far too long to wait for in a test — so this runs the
+// same server configuration with a short one.
+func TestStalledRequestBodyIsCutOff(t *testing.T) {
+	const stallTimeout = 150 * time.Millisecond
+	route := userRoutes[0]
+
+	handler := &userHandler{
+		h:     newServeTestHub(t, []byte("data: {\"id\":\"chatcmpl-sim1\"}\n\n")),
+		cfg:   serveConfig{Host: "127.0.0.1:18080", Max: 1 << 20},
+		route: route,
+	}
+	srv := httptest.NewUnstartedServer(handler)
+	srv.Config = newHubServer("", handler, stallTimeout)
+	srv.Start()
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Headers arrive; the body they announce never does.
+	if _, err := fmt.Fprintf(conn,
+		"POST %s HTTP/1.1\r\nHost: hub.test\r\n%s: tenant-test\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n",
+		route.Path, tenantKeyHeader); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	raw, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if !strings.Contains(string(raw), "408") {
+		t.Fatalf("response = %q, want a 408 for a stalled body", raw)
+	}
+}
+
+// TestReadTimeoutDoesNotTruncateAResponseStream pins why the read deadline is
+// safe to set server-wide: it bounds reading the request, so a response that
+// takes longer to finish than the timeout — every SSE answer does — still
+// arrives whole. It is WriteTimeout, deliberately left zero, that would cut such
+// a stream.
+func TestReadTimeoutDoesNotTruncateAResponseStream(t *testing.T) {
+	const readTimeout = 100 * time.Millisecond
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Consume the request as the real routes do, so the deadline the server
+		// armed on the body is the one under test.
+		_, _ = io.Copy(io.Discard, r.Body)
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, "first")
+		flusher.Flush()
+		// Write the second half well after the read timeout has elapsed.
+		time.Sleep(3 * readTimeout)
+		_, _ = io.WriteString(w, "second")
+		flusher.Flush()
+	})
+
+	srv := httptest.NewUnstartedServer(handler)
+	srv.Config = newHubServer("", handler, readTimeout)
+	srv.Start()
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"m"}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read stream: %v", err)
+	}
+	if string(body) != "firstsecond" {
+		t.Fatalf("streamed body = %q, want both halves: a read timeout must not cut a response", body)
 	}
 }
