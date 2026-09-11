@@ -87,19 +87,26 @@ func agentHub(t *testing.T, cfg Config) *Hub {
 	return scriptedHub(t, cfg)
 }
 
-// TestAgentGateRejectsWrongSharedKey pins the shared-key gate: a dial-in with
-// any key but the Hub's is refused before the upgrade, so it never reaches a
-// tunnel.
-func TestAgentGateRejectsWrongSharedKey(t *testing.T) {
-	h := agentHub(t, Config{AgentSecret: []byte("right")})
+// TestAgentGateRejectsWrongKey pins the per-provider gate: a dial-in with any
+// key but the one provisioned for the provider it names is refused before the
+// upgrade, so it never reaches a tunnel.
+func TestAgentGateRejectsWrongKey(t *testing.T) {
+	h := agentHub(t, Config{AgentKeys: map[string][]byte{"cheap": []byte("right")}})
 	url := gateURL(t, h, "/v1/agent")
 
-	conn, resp, err := dialGate(t, url, http.Header{AgentKeyHeader: {"wrong"}})
-	if err == nil {
+	if conn, resp, err := dialGate(t, url, http.Header{AgentKeyHeader: {"wrong"}}); err == nil {
 		conn.Close()
 		t.Fatal("gate admitted a dial-in with the wrong key")
+	} else if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %v, want 401", resp)
 	}
-	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+	if conn, resp, err := dialGate(t, url, http.Header{
+		AgentKeyHeader:      {"wrong"},
+		AgentProviderHeader: {"cheap"},
+	}); err == nil {
+		conn.Close()
+		t.Fatal("gate admitted a dial-in with the wrong key for the named provider")
+	} else if resp == nil || resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %v, want 401", resp)
 	}
 }
@@ -164,11 +171,13 @@ func TestAgentGatePerProviderKeyBindsTunnel(t *testing.T) {
 // on its own tunnel must neither close the control lease twice nor displace
 // the real registration. A panic here would take the whole test process down.
 func TestAgentTunnelSecondOpenIsRefusedWithoutDroppingTheLease(t *testing.T) {
-	h := agentHub(t, Config{AgentSecret: []byte("k")})
+	h := agentHub(t, Config{AgentKeys: map[string][]byte{"cheap": []byte("k")}})
 	url := gateURL(t, h, "/v1/agent")
 
-	mux, err := agentSession(t, url, http.Header{AgentKeyHeader: {"k"}},
-		AgentRegister{Provider: "cheap", Credential: &tee.Envelope{}})
+	mux, err := agentSession(t, url, http.Header{
+		AgentKeyHeader:      {"k"},
+		AgentProviderHeader: {"cheap"},
+	}, AgentRegister{Provider: "cheap", Credential: &tee.Envelope{}})
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -195,11 +204,13 @@ func TestAgentTunnelSecondOpenIsRefusedWithoutDroppingTheLease(t *testing.T) {
 // TestAgentRegisterRejectsInvalidProviderName pins that a provider name is
 // validated before it can reach the credential store's file path.
 func TestAgentRegisterRejectsInvalidProviderName(t *testing.T) {
-	h := agentHub(t, Config{AgentSecret: []byte("k")})
+	h := agentHub(t, Config{AgentKeys: map[string][]byte{"cheap": []byte("k")}})
 	url := gateURL(t, h, "/v1/agent")
 
-	mux, err := agentSession(t, url, http.Header{AgentKeyHeader: {"k"}},
-		AgentRegister{Provider: "../escape", Credential: &tee.Envelope{}})
+	mux, err := agentSession(t, url, http.Header{
+		AgentKeyHeader:      {"k"},
+		AgentProviderHeader: {"cheap"},
+	}, AgentRegister{Provider: "../escape", Credential: &tee.Envelope{}})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

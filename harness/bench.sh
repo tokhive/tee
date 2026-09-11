@@ -79,7 +79,8 @@ wait_for_port 127.0.0.1 "$MP_PORT"
 
 echo "==> starting reverse-tunnel Hub on :$HUB_PORT (agent gate /v1/agent, tee relay /v1/relay)"
 "$BIN/hub" -serve "127.0.0.1:$HUB_PORT" -host "127.0.0.1:$MP_PORT" \
-  -tee "http://127.0.0.1:$TEE_PORT" -agent-key "$AGENT_SECRET" > "$SIM/hub.log" 2>&1 &
+  -tee "http://127.0.0.1:$TEE_PORT" -agent-keys "openai-sim=$AGENT_SECRET" \
+  -relay-key "$AGENT_SECRET" > "$SIM/hub.log" 2>&1 &
 HUB_PID=$!
 wait_for_port 127.0.0.1 "$HUB_PORT"
 
@@ -91,7 +92,7 @@ sleep 1
 
 echo "==> starting simulated TEE on :$TEE_PORT (egress via the hub relay)"
 "$BIN/tee" -addr "127.0.0.1:$TEE_PORT" -relay "ws://127.0.0.1:$HUB_PORT/v1/relay" \
-  -seq "$SIM/seqstore.json" > "$SIM/tee.log" 2>&1 &
+  -relay-key "$AGENT_SECRET" -seq "$SIM/seqstore.json" > "$SIM/tee.log" 2>&1 &
 TEE_PID=$!
 wait_for_port 127.0.0.1 "$TEE_PORT"
 sleep 1

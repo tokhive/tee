@@ -57,23 +57,17 @@ func (h *Hub) AgentGate(upgrader websocket.Upgrader) http.Handler {
 	})
 }
 
-// authenticateAgent admits a dial-in and, when per-provider keys are
-// configured, reports which provider the presented key was issued for. The
-// returned name is "" when only a shared key is configured, meaning the gate
-// cannot bind the tunnel to a provider and the register stream's own claim
-// stands (see serveAgentTunnel).
+// authenticateAgent admits a dial-in and reports which provider the presented
+// key was issued for. There is no shared-key mode: every dial-in must name a
+// provider on AgentProviderHeader and present exactly the key provisioned for
+// it, so the gate always returns the provider the key was bound to. A Hub with
+// no per-provider keys configured admits nothing.
 func (h *Hub) authenticateAgent(provider string, presented []byte) (string, bool) {
-	if len(h.agentKeys) > 0 {
-		secret, ok := h.agentKeys[provider]
-		if !ok || !agentKeyMatches(presented, secret) {
-			return "", false
-		}
-		return provider, true
-	}
-	if !agentKeyMatches(presented, h.agentSecret) {
+	secret, ok := h.agentKeys[provider]
+	if !ok || !agentKeyMatches(presented, secret) {
 		return "", false
 	}
-	return "", true
+	return provider, true
 }
 
 // CredentialKeyHandler serves the TEE's inbox public key to provider agents:
@@ -99,10 +93,10 @@ func (h *Hub) CredentialKeyHandler(w http.ResponseWriter, r *http.Request) {
 // schedulable; when the control stream closes, the agent drops offline and the
 // tunnel is torn down.
 //
-// authedProvider is the provider the dial-in's key was issued for, or "" when
-// the gate could only check a shared key. When it is non-empty the register
-// must name exactly that provider, so a key for one provider cannot be used to
-// come online as another.
+// authedProvider is the provider the dial-in's key was issued for (never empty:
+// the gate only admits a key that resolves to a provider). The register must
+// name exactly that provider, so a key for one provider cannot be used to come
+// online as another.
 func (h *Hub) serveAgentTunnel(conn *websocket.Conn, authedProvider string) {
 	mux := tunnel.New(tunnel.WrapWS(conn), tunnel.Low)
 	// The control-stream handler is the only authority on the tunnel's end: it

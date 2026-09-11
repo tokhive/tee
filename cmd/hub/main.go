@@ -21,6 +21,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -71,8 +72,7 @@ func main() {
 	sessionMaxUp := flag.Uint64("session-max-up", 1<<20, "max uplink bytes a streaming session may relay (0 = unlimited)")
 	sessionIdle := flag.Duration("session-idle", 30*time.Second, "tear a session down if the provider streams nothing this long (0 = no watchdog)")
 	attemptTimeout := flag.Duration("attempt-timeout", 3*time.Minute, "bound on one dispatch to a provider, including TEE time (0 = no bound; keep this above the TEE's -request-timeout)")
-	agentKey := flag.String("agent-key", "", "shared key Provider Agents must present to dial in (required to make the Hub schedulable-by-online)")
-	agentKeys := flag.String("agent-keys", "", "per-provider agent keys as provider=key[,provider=key]; replaces -agent-key and binds each tunnel to one provider")
+	agentKeys := flag.String("agent-keys", "", "per-provider agent keys as provider=key[,provider=key]; binds each tunnel to exactly one provider (required in serve mode)")
 	relayKey := flag.String("relay-key", "", "key the TEE must present to dial /v1/relay (empty = unauthenticated relay)")
 	tenantKeys := flag.String("tenant-keys", "", "user api keys as key=tenant[,key=tenant]; the key is verified and resolves to its tenant (empty = open mode: the presented key is the tenant)")
 	tenantBudgets := flag.String("tenant-budgets", "", "per-tenant cumulative spend ceilings in micro-units, as tenant=micros[,tenant=micros]; a tenant absent from the map is uncapped")
@@ -138,7 +138,6 @@ func main() {
 		SessionMaxUpBytes:    *sessionMaxUp,
 		SessionIdle:          *sessionIdle,
 		AttemptTimeout:       *attemptTimeout,
-		AgentSecret:          []byte(*agentKey),
 		AgentKeys:            perProviderKeys,
 		RelaySecret:          []byte(*relayKey),
 		Credentials:          teeClient,
@@ -162,7 +161,13 @@ func main() {
 	}
 
 	// Resident user-facing mode: one OpenAI-compatible HTTP endpoint that routes
-	// by model through the lowest-price scheduler.
+	// by model through the lowest-price scheduler. Serving refuses to start
+	// without both the agent gate (per-provider keys) and the TEE relay key: a
+	// Hub exposed to the network with either unauthenticated is a free egress
+	// proxy through every seller's connection.
+	if err := requireServeKeys(*serveAddr, *agentKeys, *relayKey); err != nil {
+		log.Fatal(err)
+	}
 	if *serveAddr != "" {
 		runServe(h, serveConfig{
 			Addr:    *serveAddr,
@@ -195,6 +200,22 @@ func main() {
 		printOutcome(outcome)
 	}
 	printLedger(h.Ledger())
+}
+
+// requireServeKeys refuses to expose a Hub on the network without an
+// authenticated agent gate and an authenticated TEE relay. In CLI one-shot mode
+// (no -serve) nothing is exposed, so neither key is required.
+func requireServeKeys(serveAddr, agentKeys, relayKey string) error {
+	if serveAddr == "" {
+		return nil
+	}
+	if agentKeys == "" {
+		return errors.New("serve mode requires -agent-keys (per-provider agent keys)")
+	}
+	if relayKey == "" {
+		return errors.New("serve mode requires -relay-key (TEE relay authentication)")
+	}
+	return nil
 }
 
 // wsEndpoint rewrites the TEE's http(s) base into the ws(s) WebSocket URL its

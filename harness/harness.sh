@@ -226,7 +226,7 @@ HUB_WS="ws://127.0.0.1:18085"   # user-facing Hub (scenarios 15-17)
 # real TEE directly, so the envelope agent A deposits here is never opened.
 echo "==> starting reverse-tunnel Hub on :$RT_HUB_PORT (agent gate /v1/agent, tee relay /v1/relay)"
 "$BIN/hub" -serve "127.0.0.1:$RT_HUB_PORT" -host "127.0.0.1:$MP_PORT" \
-  -tee "http://127.0.0.1:$TEE_PORT" -agent-keys "$AGENT_KEYS" > "$SIM/hub-rt.log" 2>&1 &
+  -tee "http://127.0.0.1:$TEE_PORT" -agent-keys "$AGENT_KEYS" -relay-key "$RELAY_SECRET" > "$SIM/hub-rt.log" 2>&1 &
 RT_HUB_PID=$!
 wait_for_port 127.0.0.1 "$RT_HUB_PORT"
 
@@ -462,6 +462,7 @@ section "15. lowest-price scheduling + commission: user API picks cheap-sim"
 echo "    starting the user-facing Hub on :$HUB_API_PORT (10% commission, agent-key gate)"
 "$BIN/hub" -serve "127.0.0.1:$HUB_API_PORT" -host "127.0.0.1:$MP_PORT" \
   -tee "http://127.0.0.1:$TEE_D" -commission 1000 -agent-keys "$AGENT_KEYS" \
+  -relay-key "$RELAY_SECRET" \
   > "$SIM/hub-serve.log" 2>&1 &
 HUB_API_PID=$!
 wait_for_port 127.0.0.1 "$HUB_API_PORT"
@@ -546,6 +547,7 @@ echo "    (fresh hub + stores so receipt counts are unambiguous)"
 rm -rf "$SIM/receipts"
 "$BIN/hub" -serve "127.0.0.1:$HUB_API_PORT" -host "127.0.0.1:$MP_PORT" \
   -tee "http://127.0.0.1:$TEE_D" -agent-keys "$AGENT_KEYS" \
+  -relay-key "$RELAY_SECRET" \
   > "$SIM/hub-serve16.log" 2>&1 &
 HUB_API16_PID=$!
 wait_for_port 127.0.0.1 "$HUB_API_PORT"
@@ -687,7 +689,7 @@ rm -rf "$SIM/receipts"
 "$BIN/hub" -serve "127.0.0.1:$HUB_API_PORT" -host "127.0.0.1:$MP_PORT" \
   -tee "http://127.0.0.1:$TEE_G" -commission 1000 \
   -session-timeout 30s -session-max 1048576 -session-idle 5s \
-  -agent-keys "$AGENT_KEYS" > "$SIM/hub-serve17.log" 2>&1 &
+  -agent-keys "$AGENT_KEYS" -relay-key "$RELAY_SECRET" > "$SIM/hub-serve17.log" 2>&1 &
 HUB_API17_PID=$!
 wait_for_port 127.0.0.1 "$HUB_API_PORT"
 

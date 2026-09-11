@@ -342,7 +342,7 @@ func TestDirectoryPricesTheVolumeRate(t *testing.T) {
 	card := RateCard{PerMegabyteMicros: 500_000}
 	h := scriptedHub(t, Config{
 		Rates:       ratesTable(map[string]RateCard{"vol": card}),
-		AgentSecret: []byte("gate-secret"),
+		AgentKeys: map[string][]byte{"vol": []byte("gate-secret")},
 	})
 	offline := agentsOnlineWith(h, "vol", card, []string{"m"})
 	defer offline()

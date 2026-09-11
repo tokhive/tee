@@ -49,7 +49,7 @@ func gateStack(t *testing.T, token string) (*tee.InboxKey, *hub.MemoryCredential
 		Rates:           map[string]hub.RateCard{"openai": {PerRequestMicros: 100}},
 		Store:           memStore{},
 		Verify:          func(proof.SignedReceipt) error { return nil },
-		AgentSecret:     []byte(agentSecret),
+		AgentKeys:       map[string][]byte{"openai": []byte(agentSecret)},
 		Credentials:     &keyService{inbox: inbox},
 		CredentialStore: store,
 	})

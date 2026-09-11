@@ -293,6 +293,9 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 	// Store first, then settle: the ledger is in-memory and cannot fail, so
 	// once Put has succeeded the settlement is guaranteed to be recorded.
 	outcome.Stored = true
+	if !h.claimSettlement(receipt.Receipt.JobID) {
+		return outcome, fmt.Errorf("%w: job %x", ErrDuplicateSettlement, receipt.Receipt.JobID)
+	}
 	h.ledger.NoteSettled(spec.Provider, charged)
 	h.ledger.NoteCommission(spec.Provider, commission)
 	h.chargeTenant(tenant, buyer)

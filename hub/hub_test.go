@@ -3,6 +3,7 @@ package hub
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -43,10 +44,17 @@ func totalBytes(chunks [][]byte) uint64 {
 
 // makeReceipt builds a receipt that passes the Hub's stream check, optionally
 // mutated. The Hub only inspects a handful of fields, so the rest stay zero.
+// The JobID is randomized per receipt — a real TEE signs each job under the
+// JobID the Hub generated — so a script that returns the same receipt more
+// than once does not accidentally replay one JobID into the settlement dedup.
 func makeReceipt(seq uint64, stream [][]byte, mutate func(*proof.Receipt)) proof.SignedReceipt {
+	jobID := make([]byte, proof.JobIDLength)
+	if _, err := rand.Read(jobID); err != nil {
+		panic("makeReceipt: random job id: " + err.Error())
+	}
 	r := proof.Receipt{
 		Version:       proof.VersionV1,
-		JobID:         make([]byte, proof.JobIDLength),
+		JobID:         jobID,
 		Provider:      testProvider,
 		StatusCode:    200,
 		Completion:    proof.CompletionComplete,
