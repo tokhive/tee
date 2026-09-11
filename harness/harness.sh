@@ -81,6 +81,28 @@ wait_for_port() {
   done
 }
 
+# wait_for_cheapest waits until the Hub's model directory quotes the named
+# provider as the cheapest for at least one model — i.e. until that provider's
+# agent is genuinely online. Scenarios 15-17 dial their agents in BEFORE their
+# TEE exists, so the first registration cannot seal a credential, and the agent
+# retries on a full-jitter backoff (provider.jittered): the instant it comes
+# back is not fixed. A bare `sleep` races that backoff and flakes; polling the
+# real readiness signal does not. On timeout the caller's assertions still run
+# and fail loudly, so a genuinely stuck agent is reported, not masked.
+wait_for_cheapest() {
+  local port="$1" provider="$2" tries=150
+  while [ "$tries" -gt 0 ]; do
+    if curl -s --noproxy '*' "http://127.0.0.1:$port/v1/models" 2>/dev/null \
+        | grep -q "\"provider\":\"$provider\""; then
+      return 0
+    fi
+    tries=$((tries-1))
+    sleep 0.2
+  done
+  echo "  !! timeout waiting for $provider to appear in the model directory on :$port"
+  return 1
+}
+
 MP_PORT=18080
 TEE_PORT=18090
 STATS_PORT=18081
@@ -459,10 +481,10 @@ echo "    starting real tee D on :$TEE_D with the two-provider egress"
 TEE_D_PID=$!
 wait_for_port 127.0.0.1 "$TEE_D"
 # The agents dialed in before the TEE was up and had no inbox key to encrypt to,
-# so they retry every reconnect tick. Give them a beat to re-register now that
-# the TEE relays a key; firing a request earlier would dispatch without a
-# credential and be refused.
-sleep 2
+# so they retry on a jittered backoff. Wait for the real signal — cheap-sim live
+# in the model directory — rather than a fixed beat that races that backoff;
+# firing a request earlier would dispatch without a credential and be refused.
+wait_for_cheapest "$HUB_API_PORT" cheap-sim
 
 echo "    sending 3 chat requests for model sim-mock-0.5b:"
 for i in 1 2 3; do
@@ -550,9 +572,9 @@ fi
 TEE_D16_PID=$!
 wait_for_port 127.0.0.1 "$TEE_D"
 
-# Same registration beat as scenario 15: agents re-register once the TEE relays
-# an inbox key, and the requests below must not race that.
-sleep 2
+# Same readiness wait as scenario 15: the requests below must not race the
+# agents' jittered re-registration.
+wait_for_cheapest "$HUB_API_PORT" cheap-sim
 
 echo "    POST /v1/messages (Anthropic format, model claude-sim):"
 curl -s --noproxy '*' -X POST "http://127.0.0.1:$HUB_API_PORT/v1/messages" \
@@ -683,8 +705,8 @@ sleep 1
 TEE_G_PID=$!
 wait_for_port 127.0.0.1 "$TEE_G"
 
-# Same registration beat as scenario 15.
-sleep 2
+# Same readiness wait as scenario 15.
+wait_for_cheapest "$HUB_API_PORT" cheap-sim
 
 echo "    a streaming session for model sim-mock-0.5b (cheapest provider = cheap-sim):"
 "$BIN/sessiondriver" -url "ws://127.0.0.1:$HUB_API_PORT/v1/session" \
