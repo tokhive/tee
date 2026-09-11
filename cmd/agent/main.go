@@ -43,6 +43,8 @@ func main() {
 	authHeader := flag.String("auth-header", "authorization", "request header the token travels in (e.g. authorization, x-api-key)")
 	timeout := flag.Duration("connect-timeout", 10*time.Second, "bounds dialing the Hub and each upstream")
 	reconnect := flag.Duration("reconnect", time.Second, "pause between reconnect attempts after the tunnel drops")
+	maxConns := flag.Int("max-conns", provider.DefaultMaxRelayConns, "how many relay streams to serve at once; streams past this are refused so the Hub can route to another provider (0 = unlimited)")
+	relayIdle := flag.Duration("relay-idle", provider.DefaultRelayIdle, "tear a relay stream down once it has carried nothing this long; keep this above the Hub's -attempt-timeout (0 = no watchdog)")
 	flag.Parse()
 
 	if *key == "" {
@@ -84,6 +86,8 @@ func main() {
 		AllowedTargets: allowed,
 		ConnectTimeout: *timeout,
 		ReconnectDelay: *reconnect,
+		MaxRelayConns:  *maxConns,
+		RelayIdle:      *relayIdle,
 		Self: hub.AgentRegister{
 			Provider:    *providerName,
 			DisplayName: *name,
@@ -136,10 +140,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("provider agent %s online via %s (allowlist: %v, price: %s, auth: %s%s)",
-		*providerName, *gate, allowed, priceLabel(*price), *authHeader, schemeLabel(scheme))
-	if err := agent.Run(ctx); err != nil {
-		log.Fatalf("agent: %v", err)
+	log.Printf("provider agent %s online via %s (allowlist: %v, price: %s, auth: %s%s, relays: %d concurrent, idle: %s)",
+		*providerName, *gate, allowed, priceLabel(*price), *authHeader, schemeLabel(scheme), *maxConns, *relayIdle)
+	err = agent.Run(ctx)
+	// Report what the machine carried before leaving: the contributor is owed the
+	// usage line whether the run ended on a signal or on a failure.
+	log.Printf("provider agent %s stopped: %s", *providerName, agent.Stats())
+	// A cancelled context is how a signal ends the run, not a failure — so it
+	// exits cleanly. Anything else is a real error and must exit non-zero, or a
+	// supervisor would not restart the agent.
+	if err != nil && ctx.Err() == nil {
+		log.Fatalf("provider agent %s: %v", *providerName, err)
 	}
 }
 
