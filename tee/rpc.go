@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
@@ -46,6 +47,19 @@ const (
 	// so a caller that treats "no receipt frame" and "error frame" as the same
 	// case loses the reason; they are deliberately distinct.
 	EventError = "error"
+
+	// MaxExecuteBody bounds the canonical-CBOR ExecuteRequest the TEE will
+	// read. A job spec plus its request body is small; a caller declaring a
+	// gigabyte is not submitting a job, it is attempting to exhaust the
+	// enclave's memory before any policy check runs.
+	MaxExecuteBody = 8 << 20
+
+	// executeReadTimeout bounds how long the TEE spends reading that body, so
+	// a peer that opens the stream and dribbles bytes cannot pin a connection.
+	// It is deliberately local to /v1/execute: /v1/session hijacks its socket
+	// into a WebSocket whose read deadline must stay clear for the session's
+	// whole life.
+	executeReadTimeout = 30 * time.Second
 )
 
 // startFrame is the JSON payload of an EventStart frame. Headers are a map so
@@ -90,9 +104,19 @@ func (r ExecuteRequest) Job() Job { return Job{Spec: r.Spec, Body: r.Body} }
 // A refusal is reported as an EventError frame, so the caller learns why
 // without a credential ever being touched.
 func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
-	raw, err := io.ReadAll(r.Body)
+	// Bound the request twice before reading a byte: a read deadline so a peer
+	// that dribbles the body cannot pin the connection, and a size limit so a
+	// declared length cannot allocate unbounded memory. The read of one extra
+	// byte past the cap is what distinguishes "exactly at the cap" from "over
+	// it" without trusting Content-Length.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(executeReadTimeout))
+	raw, err := io.ReadAll(io.LimitReader(r.Body, MaxExecuteBody+1))
 	if err != nil {
 		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+	if len(raw) > MaxExecuteBody {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	req, err := DecodeExecuteRequest(raw)

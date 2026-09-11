@@ -39,8 +39,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/transport"
@@ -54,6 +56,9 @@ const defaultPlatform = "simulated"
 func main() {
 	addr := flag.String("addr", "127.0.0.1:18090", "listen address")
 	relay := flag.String("relay", "", "Hub TeeRelay WebSocket URL: every provider connection egresses as a stream over the Hub's reverse tunnel")
+	relayKey := flag.String("relay-key", "", "key to present to the Hub's TeeRelay endpoint (empty = the Hub requires none)")
+	maxConns := flag.Int("max-conns", 0, "max resident provider connections per (provider, host) (0 = default 32)")
+	requestTimeout := flag.Duration("request-timeout", 2*time.Minute, "bound on a single provider exchange, including streaming sessions (0 = no bound)")
 	seqPath := flag.String("seq", "", "ProviderSeq store file (default <simdir>/seqstore.json)")
 	platformName := flag.String("platform", defaultPlatform, "attestation platform: simulated or sevsnp")
 	includeEvidence := flag.Bool("evidence", true, "embed attestation evidence in every receipt (false = resolve EvidenceHash via evidence retrieval)")
@@ -112,6 +117,8 @@ func main() {
 	cm, err := transport.NewChannelManager(transport.ChannelConfig{
 		Scheme:          "https",
 		RelayURL:        *relay,
+		RelayHeaders:    relayHeaders(*relayKey),
+		MaxConnsPerHost: *maxConns,
 		TLSClientConfig: upstreamTLS,
 	})
 	if err != nil {
@@ -131,11 +138,12 @@ func main() {
 	signer.IncludeEvidence = *includeEvidence
 
 	svc, err := tee.NewService(tee.Config{
-		Policies:  policies,
-		Transport: cm,
-		Signer:    signer,
-		Seq:       store,
-		InboxKey:  inbox,
+		Policies:       policies,
+		Transport:      cm,
+		Signer:         signer,
+		Seq:            store,
+		InboxKey:       inbox,
+		RequestTimeout: *requestTimeout,
 	})
 	if err != nil {
 		log.Fatalf("build service: %v", err)
@@ -158,7 +166,28 @@ func main() {
 	})
 	log.Printf("tee (platform=%s, includeEvidence=%t) listening on http://%s",
 		*platformName, *includeEvidence, *addr)
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	srv := &http.Server{
+		Addr:    *addr,
+		Handler: mux,
+		// ReadHeaderTimeout drops a client that stalls in the request line or
+		// headers instead of pinning a connection. ReadTimeout and WriteTimeout
+		// stay zero: /v1/session hijacks its connection into a long-lived
+		// WebSocket, and /v1/execute answers with an SSE stream, so neither
+		// endpoint has a bounded read or write window a deadline could safely
+		// describe. The execute body itself is bounded inside ServeExecute.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
+}
+
+// relayHeaders builds the headers the TEE presents when dialing the Hub's
+// relay endpoint. An empty key means the Hub's relay requires none.
+func relayHeaders(key string) http.Header {
+	if key == "" {
+		return nil
+	}
+	return http.Header{hub.RelayKeyHeader: {key}}
 }
 
 // upstreamTLSConfig returns the TLS trust roots for provider connections.

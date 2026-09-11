@@ -171,6 +171,10 @@ func NewAgent(cfg AgentConfig) (*Agent, error) {
 	a := &Agent{cfg: cfg}
 	a.hdr = http.Header{}
 	a.hdr.Set(hub.AgentKeyHeader, string(cfg.SharedKey))
+	// Name the provider on the dial-in too, so a Hub configured with
+	// per-provider keys can bind this tunnel to exactly this provider before
+	// upgrading. A Hub with only a shared key ignores the header.
+	a.hdr.Set(hub.AgentProviderHeader, cfg.Self.Provider)
 	return a, nil
 }
 

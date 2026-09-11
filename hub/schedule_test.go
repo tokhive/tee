@@ -296,6 +296,125 @@ func TestExecuteForModelNoProviders(t *testing.T) {
 	}
 }
 
+// --- billing integrity: hidden volume rate, per-job ceiling ----------------
+
+// TestBookPriceFoldsInTheVolumeFloor pins that the number the scheduler orders
+// by — and the number the buyer is shown — includes the volume rate's minimum
+// billable unit. Billing rounds volume up to whole mebibytes, so the smallest
+// non-empty exchange already bills one unit of the volume rate; the book price
+// must therefore never omit that component.
+func TestBookPriceFoldsInTheVolumeFloor(t *testing.T) {
+	h := scheduleHub(t, ratesTable(map[string]RateCard{
+		"p": {PerRequestMicros: 100, PerMegabyteMicros: 5, ModelPremiumMicros: map[string]uint64{"m": 20}},
+	}), 0)
+
+	got, ok := h.bookPrice("p", "m")
+	if !ok {
+		t.Fatal("bookPrice: no card")
+	}
+	if want := uint64(100 + 20 + 5); got != want {
+		t.Fatalf("bookPrice = %d, want %d (per-request + premium + one MiB of volume)", got, want)
+	}
+}
+
+// TestRankedProvidersIgnoresHiddenVolumeCliff is the regression for the
+// cheapest-wins auction being gameable by a hidden volume rate: a seller that
+// advertises a zero per-request price while charging the maximum per-megabyte
+// rate must not outrank an honest seller with a modest flat price.
+func TestRankedProvidersIgnoresHiddenVolumeCliff(t *testing.T) {
+	set := ratesTable(map[string]RateCard{
+		// Headline price is zero; the real cost hides in the volume rate.
+		"sneaky": {PerMegabyteMicros: MaxRateMicros},
+		"honest": {PerRequestMicros: 1_000},
+	})
+	h := scheduleHub(t, set, 0)
+
+	got := h.providersForModel("m")
+	if len(got) != 2 || got[0] != "honest" {
+		t.Fatalf("ranked = %v, want honest first (the volume rate must count)", got)
+	}
+}
+
+// TestDirectoryPricesTheVolumeRate pins that a provider priced only by volume
+// does not appear free in the buyer-facing directory: a zero price there is
+// the exact signal the hidden-volume-rate attack depends on.
+func TestDirectoryPricesTheVolumeRate(t *testing.T) {
+	card := RateCard{PerMegabyteMicros: 500_000}
+	h := scriptedHub(t, Config{
+		Rates:       ratesTable(map[string]RateCard{"vol": card}),
+		AgentSecret: []byte("gate-secret"),
+	})
+	offline := agentsOnlineWith(h, "vol", card, []string{"m"})
+	defer offline()
+
+	dir := h.ModelDirectory()
+	if len(dir) != 1 {
+		t.Fatalf("directory = %+v, want one quote", dir)
+	}
+	if dir[0].PriceMicros != 500_000 {
+		t.Fatalf("price = %d, want 500000 (one MiB of the volume rate, never zero)", dir[0].PriceMicros)
+	}
+}
+
+// TestMaxJobMicrosRefusesAboveCeiling pins the per-job ceiling: a job that
+// prices above it is refused at settlement — no charge, no commission, nothing
+// in the ledger — while its receipt is still stored, so the execution stays
+// visible to the provider and the sequence keeps no hole.
+func TestMaxJobMicrosRefusesAboveCeiling(t *testing.T) {
+	store := NewReceiptStore(t.TempDir())
+	fake := &ScriptedTEE{Reply: func(call int, spec jobs.Spec) (Result, error) {
+		return cardReply(call, spec, 1_000, false)
+	}}
+	h, err := New(Config{
+		TEE:          fake,
+		Rates:        ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 1_000}}),
+		Store:        store,
+		Verify:       acceptAll,
+		MaxJobMicros: 500,
+	})
+	if err != nil {
+		t.Fatalf("build hub: %v", err)
+	}
+
+	out, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil)
+	if !errors.Is(err, ErrJobPriceExceeded) {
+		t.Fatalf("err = %v, want ErrJobPriceExceeded", err)
+	}
+	if out.Charged != 1_000 || out.Buyer != 1_000 {
+		t.Errorf("charged/buyer = %d/%d, want the priced 1000/1000", out.Charged, out.Buyer)
+	}
+	if !out.Stored {
+		t.Error("receipt must be stored even when the ceiling refuses payment (no hidden execution)")
+	}
+	if snap := h.Ledger().Snapshot(); snap.Settled != 0 || snap.Revenue != 0 {
+		t.Errorf("ledger settled/revenue = %d/%d, want 0/0 (nothing may move)", snap.Settled, snap.Revenue)
+	}
+	receipts, lerr := store.List(testProvider)
+	if lerr != nil {
+		t.Fatalf("list receipts: %v", lerr)
+	}
+	if len(receipts) != 1 {
+		t.Errorf("stored receipts = %d, want 1 (the execution must stay auditable)", len(receipts))
+	}
+}
+
+// TestCeilingDropsCandidatesItCannotAfford pins that a provider whose book
+// price already exceeds the ceiling is not even offered as a candidate: a
+// dispatch that could only be refused at settlement is not a real option.
+func TestCeilingDropsCandidatesItCannotAfford(t *testing.T) {
+	set := ratesTable(map[string]RateCard{
+		"dear":  {PerRequestMicros: 10_000},
+		"cheap": {PerRequestMicros: 100},
+	})
+	h := scriptedHub(t, Config{Rates: set, MaxJobMicros: 500})
+
+	got := h.providersForModel("m")
+	if len(got) != 1 || got[0] != "cheap" {
+		t.Fatalf("candidates = %v, want only [cheap] under a 500 ceiling", got)
+	}
+}
+
+
 // --- commission -----------------------------------------------------------
 
 func TestCommissionAddsToBuyerAndLedger(t *testing.T) {

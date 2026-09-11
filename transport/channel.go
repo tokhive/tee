@@ -47,6 +47,10 @@ type ChannelConfig struct {
 	// unchanged. When empty, the manager dials req.Host directly (used by the
 	// embedded transport tests and colocated simulation runs).
 	RelayURL string
+
+	// RelayHeaders are extra headers sent on the relay handshake, e.g. the
+	// relay key the Hub's endpoint requires. Nil means none.
+	RelayHeaders http.Header
 }
 
 // DefaultScheme is used when ChannelConfig.Scheme is empty.
@@ -159,7 +163,7 @@ func NewChannelManager(cfg ChannelConfig) (*ChannelManager, error) {
 		pools:       make(map[string]*channelPool),
 	}
 	if cfg.RelayURL != "" {
-		r, err := NewRelay(RelayConfig{URL: cfg.RelayURL})
+		r, err := NewRelay(RelayConfig{URL: cfg.RelayURL, Headers: cfg.RelayHeaders})
 		if err != nil {
 			return nil, err
 		}

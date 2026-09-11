@@ -92,7 +92,9 @@ func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 		if aerr != nil {
 			return nil, jobs.Spec{}, fmt.Errorf("attach credential for %q: %w", provider, aerr)
 		}
-		conn, oerr := h.tee.OpenSession(ctx, spec)
+		attemptCtx, cancel := h.attemptContext(ctx)
+		conn, oerr := h.tee.OpenSession(attemptCtx, spec)
+		cancel()
 		if oerr != nil {
 			continue
 		}
@@ -141,7 +143,8 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 		}
 	}()
 
-	up, down, downHash, relErr := relaySession(ctx, conn, link, spec.JobID, h.sessionMaxDownBytes, h.sessionIdle)
+	up, down, downHash, relErr := relaySession(ctx, conn, link, spec.JobID,
+		h.sessionMaxUpBytes, h.sessionMaxDownBytes, h.sessionIdle)
 
 	if errors.Is(relErr, ErrSessionLimitExceeded) {
 		// The Hub answered its own byte bound. The tunnel is already torn down;
@@ -206,6 +209,16 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 		Commission:    commission,
 		Buyer:         buyer,
 	}
+	if h.maxJob > 0 && buyer > h.maxJob {
+		// Same policy as the request path: the exchange really happened, so
+		// the receipt is kept for the provider's audit, but a session priced
+		// above the Hub's per-job ceiling settles nothing.
+		if serr := h.store.Put(spec.Provider, receipt); serr != nil {
+			return outcome, fmt.Errorf("store session receipt: %w", serr)
+		}
+		outcome.Stored = true
+		return outcome, fmt.Errorf("%w: buyer %d exceeds %d", ErrJobPriceExceeded, buyer, h.maxJob)
+	}
 	if err := h.store.Put(spec.Provider, receipt); err != nil {
 		// Same rule as the request path: the receipt is not durable, so the
 		// ledger records no money. The caller still gets the priced outcome
@@ -225,12 +238,18 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 // session ends when the provider closes (downlink hits io.EOF after the receipt
 // has been flushed through the tunnel), the user closes, or a bound fires.
 //
+// maxUp and maxDown are the Hub's own byte bounds; zero means no bound. The
+// uplink bound is enforced by simply not reading further from the user, which
+// ends the session normally: nothing was truncated on the provider's side, so
+// the receipt still reconciles and the session still settles for what crossed.
+// The downlink bound is different — see ErrSessionLimitExceeded.
+//
 // relaySession returns as soon as the downlink side resolves (or the session
 // times out), because that is when the receipt has been produced. The uplink
 // goroutine is left to unwind when the caller closes the user connection, which
 // is the only thing that can unblock a read on a live user socket.
 func relaySession(ctx context.Context, tunnel SessionConn, link RealtimeLink, jobID []byte,
-	maxDown uint64, idle time.Duration) (up, down uint64, downHash [32]byte, relErr error) {
+	maxUp, maxDown uint64, idle time.Duration) (up, down uint64, downHash [32]byte, relErr error) {
 
 	hasher := proof.NewStreamingHasher(jobID)
 
@@ -282,6 +301,13 @@ func relaySession(ctx context.Context, tunnel SessionConn, link RealtimeLink, jo
 		for {
 			n, rerr := link.Read(buf)
 			if n > 0 {
+				if maxUp > 0 && upCount.Load()+uint64(n) > maxUp {
+					// The user is uploading more than the Hub will relay into
+					// the provider's tunnel. Stop reading and end the session:
+					// the provider's own tunnel sees a clean close, so nothing
+					// is truncated mid-frame and the receipt still reconciles.
+					break
+				}
 				upCount.Add(uint64(n))
 				if _, werr := tunnel.Write(buf[:n]); werr != nil {
 					break

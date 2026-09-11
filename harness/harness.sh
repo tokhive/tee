@@ -34,6 +34,12 @@
 #  17  streaming session via  -> the Hub user API WebSocket: select + settle
 #      the Hub user API          + duplex
 #
+# Every hub that hosts the reverse tunnel does so with per-provider agent keys
+# (-agent-keys) and a relay key (-relay-key): a dial-in is bound to exactly one
+# provider, and the TEE must authenticate to carry egress. The retired shared
+# key and the unauthenticated relay are not exercised — a silently dropped flag
+# would then fail the scenarios loudly rather than pass unnoticed.
+#
 # Nothing here talks to a real model or a real enclave. The Hub's business
 # rules (pricing, quota, ledger, gap detection) are unit tested in-process
 # against a scripted TEE; this harness exercises them over the real RPC.
@@ -168,7 +174,18 @@ echo "        a ProviderSeq would show up here as a missing number."
 #        -> provider (real TLS, terminated inside the TEE)
 # =====================================================================
 
-AGENT_SECRET="sim-agent-secret"
+# Per-provider agent keys: each provider's tunnel can only be opened with its
+# own key, so no seller can come online as another and collect the revenue
+# routed to its name. The shared-key path is deliberately not exercised here:
+# with only -agent-keys configured the gate refuses every dial-in that does not
+# name a provisioned provider and present that provider's key, so a silently
+# dropped flag would fail the scenarios loudly instead of going unnoticed.
+KEY_OAI_AGENT="sim-agent-key-openai"
+KEY_CHEAP_AGENT="sim-agent-key-cheap"
+# Key the TEE presents to dial the Hub's /v1/relay endpoint, so the relay is
+# not an open egress proxy for anything that can reach it.
+RELAY_SECRET="sim-relay-secret"
+AGENT_KEYS="openai-sim=$KEY_OAI_AGENT,cheap-sim=$KEY_CHEAP_AGENT"
 # The sellers' access tokens. They live only in the agent processes (and, for
 # the one-shot simulation tools that talk to a TEE directly, in their -credential
 # flag): the TEE receives them sealed, and the Hub never sees them in the clear.
@@ -187,7 +204,7 @@ HUB_WS="ws://127.0.0.1:18085"   # user-facing Hub (scenarios 15-17)
 # real TEE directly, so the envelope agent A deposits here is never opened.
 echo "==> starting reverse-tunnel Hub on :$RT_HUB_PORT (agent gate /v1/agent, tee relay /v1/relay)"
 "$BIN/hub" -serve "127.0.0.1:$RT_HUB_PORT" -host "127.0.0.1:$MP_PORT" \
-  -tee "http://127.0.0.1:$TEE_PORT" -agent-key "$AGENT_SECRET" > "$SIM/hub-rt.log" 2>&1 &
+  -tee "http://127.0.0.1:$TEE_PORT" -agent-keys "$AGENT_KEYS" > "$SIM/hub-rt.log" 2>&1 &
 RT_HUB_PID=$!
 wait_for_port 127.0.0.1 "$RT_HUB_PORT"
 
@@ -200,14 +217,14 @@ TEE_A=18095
 section "9. real TEE -> tee relay -> agent reverse tunnel -> provider (TLS)"
 
 echo "    starting provider agent A (openai-sim) dialing the reverse-tunnel hub"
-"$BIN/agent" -hub "$RT_HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
+"$BIN/agent" -hub "$RT_HUB_WS/v1/agent" -key "$KEY_OAI_AGENT" -provider openai-sim \
   -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" -tap "$SIM/tap.log" > "$SIM/agentA.log" 2>&1 &
 AGENT_A_PID=$!
 # The agent registers asynchronously; give it a beat before the first request.
 sleep 1
 
 echo "    starting REAL tee.Service A on :$TEE_A, egressing via the hub relay"
-"$BIN/tee" -addr "127.0.0.1:$TEE_A" -relay "$RT_HUB_WS/v1/relay" \
+"$BIN/tee" -addr "127.0.0.1:$TEE_A" -relay "$RT_HUB_WS/v1/relay" -relay-key "$RELAY_SECRET" \
   -seq "$SIM/seqstore-real.json" > "$SIM/teeA.log" 2>&1 &
 TEE_A_PID=$!
 wait_for_port 127.0.0.1 "$TEE_A"
@@ -238,7 +255,7 @@ fi
 TEE_B=18096
 section "10. Provider Agent killed mid-request -> graceful failure"
 echo "    real tee B on :$TEE_B, egressing back through the SAME agent A"
-"$BIN/tee" -addr "127.0.0.1:$TEE_B" -relay "$RT_HUB_WS/v1/relay" \
+"$BIN/tee" -addr "127.0.0.1:$TEE_B" -relay "$RT_HUB_WS/v1/relay" -relay-key "$RELAY_SECRET" \
   -seq "$SIM/seqstore-teeb.json" > "$SIM/teeB.log" 2>&1 &
 TEE_B_PID=$!
 wait_for_port 127.0.0.1 "$TEE_B"
@@ -274,14 +291,14 @@ kill "$TEE_B_PID" 2>/dev/null; wait "$TEE_B_PID" 2>/dev/null
 # --- Scenario 11: epoch rotation (restart agent A + tee A) ----------------
 section "11. TEE restarts with a NEW signing key (epoch rotation)"
 echo "    (a fresh sim epoch => new key; restart agent A so openai-sim is back online)"
-"$BIN/agent" -hub "$RT_HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
+"$BIN/agent" -hub "$RT_HUB_WS/v1/agent" -key "$KEY_OAI_AGENT" -provider openai-sim \
   -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" -tap "$SIM/tap.log" > "$SIM/agentA2.log" 2>&1 &
 AGENT_A_PID=$!
 sleep 1
 
 echo "    (killing tee A pid $TEE_A_PID and restarting it under the new key)"
 kill "$TEE_A_PID" 2>/dev/null; wait "$TEE_A_PID" 2>/dev/null
-"$BIN/tee" -addr "127.0.0.1:$TEE_A" -relay "$RT_HUB_WS/v1/relay" \
+"$BIN/tee" -addr "127.0.0.1:$TEE_A" -relay "$RT_HUB_WS/v1/relay" -relay-key "$RELAY_SECRET" \
   -seq "$SIM/seqstore-real.json" > "$SIM/teeA2.log" 2>&1 &
 TEE_A_PID=$!
 wait_for_port 127.0.0.1 "$TEE_A"
@@ -323,7 +340,7 @@ echo "    starting fresh real tee C on :$TEE_C, egressing via the reverse tunnel
 # otherwise tee C's seq 1..N collide with tee A's receipts from scenarios 9-12
 # and the "[receipt]" lines below never print.
 rm -rf "$SIM/receipts"
-"$BIN/tee" -addr "127.0.0.1:$TEE_C" -relay "$RT_HUB_WS/v1/relay" \
+"$BIN/tee" -addr "127.0.0.1:$TEE_C" -relay "$RT_HUB_WS/v1/relay" -relay-key "$RELAY_SECRET" \
   -seq "$SIM/seqstore-teec.json" > "$SIM/teeC.log" 2>&1 &
 TEE_C_PID=$!
 wait_for_port 127.0.0.1 "$TEE_C"
@@ -381,7 +398,7 @@ TEE_E=18099
 section "14. streaming session: WebSocket upgrade tunnel + session receipt"
 
 echo "    starting real tee E on :$TEE_E, egressing via the reverse tunnel"
-"$BIN/tee" -addr "127.0.0.1:$TEE_E" -relay "$RT_HUB_WS/v1/relay" \
+"$BIN/tee" -addr "127.0.0.1:$TEE_E" -relay "$RT_HUB_WS/v1/relay" -relay-key "$RELAY_SECRET" \
   -seq "$SIM/seqstore-t14.json" > "$SIM/teeE.log" 2>&1 &
 TEE_E_PID=$!
 wait_for_port 127.0.0.1 "$TEE_E"
@@ -422,22 +439,22 @@ section "15. lowest-price scheduling + commission: user API picks cheap-sim"
 
 echo "    starting the user-facing Hub on :$HUB_API_PORT (10% commission, agent-key gate)"
 "$BIN/hub" -serve "127.0.0.1:$HUB_API_PORT" -host "127.0.0.1:$MP_PORT" \
-  -tee "http://127.0.0.1:$TEE_D" -commission 1000 -agent-key "$AGENT_SECRET" \
+  -tee "http://127.0.0.1:$TEE_D" -commission 1000 -agent-keys "$AGENT_KEYS" \
   > "$SIM/hub-serve.log" 2>&1 &
 HUB_API_PID=$!
 wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
 echo "    two provider agents come online: cheap-sim (0.30) and openai-sim (1.00)"
-"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider cheap-sim \
+"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$KEY_CHEAP_AGENT" -provider cheap-sim \
   -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_CHEAP" -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" > "$SIM/agent-cheap.log" 2>&1 &
 AGENT_CHEAP_PID=$!
-"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
+"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$KEY_OAI_AGENT" -provider openai-sim \
   -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" > "$SIM/agent-oai.log" 2>&1 &
 AGENT_OAI_PID=$!
 sleep 1
 
 echo "    starting real tee D on :$TEE_D with the two-provider egress"
-"$BIN/tee" -addr "127.0.0.1:$TEE_D" -relay "$HUB_WS/v1/relay" \
+"$BIN/tee" -addr "127.0.0.1:$TEE_D" -relay "$HUB_WS/v1/relay" -relay-key "$RELAY_SECRET" \
   -seq "$SIM/seqstore-t15.json" > "$SIM/teeD.log" 2>&1 &
 TEE_D_PID=$!
 wait_for_port 127.0.0.1 "$TEE_D"
@@ -506,16 +523,16 @@ section "16. Anthropic /v1/messages + OpenAI /v1/responses user APIs"
 echo "    (fresh hub + stores so receipt counts are unambiguous)"
 rm -rf "$SIM/receipts"
 "$BIN/hub" -serve "127.0.0.1:$HUB_API_PORT" -host "127.0.0.1:$MP_PORT" \
-  -tee "http://127.0.0.1:$TEE_D" -agent-key "$AGENT_SECRET" \
+  -tee "http://127.0.0.1:$TEE_D" -agent-keys "$AGENT_KEYS" \
   > "$SIM/hub-serve16.log" 2>&1 &
 HUB_API16_PID=$!
 wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
 echo "    bringing the two agents back online (no -models: each auto-discovers from its upstream /v1/models)"
-"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider cheap-sim \
+"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$KEY_CHEAP_AGENT" -provider cheap-sim \
   -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_CHEAP" -ca "$SIM/ca.pem" > "$SIM/agent-cheap16.log" 2>&1 &
 AGENT_CHEAP_PID=$!
-"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
+"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$KEY_OAI_AGENT" -provider openai-sim \
   -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -ca "$SIM/ca.pem" > "$SIM/agent-oai16.log" 2>&1 &
 AGENT_OAI_PID=$!
 sleep 1
@@ -528,7 +545,7 @@ else
   echo "      !! FAIL: an agent did not attempt conventional /v1/models discovery"
 fi
 
-"$BIN/tee" -addr "127.0.0.1:$TEE_D" -relay "$HUB_WS/v1/relay" \
+"$BIN/tee" -addr "127.0.0.1:$TEE_D" -relay "$HUB_WS/v1/relay" -relay-key "$RELAY_SECRET" \
   -seq "$SIM/seqstore-t16.json" > "$SIM/teeD16.log" 2>&1 &
 TEE_D16_PID=$!
 wait_for_port 127.0.0.1 "$TEE_D"
@@ -648,20 +665,20 @@ rm -rf "$SIM/receipts"
 "$BIN/hub" -serve "127.0.0.1:$HUB_API_PORT" -host "127.0.0.1:$MP_PORT" \
   -tee "http://127.0.0.1:$TEE_G" -commission 1000 \
   -session-timeout 30s -session-max 1048576 -session-idle 5s \
-  -agent-key "$AGENT_SECRET" > "$SIM/hub-serve17.log" 2>&1 &
+  -agent-keys "$AGENT_KEYS" > "$SIM/hub-serve17.log" 2>&1 &
 HUB_API17_PID=$!
 wait_for_port 127.0.0.1 "$HUB_API_PORT"
 
 echo "    two provider agents online (cheap-sim cheapest for the model)"
-"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider cheap-sim \
+"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$KEY_CHEAP_AGENT" -provider cheap-sim \
   -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_CHEAP" -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" > "$SIM/agent-cheap17.log" 2>&1 &
 AGENT_CHEAP_PID=$!
-"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$AGENT_SECRET" -provider openai-sim \
+"$BIN/agent" -hub "$HUB_WS/v1/agent" -key "$KEY_OAI_AGENT" -provider openai-sim \
   -targets "127.0.0.1:$MP_PORT" -token "$TOKEN_OAI" -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" > "$SIM/agent-oai17.log" 2>&1 &
 AGENT_OAI_PID=$!
 sleep 1
 
-"$BIN/tee" -addr "127.0.0.1:$TEE_G" -relay "$HUB_WS/v1/relay" \
+"$BIN/tee" -addr "127.0.0.1:$TEE_G" -relay "$HUB_WS/v1/relay" -relay-key "$RELAY_SECRET" \
   -seq "$SIM/seqstore-t17.json" > "$SIM/teeG.log" 2>&1 &
 TEE_G_PID=$!
 wait_for_port 127.0.0.1 "$TEE_G"

@@ -30,6 +30,10 @@ type RelayConfig struct {
 	// Dialer is the WebSocket dialer. Defaults to websocket.DefaultDialer.
 	Dialer *websocket.Dialer
 
+	// Headers are extra HTTP headers sent on the relay handshake, e.g. the
+	// relay key the Hub's TeeRelay endpoint requires. Nil means none.
+	Headers http.Header
+
 	// ConnectTimeout bounds dialing and (re)establishing the tunnel. Zero means
 	// 10s.
 	ConnectTimeout time.Duration
@@ -103,7 +107,7 @@ func (r *Relay) tunnel(ctx context.Context) (*tunnel.Multiplexer, error) {
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, r.cfg.ConnectTimeout)
 	defer cancel()
-	conn, resp, err := r.cfg.Dialer.DialContext(dialCtx, r.cfg.URL, nil)
+	conn, resp, err := r.cfg.Dialer.DialContext(dialCtx, r.cfg.URL, r.cfg.Headers)
 	if err != nil {
 		return nil, fmt.Errorf("dial relay tunnel: %w", err)
 	}

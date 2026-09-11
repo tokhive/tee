@@ -39,6 +39,15 @@ var (
 // audiences.
 const AgentKeyHeader = "X-TokenHive-Agent-Key"
 
+// AgentProviderHeader is the HTTP header an agent sets on its dial-in request
+// to name the provider it egresses for. It is what lets the gate look up a
+// per-provider key (see Hub.authenticateAgent) before the tunnel is upgraded,
+// and it is checked against the provider on the register stream so a key
+// issued for one provider cannot register as another. With only a shared key
+// configured the header is unused — the register stream remains the sole
+// statement of identity — so an agent that predates it still dials in.
+const AgentProviderHeader = "X-TokenHive-Provider"
+
 // deliverCredential stores an agent-registered envelope in the Hub's
 // credential store. The Hub holds only ciphertext — an envelope sealed to the
 // TEE's inbox key — which it later attaches to every job it dispatches to this
@@ -56,6 +65,14 @@ func (h *Hub) deliverCredential(reg AgentRegister) error {
 // registration.
 func (h *Hub) revokeCredential(provider string) {
 	_ = h.credentialStore.Delete(provider)
+}
+
+// agentsEnabled reports whether this Hub hosts the agent gate at all — a
+// shared key or a per-provider key map is configured. When it is false the Hub
+// has no way to hear from a dialing agent, so it schedules over its static
+// market table rather than live supply (and the buyer directory is empty).
+func (h *Hub) agentsEnabled() bool {
+	return len(h.agentSecret) > 0 || len(h.agentKeys) > 0
 }
 
 // agentKeyMatches compares a presented key to the Hub's shared secret in

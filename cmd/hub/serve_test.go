@@ -387,3 +387,56 @@ func TestModelsEndpointShape(t *testing.T) {
 		t.Fatalf("filtered empty directory body = %q, want {\"models\":[]}", body)
 	}
 }
+
+// TestUserRouteRequiresATenantKey pins the user-side gate: a request with no
+// key is refused rather than silently attributed to one shared anonymous
+// tenant, and a configured key map both authenticates a provisioned key and
+// rejects an unknown one.
+func TestUserRouteRequiresATenantKey(t *testing.T) {
+	route := userRoutes[0]
+	const body = `{"model":"sim-mock-0.5b"}`
+
+	run := func(resolver tenantResolver, key string) int {
+		t.Helper()
+		h := newServeTestHub(t, []byte("data: {\"id\":\"chatcmpl-sim1\"}\n\n"))
+		handler := &userHandler{
+			h:     h,
+			cfg:   serveConfig{Host: "127.0.0.1:18080", Max: 1 << 20, Tenants: resolver},
+			route: route,
+		}
+		req := httptest.NewRequest(http.MethodPost, route.Path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if key != "" {
+			req.Header.Set(tenantKeyHeader, key)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if got := run(tenantResolver{}, ""); got != http.StatusUnauthorized {
+		t.Errorf("no key in open mode = %d, want 401", got)
+	}
+	if got := run(tenantResolver{}, "tenant-x"); got != http.StatusOK {
+		t.Errorf("open mode with a key = %d, want 200", got)
+	}
+	keys := tenantResolver{keys: map[string]string{"sk-good": "tenant-real"}}
+	if got := run(keys, "sk-wrong"); got != http.StatusUnauthorized {
+		t.Errorf("unknown key with a key map = %d, want 401", got)
+	}
+	if got := run(keys, "sk-good"); got != http.StatusOK {
+		t.Errorf("provisioned key = %d, want 200", got)
+	}
+}
+
+// TestTenantResolverMapsKeyToTenant pins that a provisioned key resolves to its
+// tenant rather than being used verbatim: otherwise a caller could name any
+// tenant by presenting any key.
+func TestTenantResolverMapsKeyToTenant(t *testing.T) {
+	r := tenantResolver{keys: map[string]string{"sk-good": "tenant-real"}}
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.Header.Set(tenantKeyHeader, "sk-good")
+	if tenant, ok := r.resolve(req); !ok || tenant != "tenant-real" {
+		t.Fatalf("resolve = %q,%t, want tenant-real,true", tenant, ok)
+	}
+}

@@ -180,6 +180,47 @@ func TestOpenSessionForModelPicksCheapestAndFailsOver(t *testing.T) {
 	}
 }
 
+func TestRunRealtimeRefusesAboveCeiling(t *testing.T) {
+	// A card whose book price (per-request + one MiB of volume = 400) fits the
+	// ceiling, but whose volume rate pushes the real bill past it once the
+	// provider streams 3 MiB (3 units => 900 + 100 = 1000). The candidate
+	// filter cannot catch this — only the settlement-time backstop can.
+	card := RateCard{PerRequestMicros: 100, PerMegabyteMicros: 300}
+
+	mib := bytes.Repeat([]byte("x"), 1<<20)
+	down := [][]byte{mib, mib, mib}
+	fake := &ScriptedTEE{
+		OpenReply: func(_ int, spec jobs.Spec) (SessionConn, error) {
+			return &scriptTunnel{frames: down, rec: sessionReceipt(spec.JobID, 0, down, 101)}, nil
+		},
+	}
+	store := NewReceiptStore(t.TempDir())
+	h, err := New(Config{
+		TEE:          fake,
+		Rates:        ratesTable(map[string]RateCard{testProvider: card}),
+		Store:        store,
+		Verify:       acceptAll,
+		MaxJobMicros: 500,
+	})
+	if err != nil {
+		t.Fatalf("build hub: %v", err)
+	}
+
+	outcome, err := h.RunRealtime(context.Background(), "tenant", "m", buildSession, &userLink{})
+	if !errors.Is(err, ErrJobPriceExceeded) {
+		t.Fatalf("err = %v, want ErrJobPriceExceeded", err)
+	}
+	if outcome.Charged != 1_000 {
+		t.Errorf("charged = %d, want the priced 1000 (3 MiB + fee)", outcome.Charged)
+	}
+	if !outcome.Stored {
+		t.Error("session receipt must be stored even when the ceiling refuses payment")
+	}
+	if snap := h.Ledger().Snapshot(); snap.Settled != 0 || snap.Revenue != 0 {
+		t.Errorf("ledger settled/revenue = %d/%d, want 0/0", snap.Settled, snap.Revenue)
+	}
+}
+
 func TestRunRealtimeSettlesASession(t *testing.T) {
 	down := [][]byte{[]byte("data"), []byte(": {}\n"), []byte("\n")}
 	var tunnel *scriptTunnel
@@ -410,5 +451,39 @@ func TestRunRealtimeTimeoutEndsASession(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("hub did not enforce the session timeout")
+	}
+}
+
+// TestRunRealtimeStopsUplinkAtTheBound pins the uplink byte bound: a user that
+// uploads more than the Hub will relay must have the excess dropped, not
+// forwarded into the provider's tunnel. The TEE applies no session bound of its
+// own (it is a transparent relay), so this is the Hub's only protection against
+// an unbounded upload.
+func TestRunRealtimeStopsUplinkAtTheBound(t *testing.T) {
+	down := [][]byte{[]byte("ok")}
+	var tunnel *scriptTunnel
+	fake := &ScriptedTEE{
+		OpenReply: func(_ int, spec jobs.Spec) (SessionConn, error) {
+			tunnel = &scriptTunnel{frames: down, rec: sessionReceipt(spec.JobID, 0, down, 101)}
+			return tunnel, nil
+		},
+	}
+	h := mustHub(t, Config{
+		TEE:               fake,
+		Rates:             ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 100}}),
+		SessionMaxUpBytes: 4,
+	})
+	link := &userLink{}
+	link.addUp("far more than four bytes")
+
+	outcome, err := h.RunRealtime(context.Background(), "tenant", "m", buildSession, link)
+	if err != nil {
+		t.Fatalf("run realtime: %v", err)
+	}
+	if outcome.UplinkBytes != 0 {
+		t.Fatalf("uplink counted = %d, want 0 (the over-bound chunk must not be relayed)", outcome.UplinkBytes)
+	}
+	if tunnel.Uplink() != 0 {
+		t.Fatalf("uplink relayed = %d, want 0", tunnel.Uplink())
 	}
 }

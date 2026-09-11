@@ -23,10 +23,45 @@ import (
 // serveConfig is the routing the resident service hands to the scheduler: the
 // upstream it asks the TEE to reach, per provider.
 type serveConfig struct {
-	Addr  string // where the Hub listens for its users
-	Host  string // the AI service host:port (must be in every provider policy)
-	Query string // extra upstream query (fault injection, for the harness)
-	Max   uint64 // MaxResponseBytes cap passed to the TEE
+	Addr    string // where the Hub listens for its users
+	Host    string // the AI service host:port (must be in every provider policy)
+	Query   string // extra upstream query (fault injection, for the harness)
+	Max     uint64 // MaxResponseBytes cap passed to the TEE
+	Tenants tenantResolver
+}
+
+// tenantKeyHeader is the header a user presents to identify itself. It is the
+// Hub's user-facing counterpart to the agent gate's key header: a bearer
+// credential, held to the same rule (a mismatch is refused, never defaulted).
+const tenantKeyHeader = "X-TokenHive-Key"
+
+// tenantResolver maps a presented user key to the tenant it belongs to, which
+// is what quota and attribution key on.
+//
+// With a key map configured, only a provisioned key admits a request and the
+// tenant is the mapped name — the caller cannot choose who it is. Without one
+// the Hub runs open: the presented key is the tenant, which is the deliberate
+// dev stance (there is no provisioned identity to check against), but the key
+// is still required. Silently defaulting an absent key to one shared name would
+// make every headerless caller a single tenant — one shared quota bucket and
+// one indistinguishable attribution — which is worse than refusing them.
+type tenantResolver struct {
+	// keys maps a user API key to the tenant it authenticates as. Empty means
+	// open mode.
+	keys map[string]string
+}
+
+// resolve returns the tenant a request belongs to, and whether it may proceed.
+func (r tenantResolver) resolve(req *http.Request) (string, bool) {
+	key := req.Header.Get(tenantKeyHeader)
+	if key == "" {
+		return "", false
+	}
+	if len(r.keys) == 0 {
+		return key, true
+	}
+	tenant, ok := r.keys[key]
+	return tenant, ok
 }
 
 // userRoute describes one user-facing endpoint the Hub relays. The Hub is a
@@ -102,7 +137,19 @@ func runServe(h *hub.Hub, cfg serveConfig) {
 		cfg.Addr, routePaths(), sessionPath, modelsPath)
 	log.Printf("hub reverse-tunnel endpoints: agent gate %s, tee relay %s, credential key %s",
 		agentGatePath, teeRelayPath, credentialKeyPath)
-	log.Fatal(http.ListenAndServe(cfg.Addr, mux))
+	srv := &http.Server{
+		Addr:    cfg.Addr,
+		Handler: mux,
+		// ReadHeaderTimeout is the slowloris defence: a client that stalls in
+		// the request line or headers is dropped instead of pinning a
+		// connection indefinitely. ReadTimeout and WriteTimeout stay zero on
+		// purpose — neither a large request body nor an SSE response has a
+		// bounded size or duration here, and a write deadline would cut live
+		// streams mid-body.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }
 
 func routePaths() []string {
@@ -136,11 +183,15 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Tenant resolution is the v1 placeholder: the user API key is not yet a
-	// real auth system, so the caller identifies itself with a header.
-	tenant := r.Header.Get("X-TokenHive-Key")
-	if tenant == "" {
-		tenant = "tenant-api"
+	// Tenant resolution: the caller identifies itself with a key, which either
+	// resolves through the Hub's key map to its tenant or (in open mode) is the
+	// tenant. A request with no key, or a key the map does not hold, is refused
+	// before anything is dispatched.
+	tenant, ok := c.cfg.Tenants.resolve(r)
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "missing or invalid api key")
+		log.Printf("api model=%q path=%s err=unauthorized", req.Model, c.route.Path)
+		return
 	}
 
 	flusher, _ := w.(http.Flusher)
@@ -359,9 +410,9 @@ func (c *sessionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tenant := r.Header.Get("X-TokenHive-Key")
-	if tenant == "" {
-		tenant = "tenant-api"
+	tenant, ok := c.cfg.Tenants.resolve(r)
+	if !ok {
+		return
 	}
 
 	outcome, err := c.h.RunRealtime(r.Context(), tenant, req.Model, c.buildSession, &sessionLink{conn: conn, first: first})

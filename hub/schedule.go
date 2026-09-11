@@ -29,7 +29,7 @@ var ErrNoProvidersOnline = errors.New("no provider is online")
 // down — a temporary condition, not a nonexistent model. Otherwise the model
 // is simply not served by anything the Hub knows.
 func (h *Hub) supplyError(model string) error {
-	if len(h.agentSecret) > 0 && len(h.agents.onlineProviders()) == 0 {
+	if h.agentsEnabled() && len(h.agents.onlineProviders()) == 0 {
 		return fmt.Errorf("%w: model %q", ErrNoProvidersOnline, model)
 	}
 	return fmt.Errorf("%w: model %q", ErrNoProviderForModel, model)
@@ -59,18 +59,22 @@ func (h *Hub) supplyError(model string) error {
 // no online agent's list at all, the request is refused with
 // ErrNoProviderForModel rather than fired at every provider hoping one answers.
 //
-// The effective book price is per-request plus any per-model surcharge, taken
-// from the agent's own card when it declared one and the platform default
-// otherwise. Volume pricing is deliberately left out of the choice — the Hub
-// cannot know how large a response will be before it runs the job, so an order
-// that depended on it would be non-deterministic. Per-request and model
-// surcharge are both known before dispatch, which is what a decision needs.
+// The effective book price is per-request plus any per-model surcharge plus a
+// floor of one mebibyte of the volume rate, taken from the agent's own card
+// when it declared one and the platform default otherwise. Volume pricing is
+// deliberately left out of the *forecast* — the Hub cannot know how large a
+// response will be before it runs the job, so an order that depended on the
+// final size would be non-deterministic. The floor is not a forecast: billing
+// rounds volume up to whole mebibytes, so the smallest non-empty exchange
+// already bills one unit of the volume rate. Folding that floor in is what
+// keeps a seller from hiding its cost behind a zero per-request price (see
+// bookPrice).
 //
 // An unlisted model pays no premium under a rate card, so every candidate is
 // still priced. The card's numbers, not the Hub's opinion, decide the order.
 func (h *Hub) providersForModel(model string) []string {
 	var providers []string
-	if len(h.agentSecret) == 0 {
+	if !h.agentsEnabled() {
 		// No agent gate on this Hub: the market table is the supply.
 		providers = make([]string, 0, len(h.rates))
 		for provider := range h.rates {
@@ -87,27 +91,52 @@ func (h *Hub) providersForModel(model string) []string {
 			}
 		}
 	}
-	sort.SliceStable(providers, func(i, j int) bool {
-		pi, ok := h.bookPrice(providers[i], model)
+	// Price every candidate once, dropping any whose floor book price already
+	// exceeds the Hub's per-job ceiling: no job within the ceiling can be
+	// settled against it, so dispatching to it would only buy a refusal at
+	// settlement.
+	priced := make(map[string]uint64, len(providers))
+	kept := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		price, ok := h.bookPrice(provider, model)
 		if !ok {
-			pi = ^uint64(0)
+			// No card at all: unpriceable, so it sorts last and is only ever
+			// reached after every priced candidate (Execute then refuses it as
+			// an unknown provider).
+			price = ^uint64(0)
+		} else if h.maxJob > 0 && price > h.maxJob {
+			continue
 		}
-		pj, ok := h.bookPrice(providers[j], model)
-		if !ok {
-			pj = ^uint64(0)
-		}
+		priced[provider] = price
+		kept = append(kept, provider)
+	}
+	sort.SliceStable(kept, func(i, j int) bool {
+		pi, pj := priced[kept[i]], priced[kept[j]]
 		if pi != pj {
 			return pi < pj
 		}
-		return providers[i] < providers[j]
+		return kept[i] < kept[j]
 	})
-	return providers
+	return kept
 }
 
-// bookPrice returns a provider's per-request book price for a model: the
-// per-request rate plus any model surcharge, taken from the agent's own card
-// when it declared one and the platform default otherwise. ok is false when
-// the provider has no card at all.
+// bookPrice returns a provider's per-job book price for a model: the
+// per-request rate, plus any model surcharge, plus one mebibyte of the volume
+// rate. ok is false when the provider has no card at all.
+//
+// The volume floor is deliberate and load-bearing. A scheduler keyed on the
+// per-request rate alone can be gamed: a seller advertises a zero (or trivial)
+// per-request price, hides an enormous per-megabyte rate behind it, wins every
+// auction on the headline number, and only then does the buyer discover the
+// bill. Billing rounds volume up to whole mebibytes, so the smallest non-empty
+// exchange already bills one unit of the volume rate; folding exactly that
+// floor into the book price puts the volume rate back into the number the
+// scheduler orders by and the number the buyer is shown. A card that charges a
+// lot per megabyte then looks expensive where the choice is made. It is a
+// floor, not a forecast — the charge itself still comes from Price over the
+// bytes actually delivered — so it can only ever make a provider look *more*
+// expensive than a real tiny job would be, never less. Understating a price is
+// the vulnerability; overstating it is merely conservative.
 //
 // It is the single price source for both the scheduler's candidate order and
 // the buyer-facing directory, so the price a buyer sees is the price the
@@ -118,7 +147,10 @@ func (h *Hub) bookPrice(provider, model string) (uint64, bool) {
 		return 0, false
 	}
 	book, ok := addChecked(card.PerRequestMicros, card.Premium(model))
-	return book, ok
+	if !ok {
+		return 0, false
+	}
+	return addChecked(book, card.PerMegabyteMicros)
 }
 
 // ModelQuote is one row of the buyer-facing model directory: a model an online
@@ -129,8 +161,11 @@ type ModelQuote struct {
 	Model string `json:"model"`
 	// Provider is the cheapest candidate currently serving the model.
 	Provider string `json:"provider"`
-	// PriceMicros is that provider's per-request book price for the model
-	// (per-request plus any model surcharge), in micro-units.
+	// PriceMicros is that provider's book price for the model: the per-request
+	// rate, plus any model surcharge, plus one mebibyte of the volume rate. The
+	// volume term is the minimum a non-empty exchange bills, so the number is
+	// never smaller than what the cheapest possible job would cost — see
+	// bookPrice.
 	PriceMicros uint64 `json:"price_micros"`
 }
 
@@ -150,7 +185,7 @@ func (h *Hub) ModelDirectory() []ModelQuote {
 // a prefix or fragment ("deepseek" matches both "deepseek-pro" and
 // "deepseek-flash"). An empty query returns the whole directory.
 func (h *Hub) SearchModels(query string) []ModelQuote {
-	if len(h.agentSecret) == 0 {
+	if !h.agentsEnabled() {
 		return nil
 	}
 	seen := make(map[string]struct{})
@@ -266,6 +301,13 @@ func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []
 				// This provider's start or bytes already reached the user. There
 				// is no honest way to continue with another provider: return the
 				// attempt's outcome as final.
+				return last, err
+			}
+			if errors.Is(err, ErrJobPriceExceeded) {
+				// The Hub's own per-job ceiling refused the price. Candidates
+				// are tried cheapest floor-first and the ceiling is a property
+				// of the Hub, not of a provider, so a more expensive candidate
+				// cannot help — the refusal is final.
 				return last, err
 			}
 			continue
