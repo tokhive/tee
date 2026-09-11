@@ -29,7 +29,7 @@ import (
 
 func main() {
 	gate := flag.String("hub", "ws://127.0.0.1:18085/v1/agent", "Hub AgentGate WebSocket URL the agent dials to come online")
-	key := flag.String("key", "", "shared key to present at dial-in (must match the Hub's AgentSecret)")
+	key := flag.String("key", "", "this provider's key to present at dial-in (must match its entry in the Hub's -agent-keys)")
 	providerName := flag.String("provider", "", "provider this agent egresses for")
 	name := flag.String("name", "", "optional human display label for this agent")
 	price := flag.Int64("price", 0, "per-request price in micro-units; 0 accepts the Hub's platform default for this provider")

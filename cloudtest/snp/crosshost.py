@@ -8,6 +8,8 @@ loader from EC2 user-data, so this script encodes it as KEY=VAL lines:
     TOKENHIVE_SIM_DIR=/tmp/tee        writable state dir (loader mounts /tmp 0777)
     TEE_ADDR=0.0.0.0:18090            mTLS request plane the Hub dials
     TEE_RELAY=ws://<host-ip>:18085/v1/relay    reverse tunnel back to the Hub
+    TEE_RELAY_KEY=<relay-key>          Hub TeeRelay authentication (shared with
+                                       crosshost.sh's -relay-key)
     TEE_PLATFORM=sevsnp               real attestation (fail-fast off SNP)
     TEE_MTLS=1                         RA-TLS + demand a Hub client cert
     TEE_MTLS_CLIENT_CA=/run/bundle/mtls/hub-ca.pem
@@ -30,6 +32,7 @@ agent + mockprovider) inside that one instance through the supervisor bundle
 
 import base64
 import json
+import os
 import subprocess
 import sys
 import time
@@ -54,6 +57,11 @@ HOSTS_FILE = CLOUDTEST / "crosshost.json"
 KEY_FILE = CLOUDTEST / "ssh-key.pem"
 
 CROSS_PORTS = [18085, 18090, 18091]
+
+# The Hub's TeeRelay now requires the TEE to present a key, and the Hub refuses
+# to serve without it. crosshost.sh starts the Hub with this same default, so a
+# run with no TOKENHIVE_RELAY_KEY still lines up end to end.
+DEFAULT_RELAY_KEY = "xhost-relay-key"
 
 
 def ensure_local_key() -> None:
@@ -224,7 +232,12 @@ def main() -> None:
     # one VPC/subnet/SG, and AWS group-pair SG rules only match in-VPC traffic —
     # a public-ip dial from a group member is not matched and gets dropped.
     host_priv = host.get("private_ip", "")
-    relay = f"TEE_RELAY=ws://{host_priv}:18085/v1/relay\n" if not single else ""
+    # The relay key authenticates the TEE's dial-in to the Hub. In cross-host
+    # mode it rides in as TEE_RELAY_KEY (the tee binary reads that env); in
+    # single mode the supervisor reads TOKENHIVE_RELAY_KEY and hands it to both
+    # its Hub and its tee child. Either way it matches crosshost.sh's Hub.
+    relay_key = os.environ.get("TOKENHIVE_RELAY_KEY") or DEFAULT_RELAY_KEY
+    relay = f"TEE_RELAY=ws://{host_priv}:18085/v1/relay\nTEE_RELAY_KEY={relay_key}\n" if not single else ""
     userdata = (
         "TOKENHIVE_SIM_DIR=/tmp/tee\n"
         "TEE_ADDR=0.0.0.0:18090\n"
@@ -239,6 +252,7 @@ def main() -> None:
         f"TEE_INIT_TOKEN={token}\n"
     )
     if single:
+        userdata += f"TOKENHIVE_RELAY_KEY={relay_key}\n"
         userdata += "TOKENHIVE_SUPERVISE=1\n"
         print("==> single-instance mode: whole loop inside the confidential tee")
     if tee.get("instance_id") and host_state(ec2, tee["instance_id"]) != "terminated":

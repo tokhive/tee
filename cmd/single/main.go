@@ -29,11 +29,16 @@ import (
 const bundleDir = "/run/bundle"
 
 var (
-	simDir        string
-	initToken     string
-	agentKey      string
-	teeCert       string
-	teeSvcFD3     *os.File // the app copy's attestation broker socket, re-passed to the tee server
+	simDir    string
+	initToken string
+	agentKey  string
+	// relayKey authenticates the tee's dial-in to the Hub's TeeRelay. The Hub
+	// now refuses to serve without one, so the loopback topology needs it just
+	// as the cross-host one does; both sides read the same value from this
+	// process, so it never leaves the instance.
+	relayKey  string
+	teeCert   string
+	teeSvcFD3 *os.File // the app copy's attestation broker socket, re-passed to the tee server
 )
 
 func main() {
@@ -48,6 +53,7 @@ func main() {
 	simDir = env("TOKENHIVE_SIM_DIR", "/tmp/tee")
 	initToken = env("TEE_INIT_TOKEN", "")
 	agentKey = env("TOKENHIVE_AGENT_KEY", "xhost-single-key")
+	relayKey = env("TOKENHIVE_RELAY_KEY", "xhost-relay-key")
 	teeCert = filepath.Join(simDir, "tee-cert.pem")
 	if err := os.MkdirAll(simDir, 0o755); err != nil {
 		logf("mkdir simdir: %v", err)
@@ -148,6 +154,7 @@ func teeCmd() *exec.Cmd {
 	c := cmd("svc/tee",
 		"-addr", "127.0.0.1:18090",
 		"-relay", "ws://127.0.0.1:18085/v1/relay",
+		"-relay-key", relayKey,
 		"-platform", "sevsnp",
 		"-mtls",
 		"-mtls-client-ca", filepath.Join(bundleDir, "mtls", "hub-ca.pem"),
@@ -176,7 +183,11 @@ func mpCmd(port int) *exec.Cmd {
 func hubCmd(appHash string) *exec.Cmd {
 	c := cmd("svc/hub",
 		"-serve", "0.0.0.0:18085",
-		"-agent-key", agentKey,
+		// Per-provider keys: the agent below dials in as openai-sim, so the gate
+		// binds that provider to this key. The Hub refuses to start without both
+		// this map and the relay key, matching the cross-host deployment's gate.
+		"-agent-keys", "openai-sim=" + agentKey,
+		"-relay-key", relayKey,
 		"-host", "127.0.0.1:18080",
 		"-model", "sim-mock-0.5b",
 		"-tee", "https://127.0.0.1:18090",

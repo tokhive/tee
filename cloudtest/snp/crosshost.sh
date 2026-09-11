@@ -197,7 +197,13 @@ cmd_deploy() {
   # tee-cert.pem (pinned) lives in CERTS_DIR after fetch
   remote_push "$hip" "${CERTS_DIR}/tee-cert.pem" "mtls/tee-cert.pem" >/dev/null
 
-  local agent_key; agent_key="${TOKENHIVE_AGENT_KEY:-xhost-agent-key}"
+  # Per-provider agent key and the tee relay key. The Hub now requires both
+  # (-agent-keys and -relay-key); the tee must present the same relay key, which
+  # crosshost.py injects into the confidential instance's user-data, so both
+  # scripts read the same env with the same default.
+  local agent_key relay_key
+  agent_key="${TOKENHIVE_AGENT_KEY:-xhost-agent-key}"
+  relay_key="${TOKENHIVE_RELAY_KEY:-xhost-relay-key}"
   remote_exec "$hip" bash -s <<EOF
 set -e
 cd ~
@@ -208,7 +214,8 @@ chmod 755 ./tee/hub ./tee/agent ./tee/mockprovider
 ./tee/mockprovider -addr 127.0.0.1:18080 -tls -stats-addr 127.0.0.1:18081 \
   -ca mtls/mp-ca.pem -cert mtls/mp-cert.pem -key mtls/mp-key.pem >tee/mp.log 2>&1 &
 sleep 1
-./tee/hub -serve 0.0.0.0:18085 -agent-key '${agent_key}' -host 127.0.0.1:18080 \
+./tee/hub -serve 0.0.0.0:18085 -agent-keys 'openai-sim=${agent_key}' -relay-key '${relay_key}' \
+  -host 127.0.0.1:18080 \
   -model sim-mock-0.5b -tee https://${tip}:18090 -mtls-ca mtls/tee-cert.pem \
   -mtls-cert mtls/hub-cert.pem -mtls-key mtls/hub-key.pem \
   -allowed-platforms aws-sev-snp -expected-app 'snp-app:${app_hash}' >tee/hub.log 2>&1 &
