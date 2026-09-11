@@ -14,6 +14,7 @@
 //	-drop N       withhold the receipt carrying ProviderSeq N from the store
 //	              (simulates a Hub that hides a record from the provider)
 //	-quota N      cap a tenant at N requests per -window (0 = unlimited)
+//	-tenant-budgets T=M  cap tenant T's cumulative spend at M micro-units
 package main
 
 import (
@@ -23,6 +24,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -63,6 +65,7 @@ func main() {
 	agentKeys := flag.String("agent-keys", "", "per-provider agent keys as provider=key[,provider=key]; replaces -agent-key and binds each tunnel to one provider")
 	relayKey := flag.String("relay-key", "", "key the TEE must present to dial /v1/relay (empty = unauthenticated relay)")
 	tenantKeys := flag.String("tenant-keys", "", "user api keys as key=tenant[,key=tenant]; the key is verified and resolves to its tenant (empty = open mode: the presented key is the tenant)")
+	tenantBudgets := flag.String("tenant-budgets", "", "per-tenant cumulative spend ceilings in micro-units, as tenant=micros[,tenant=micros]; a tenant absent from the map is uncapped")
 	credential := flag.String("credential", "", "provider access token to register with the TEE before the request loop (simulation one-shot mode: the CLI holds the seller's token and delivers it sealed to -tee, as a dialing agent would through a resident Hub)")
 	audit := flag.Bool("audit", false, "audit the receipt store for gaps and verify signatures")
 	flag.Parse()
@@ -98,6 +101,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("tenant-keys: %v", err)
 	}
+	budgets, err := parseBudgets(*tenantBudgets)
+	if err != nil {
+		log.Fatalf("tenant-budgets: %v", err)
+	}
 
 	teeClient := &hub.HTTPTEE{
 		URL:        *teeURL + "/v1/execute",
@@ -110,6 +117,7 @@ func main() {
 		Store:               store,
 		Verify:              verifyReceipt,
 		Quota:               quota,
+		Budgets:             budgets,
 		Commission:          uint64(*commission),
 		MaxJobMicros:        *maxJob,
 		Withhold:            withholdSeq(*drop),
@@ -317,6 +325,28 @@ func parsePairs(spec string) ([][2]string, error) {
 		out = append(out, [2]string{k, v})
 	}
 	return out, nil
+}
+
+// parseBudgets turns the -tenant-budgets flag into the per-tenant cumulative
+// ceilings. A malformed entry is a startup failure rather than a silently
+// dropped cap: a typo must not leave a tenant unbudgeted by accident.
+func parseBudgets(spec string) (map[string]uint64, error) {
+	pairs, err := parsePairs(spec)
+	if err != nil {
+		return nil, err
+	}
+	if pairs == nil {
+		return nil, nil
+	}
+	budgets := make(map[string]uint64, len(pairs))
+	for _, p := range pairs {
+		micros, err := strconv.ParseUint(p[1], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("tenant %q: ceiling %q is not a number", p[0], p[1])
+		}
+		budgets[p[0]] = micros
+	}
+	return budgets, nil
 }
 
 // parseAgentKeys turns the -agent-keys flag into the per-provider key map. A

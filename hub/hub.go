@@ -39,6 +39,11 @@ var (
 	ErrUnknownProvider = errors.New("no rate published for provider")
 	// ErrQuotaExceeded means the tenant was refused before dispatch.
 	ErrQuotaExceeded = errors.New("tenant quota exhausted")
+	// ErrBudgetExceeded means the tenant's cumulative spend has reached the
+	// ceiling the Hub holds for it. Like the quota it is refused before
+	// dispatch, so the provider is never asked to spend a credential on a job
+	// the buyer cannot pay for.
+	ErrBudgetExceeded = errors.New("tenant budget exhausted")
 	// ErrStreamMismatch means the receipt attests bytes other than the ones
 	// the Hub forwarded. Either the Hub is lying about what it delivered or
 	// the TEE is not describing the same exchange; neither is settleable.
@@ -88,6 +93,16 @@ type Config struct {
 	// a deliberate opt-out rather than a default: a control that exists to
 	// stop a credential being drained should not be on unless asked for.
 	Quota *Quota
+
+	// Budgets caps each tenant's cumulative spend, keyed by tenant, in the same
+	// micro-units as a rate card. A tenant absent from the map has no ceiling —
+	// the deliberate opt-out described on Quota — and is never tracked, so the
+	// table is bounded by what is provisioned here.
+	//
+	// It is the cumulative counterpart of MaxJobMicros: that bounds one job,
+	// this bounds the sum. Without it a seller whose card prices just under the
+	// per-job ceiling can bill a buyer indefinitely.
+	Budgets map[string]uint64
 
 	// Commission sets the fixed fraction the Hub takes over every settled
 	// charge, in basis points. 100 is 1%, 1000 is 10%, zero means the Hub takes
@@ -192,6 +207,7 @@ type Hub struct {
 	verify     func(proof.SignedReceipt) error
 	ledger     *Ledger
 	quota      *Quota
+	budget     *Budget
 	commission CommissionRate
 	maxJob     uint64
 	clock      func() time.Time
@@ -230,6 +246,14 @@ func New(cfg Config) (*Hub, error) {
 	if ledger == nil {
 		ledger = NewLedger()
 	}
+	var budget *Budget
+	if len(cfg.Budgets) > 0 {
+		built, err := NewBudget(cfg.Budgets)
+		if err != nil {
+			return nil, err
+		}
+		budget = built
+	}
 	clock := cfg.Clock
 	if clock == nil {
 		clock = time.Now
@@ -245,6 +269,7 @@ func New(cfg Config) (*Hub, error) {
 		verify:     cfg.Verify,
 		ledger:     ledger,
 		quota:      cfg.Quota,
+		budget:     budget,
 		commission: CommissionRate{BasisPoints: cfg.Commission},
 		maxJob:     cfg.MaxJobMicros,
 		clock:      clock,
@@ -327,6 +352,33 @@ func (h *Hub) card(provider string) (RateCard, bool) {
 	return card, ok
 }
 
+// admitTenant applies the Hub's pre-dispatch controls for a tenant: the
+// cumulative budget, then the request quota.
+//
+// The budget is checked first on purpose. It is the money gate, and a tenant
+// whose budget is exhausted must not also burn a rate-limit slot — the request
+// is going to be refused either way, and consuming the slot would push the
+// tenant's next (affordable) request out of its window. Both checks run before
+// dispatch, so a refused request never consumes a ProviderSeq.
+func (h *Hub) admitTenant(tenant string) error {
+	if h.budget != nil && !h.budget.Allow(tenant) {
+		return fmt.Errorf("%w: tenant %q", ErrBudgetExceeded, tenant)
+	}
+	if h.quota != nil && !h.quota.Allow(tenant, h.clock()) {
+		return fmt.Errorf("%w: tenant %q", ErrQuotaExceeded, tenant)
+	}
+	return nil
+}
+
+// chargeTenant records a settled bill against the tenant's budget. It is called
+// exactly where the ledger settles, never where the Hub merely priced a job it
+// refused to bill: a refusal moves no money and must not consume budget.
+func (h *Hub) chargeTenant(tenant string, micros uint64) {
+	if h.budget != nil {
+		h.budget.Record(tenant, micros)
+	}
+}
+
 // attemptContext derives the per-attempt context from the caller's, bounding
 // one dispatch with the Hub's attempt window. A zero window leaves the
 // caller's context untouched and returns a no-op cancel, so callers can always
@@ -359,7 +411,8 @@ type Outcome struct {
 	Stored bool
 }
 
-// Execute runs one job: check quota, dispatch, verify, price, settle, store.
+// Execute runs one job: check budget and quota, dispatch, verify, price,
+// settle, store.
 //
 // model is the Hub's own pricing key, deliberately out-of-band from the job
 // spec: the TEE only establishes and holds the provider connection, so it
@@ -367,10 +420,10 @@ type Outcome struct {
 // request to perform". The Hub selects and prices providers from the model it
 // resolved locally.
 //
-// The ordering is load-bearing in three places. Quota is checked before
-// dispatch, so a refused request never consumes a ProviderSeq — if it did,
-// ordinary rate limiting would punch holes in the provider's sequence and be
-// indistinguishable from the Hub hiding executions. The receipt is verified
+// The ordering is load-bearing in three places. Budget and quota are checked
+// before dispatch, so a refused request never consumes a ProviderSeq — if it
+// did, ordinary rate limiting would punch holes in the provider's sequence and
+// be indistinguishable from the Hub hiding executions. The receipt is verified
 // before anything is charged, so a forged receipt cannot move money. And the
 // receipt is stored before the ledger settles, so money books only when the
 // provider's audit record is durable: a store failure means the exchange did
@@ -379,8 +432,8 @@ type Outcome struct {
 // a double charge).
 func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec, body []byte,
 	onChunk func([]byte) error, onStart ...func(tee.Response)) (Outcome, error) {
-	if h.quota != nil && !h.quota.Allow(tenant, h.clock()) {
-		return Outcome{}, fmt.Errorf("%w: tenant %q", ErrQuotaExceeded, tenant)
+	if err := h.admitTenant(tenant); err != nil {
+		return Outcome{}, err
 	}
 
 	card, ok := h.card(spec.Provider)
@@ -477,6 +530,7 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 		// it failed.
 		h.ledger.NoteSettled(spec.Provider, charged)
 		h.ledger.NoteCommission(spec.Provider, commission)
+		h.chargeTenant(tenant, buyer)
 		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer}, nil
 	}
 	if err := h.store.Put(spec.Provider, res.Receipt); err != nil {
@@ -491,6 +545,7 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 	// once Put has succeeded the settlement is guaranteed to be recorded.
 	h.ledger.NoteSettled(spec.Provider, charged)
 	h.ledger.NoteCommission(spec.Provider, commission)
+	h.chargeTenant(tenant, buyer)
 	return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer, Stored: true}, nil
 }
 

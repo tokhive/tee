@@ -75,8 +75,8 @@ type SessionOutcome struct {
 func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
 
-	if h.quota != nil && !h.quota.Allow(tenant, h.clock()) {
-		return nil, jobs.Spec{}, fmt.Errorf("%w: tenant %q", ErrQuotaExceeded, tenant)
+	if err := h.admitTenant(tenant); err != nil {
+		return nil, jobs.Spec{}, err
 	}
 
 	providers := h.providersForModel(model)
@@ -230,6 +230,7 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 	outcome.Stored = true
 	h.ledger.NoteSettled(spec.Provider, charged)
 	h.ledger.NoteCommission(spec.Provider, commission)
+	h.chargeTenant(tenant, buyer)
 	return outcome, relErr
 }
 
