@@ -414,7 +414,6 @@ func TestCeilingDropsCandidatesItCannotAfford(t *testing.T) {
 	}
 }
 
-
 // --- commission -----------------------------------------------------------
 
 func TestCommissionAddsToBuyerAndLedger(t *testing.T) {
