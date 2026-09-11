@@ -91,7 +91,7 @@ func (r *Relay) dialOnce(ctx context.Context, provider, host string) (net.Conn, 
 	if err != nil {
 		return nil, tun, err
 	}
-	return streamConn{Stream: s}, tun, nil
+	return &streamConn{Stream: s}, tun, nil
 }
 
 // tunnel returns the live tunnel, dialing the Hub relay endpoint if none exists.
@@ -121,8 +121,13 @@ func (r *Relay) tunnel(ctx context.Context) (*tunnel.Multiplexer, error) {
 // dead tunnel down and rebuilt a fresh one; resetting the stale reference then
 // would tear that healthy tunnel down too. Fine-grained: a controller that never
 // dialed the failed tunnel leaves it untouched, so a single stream failure never
-// kills unrelated streams.
+// kills unrelated streams. A nil tunnel means the relay had none to begin with
+// (the failure was the very first dial): there is nothing to reset, and the
+// caller retries against a fresh tunnel.
 func (r *Relay) resetIf(tun *tunnel.Multiplexer) {
+	if tun == nil {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.tun == tun {
@@ -144,17 +149,67 @@ func (r *Relay) Close() error {
 }
 
 // streamConn adapts a tunnel.Stream to net.Conn so the TEE can run an HTTP/TLS
-// session over a relayed stream as if it were a TCP socket. Deadline and address
-// bookkeeping have no meaning on a multiplexed tunnel, so they are inert.
+// session over a relayed stream as if it were a TCP socket. Address bookkeeping
+// has no meaning on a multiplexed tunnel, so it is inert; deadlines do matter,
+// because the HTTP exchange (and the TLS handshake before it) depends on a
+// deadline to abort I/O that is parked against a silent upstream.
+//
+// A multiplexed stream cannot abort a read parked inside the tunnel except by
+// ending the stream: nothing else wakes the reader's wait. Every consumer of
+// this connection treats a fired deadline as fatal to the connection anyway
+// (the exchange fails and the connection is dropped, never pooled), so the
+// deadline is enforced by closing the stream. Only this stream is ended — its
+// siblings on the same tunnel are untouched.
 type streamConn struct {
 	*tunnel.Stream
+
+	// mu guards the deadline timer and the generation counter that tells a
+	// stale timer (superseded by a newer SetDeadline or cleared to zero) not to
+	// close a connection that was healthy enough to be reused.
+	mu    sync.Mutex
+	gen   uint64
+	timer *time.Timer
 }
 
-func (c streamConn) LocalAddr() net.Addr              { return relayAddr }
-func (c streamConn) RemoteAddr() net.Addr             { return relayAddr }
-func (c streamConn) SetDeadline(time.Time) error      { return nil }
-func (c streamConn) SetReadDeadline(time.Time) error  { return nil }
-func (c streamConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *streamConn) LocalAddr() net.Addr                { return relayAddr }
+func (c *streamConn) RemoteAddr() net.Addr               { return relayAddr }
+func (c *streamConn) SetDeadline(t time.Time) error      { return c.setDeadline(t) }
+func (c *streamConn) SetReadDeadline(t time.Time) error  { return c.setDeadline(t) }
+func (c *streamConn) SetWriteDeadline(t time.Time) error { return c.setDeadline(t) }
+
+// setDeadline arms (or clears) the stream-ending timer. Read and write
+// deadlines are treated alike: the connection is a single pipe and its users
+// treat either expiry as fatal. A deadline in the past fires immediately,
+// which is how a context cancellation poke unblocks a parked read.
+func (c *streamConn) setDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Every deadline change advances the generation — including a clear to
+	// zero. A fired timer's callback may already be running and parked on mu
+	// when Stop() returns false (it cannot stop a callback that has started);
+	// without the bump here it would then observe the same generation and
+	// close a stream whose deadline was cleared — a relayed exchange that
+	// finished at the deadline boundary would hand back a connection that is
+	// dead on arrival. The bump turns that stale callback into a no-op.
+	c.gen++
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	if t.IsZero() {
+		return nil
+	}
+	gen := c.gen
+	c.timer = time.AfterFunc(time.Until(t), func() {
+		c.mu.Lock()
+		current := c.gen == gen
+		c.mu.Unlock()
+		if current {
+			_ = c.Stream.Close()
+		}
+	})
+	return nil
+}
 
 // relayAddr is the fixed address relayed streams report; deadlines and address
 // bookkeeping have no meaning on a multiplexed tunnel.

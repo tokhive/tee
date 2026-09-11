@@ -18,7 +18,13 @@ var (
 	// so there is nothing to settle against.
 	ErrNoReceiptForSession = errors.New("session ended without a receipt")
 	// ErrSessionStreamMismatch means the session receipt attests bytes other
-	// than the ones the Hub actually relayed.
+	// than the ones the Hub actually relayed. For the downlink that is exact
+	// (the stream hash binds the receipt to the relayed bytes); for the uplink
+	// it fires only when the receipt attests MORE uplink than the Hub counted
+	// — the direction that indicates a receipt the Hub could not have relayed.
+	// A receipt attesting fewer uplink bytes than the Hub counted is the
+	// teardown tail, not a lie, and does not forfeit the session (see
+	// relaySession).
 	ErrSessionStreamMismatch = errors.New("session receipt attests different bytes than the Hub relayed")
 	// ErrSessionLimitExceeded means the Hub stopped relaying because a
 	// configured bound (downlink bytes) was hit. Unlike a request — whose cap is
@@ -75,7 +81,7 @@ func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 
 	providers := h.providersForModel(model)
 	if len(providers) == 0 {
-		return nil, jobs.Spec{}, fmt.Errorf("%w: model %q", ErrNoProviderForModel, model)
+		return nil, jobs.Spec{}, h.supplyError(model)
 	}
 	for _, provider := range providers {
 		spec, berr := build(provider)
@@ -157,7 +163,17 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 	if rec.StatusCode != 101 {
 		return SessionOutcome{}, fmt.Errorf("session receipt status %d, want 101", rec.StatusCode)
 	}
-	if rec.RequestBytes != up || rec.ResponseBytes != down || !streamHashEq(rec.StreamHash, downHash[:]) {
+	// The uplink comparison is deliberately one-sided. The Hub counts uplink
+	// when it reads it from the user, and a session can end while the user's
+	// final bytes are still in flight: the Hub may count bytes the closed
+	// tunnel never delivered, so its count is an upper bound on what the TEE
+	// can attest. An exact equality would forfeit a settled session over that
+	// teardown tail. Only a receipt attesting MORE uplink than the Hub ever
+	// relayed is a contradiction worth refusing — and the receipt stays the
+	// billing record either way, so the buyer pays exactly what the TEE
+	// attested was delivered. The downlink side is exact (the stream hash
+	// already binds it), so its count stays an equality.
+	if rec.RequestBytes > up || rec.ResponseBytes != down || !streamHashEq(rec.StreamHash, downHash[:]) {
 		return SessionOutcome{}, ErrSessionStreamMismatch
 	}
 
@@ -165,7 +181,11 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 	if !ok {
 		return SessionOutcome{}, fmt.Errorf("%w: %q", ErrUnknownProvider, spec.Provider)
 	}
-	charged, err := Price(card, model, rec)
+	// Sessions are never capped by the TEE, so the receipt's ResponseBytes is
+	// exactly what was relayed — and the mismatch check above bound it to the
+	// Hub's own relayed count. Pass the relayed count so pricing needs no cap
+	// special case.
+	charged, err := Price(card, model, down, rec)
 	if err != nil {
 		return SessionOutcome{}, fmt.Errorf("price session: %w", err)
 	}
@@ -177,9 +197,6 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 	if !ok {
 		return SessionOutcome{}, fmt.Errorf("%w: charged %d plus commission %d", ErrPriceOverflow, charged, commission)
 	}
-	h.ledger.NoteSettled(spec.Provider, charged)
-	h.ledger.NoteCommission(spec.Provider, commission)
-
 	outcome := SessionOutcome{
 		Receipt:       receipt,
 		Provider:      spec.Provider,
@@ -190,9 +207,16 @@ func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 		Buyer:         buyer,
 	}
 	if err := h.store.Put(spec.Provider, receipt); err != nil {
+		// Same rule as the request path: the receipt is not durable, so the
+		// ledger records no money. The caller still gets the priced outcome
+		// to report what would have been charged.
 		return outcome, fmt.Errorf("store session receipt: %w", err)
 	}
+	// Store first, then settle: the ledger is in-memory and cannot fail, so
+	// once Put has succeeded the settlement is guaranteed to be recorded.
 	outcome.Stored = true
+	h.ledger.NoteSettled(spec.Provider, charged)
+	h.ledger.NoteCommission(spec.Provider, commission)
 	return outcome, relErr
 }
 
@@ -271,9 +295,14 @@ func relaySession(ctx context.Context, tunnel SessionConn, link RealtimeLink, jo
 		_ = tunnel.Close()
 	}()
 
-	// drainUplink lets an in-flight uplink finish so the count is stable before
-	// it is compared against the receipt's RequestBytes — otherwise a receipt
-	// that is perfectly honest races the last write. It returns immediately if
+	// drainUplink lets an in-flight uplink finish so the count is as settled as
+	// it can be before it is compared against the receipt's RequestBytes —
+	// otherwise a receipt that is perfectly honest races the last write. The
+	// count can still grow after the drain (a user socket the goroutine is
+	// blocked reading), which is why the comparison in RunRealtime accepts a
+	// receipt attesting no more than the Hub counted: the Hub's count is an
+	// upper bound on what the TEE could have received, and a receipt inside
+	// that bound is the attested billing record. It returns immediately if
 	// the goroutine is already gone, and is bounded because with a live user
 	// socket the goroutine can only be unwound by the caller closing the
 	// connection, which happens after we return.

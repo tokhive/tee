@@ -110,28 +110,43 @@ func TestPrice(t *testing.T) {
 	}
 
 	cases := []struct {
-		name  string
-		model string
-		edit  func(*proof.Receipt)
-		want  uint64
+		name         string
+		model        string
+		relayedBytes uint64
+		edit         func(*proof.Receipt)
+		want         uint64
 	}{
 		{name: "complete 200 with empty body", want: 1_000_000},
 		{name: "model premium applies", model: "large", want: 1_250_000},
 		{name: "unlisted model pays no premium", model: "small", want: 1_000_000},
 		{
-			name: "one byte bills a whole mebibyte",
-			edit: func(r *proof.Receipt) { r.ResponseBytes = 1 },
+			name:         "one byte bills a whole mebibyte",
+			relayedBytes: 1,
+			edit:         func(r *proof.Receipt) { r.ResponseBytes = 1 },
+			want:         1_500_000,
+		},
+		{
+			name:         "exactly one mebibyte bills one unit",
+			relayedBytes: mebibyte,
+			edit:         func(r *proof.Receipt) { r.ResponseBytes = mebibyte },
+			want:         1_500_000,
+		},
+		{
+			name:         "one byte over rounds up to two units",
+			relayedBytes: mebibyte + 1,
+			edit:         func(r *proof.Receipt) { r.ResponseBytes = mebibyte + 1 },
+			want:         2_000_000,
+		},
+		{
+			name: "request bytes bill input volume",
+			edit: func(r *proof.Receipt) { r.RequestBytes = mebibyte },
 			want: 1_500_000,
 		},
 		{
-			name: "exactly one mebibyte bills one unit",
-			edit: func(r *proof.Receipt) { r.ResponseBytes = mebibyte },
-			want: 1_500_000,
-		},
-		{
-			name: "one byte over rounds up to two units",
-			edit: func(r *proof.Receipt) { r.ResponseBytes = mebibyte + 1 },
-			want: 2_000_000,
+			name:         "input and output share one rounded unit",
+			relayedBytes: 1,
+			edit:         func(r *proof.Receipt) { r.RequestBytes = mebibyte - 1; r.ResponseBytes = 1 },
+			want:         1_500_000,
 		},
 		{
 			// The provider declined. The exchange happened and is attested,
@@ -151,8 +166,63 @@ func TestPrice(t *testing.T) {
 			want: 0,
 		},
 		{
-			name: "truncated stream earns nothing",
+			// Headers arrived, then the connection died before a byte was
+			// relayed: from the buyer's side this is indistinguishable from a
+			// failed exchange, so it earns nothing.
+			name: "truncated with no delivered bytes earns nothing",
 			edit: func(r *proof.Receipt) { r.Completion = proof.CompletionTruncated },
+			want: 0,
+		},
+		{
+			// The seller paid the upstream for the prompt and the partial
+			// response, so the buyer pays for the delivered volume — but no
+			// per-request fee: margin is earned only on completed work.
+			name:         "truncated earns volume for delivered bytes",
+			relayedBytes: 1,
+			edit: func(r *proof.Receipt) {
+				r.Completion = proof.CompletionTruncated
+				r.ResponseBytes = 1
+			},
+			want: 500_000,
+		},
+		{
+			name:         "truncated bills request volume too",
+			relayedBytes: mebibyte,
+			edit: func(r *proof.Receipt) {
+				r.Completion = proof.CompletionTruncated
+				r.RequestBytes = mebibyte
+				r.ResponseBytes = mebibyte
+			},
+			want: 1_000_000,
+		},
+		{
+			// The TEE counts everything the provider sent, including the bytes
+			// past the cap that were never relayed; those are not billable.
+			// The cap is not the delivered length: chunks are rejected whole,
+			// so the relayed prefix can end anywhere below it.
+			name:         "over-cap bytes are never billed",
+			relayedBytes: mebibyte,
+			edit:         func(r *proof.Receipt) { r.ResponseBytes = 2 * mebibyte },
+			want:         1_500_000,
+		},
+		{
+			name:         "truncated over-cap bills only what was relayed",
+			relayedBytes: mebibyte,
+			edit: func(r *proof.Receipt) {
+				r.Completion = proof.CompletionTruncated
+				r.ResponseBytes = 2 * mebibyte
+			},
+			want: 500_000,
+		},
+		{
+			// The TEE rejects the whole chunk that crosses the cap, so a
+			// response whose first read is already too large delivers nothing —
+			// a 4 KiB cap with a 32 KiB first chunk bills zero, not 4 KiB.
+			name: "truncated with attested bytes but nothing relayed bills nothing",
+			edit: func(r *proof.Receipt) {
+				r.Completion = proof.CompletionTruncated
+				r.ResponseBytes = 32 * 1024
+			},
 			want: 0,
 		},
 		{
@@ -172,7 +242,7 @@ func TestPrice(t *testing.T) {
 			if tc.edit != nil {
 				tc.edit(&r)
 			}
-			got, err := Price(card, tc.model, r)
+			got, err := Price(card, tc.model, tc.relayedBytes, r)
 			if err != nil {
 				t.Fatalf("Price: %v", err)
 			}
@@ -194,7 +264,7 @@ func TestPriceOverflowIsRejectedNotWrapped(t *testing.T) {
 		ResponseBytes: 1 << 60,
 	}
 
-	got, err := Price(card, "", receipt)
+	got, err := Price(card, "", 1<<60, receipt)
 	if !errors.Is(err, ErrPriceOverflow) {
 		t.Fatalf("Price error = %v, want ErrPriceOverflow", err)
 	}
@@ -510,6 +580,34 @@ func TestWithholdingAReceiptLeavesADetectableGap(t *testing.T) {
 	// now prove happened without being shown the receipts.
 	if snap := h.Ledger().Snapshot(); snap.Settled != 3 {
 		t.Errorf("settled = %d, want 3", snap.Settled)
+	}
+}
+
+// failStore is a Store whose Put always fails, for tests that need the Hub to
+// lose the receipt right after the exchange verified.
+type failStore struct{}
+
+func (failStore) Put(string, proof.SignedReceipt) error { return errors.New("disk full") }
+
+// TestStoreFailureBooksNothing locks the settle-then-store hazard from the
+// money side: when the receipt cannot be stored, the ledger must record
+// nothing. The receipt is the provider's audit record; a charge without it is
+// money the provider can never reconcile. Before this ordering existed, a
+// disk-full store charged the buyer, lost the receipt, and left the provider
+// with a seq gap and no record of why.
+func TestStoreFailureBooksNothing(t *testing.T) {
+	stream := chunks("hello")
+	fake := &ScriptedTEE{Reply: func(call int, _ jobs.Spec) (Result, error) {
+		return Result{Chunks: stream, Receipt: makeReceipt(uint64(call), stream, nil)}, nil
+	}}
+	h := mustHub(t, Config{TEE: fake, Store: failStore{}})
+
+	if _, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil); err == nil {
+		t.Fatal("expected the store failure to surface")
+	}
+	snap := h.Ledger().Snapshot()
+	if snap.Settled != 0 || snap.Revenue != 0 {
+		t.Errorf("settled = %d, revenue = %d, want 0: nothing books without a stored receipt", snap.Settled, snap.Revenue)
 	}
 }
 

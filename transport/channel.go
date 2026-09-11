@@ -95,7 +95,11 @@ type ChannelManager struct {
 
 	mu    sync.Mutex
 	pools map[string]*channelPool
-	relay *Relay
+	// closed is set by Close and makes the manager terminal: late Do and
+	// OpenSession calls fail fast, and poolFor stops minting pools whose conns
+	// the (already stopped) idle sweeper would never reap. Guarded by mu.
+	closed bool
+	relay  *Relay
 
 	// stopReaper halts the background idle sweeper, which reaps idle
 	// connections whose window has elapsed even when no new request ever comes
@@ -200,11 +204,12 @@ func (m *ChannelManager) reapIdle() {
 }
 
 // Do performs one provider exchange on a pooled connection, relaying body
-// chunks as they arrive. It implements tee.Transport.
+// chunks as it arrives. It implements tee.Transport.
 //
 // Acquisition: an idle connection for (Provider, Host) is reused if one exists;
 // otherwise a new one is dialed through the provider's agent (if any) and
-// TLS-handshaken inside the TEE.
+// TLS-handshaken inside the TEE. When the per-host cap is reached the call
+// waits for a returned connection or a freed slot, honouring ctx cancellation.
 //
 // Outcome: a request that wrote zero bytes to a dead pooled connection is
 // re-dialed once — nothing reached the agent or provider, so nothing was spent
@@ -214,6 +219,9 @@ func (m *ChannelManager) reapIdle() {
 // An error from onChunk aborts the read; the connection is discarded because
 // half a transcript must never be reused as if it were whole.
 func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(chunk []byte) error, onStart ...tee.StartFunc) (tee.Response, error) {
+	if m.isClosed() {
+		return tee.Response{}, net.ErrClosed
+	}
 	if req.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, req.Timeout)
@@ -242,13 +250,15 @@ func (m *ChannelManager) Do(ctx context.Context, req tee.Request, onChunk func(c
 	return status, err
 }
 
-// Close stops the idle sweeper, closes every pooled connection, and stops
-// future pooling. In-flight exchanges are unaffected.
+// Close makes the manager terminal: it stops the idle sweeper, closes every
+// pooled connection, refuses new Do and OpenSession calls with net.ErrClosed,
+// and releases the relay tunnel. Exchanges already in flight are unaffected.
 func (m *ChannelManager) Close() error {
 	if m.stopReaper != nil {
 		m.stopReaperDo.Do(func() { close(m.stopReaper) })
 	}
 	m.mu.Lock()
+	m.closed = true
 	pools := make([]*channelPool, 0, len(m.pools))
 	for _, p := range m.pools {
 		pools = append(pools, p)
@@ -275,6 +285,9 @@ func (m *ChannelManager) Close() error {
 // pure transport — bytes in, bytes out — with every frame of the upstream
 // protocol left to the caller.
 func (m *ChannelManager) OpenSession(ctx context.Context, req tee.Request) (tee.SessionConn, error) {
+	if m.isClosed() {
+		return nil, net.ErrClosed
+	}
 	if req.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, req.Timeout)
@@ -335,25 +348,58 @@ func (m *ChannelManager) upgrade(ctx context.Context, conn net.Conn, br *bufio.R
 	return nil
 }
 
-func (m *ChannelManager) poolFor(req tee.Request) *channelPool {
+// isClosed reports whether the manager has been shut down. It is the fast
+// entry check for Do and OpenSession; poolFor re-checks under the same lock it
+// shares with Close, so the two cannot race into a fresh pool after shutdown.
+func (m *ChannelManager) isClosed() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closed
+}
+
+// poolFor returns the pool for a (provider, host) pair, creating it on first
+// use. ok is false once the manager is closed: pool creation and the closed
+// check share one lock with Close, so a Close cannot race a late caller into a
+// fresh pool whose conns the (stopped) sweeper would never reap.
+func (m *ChannelManager) poolFor(req tee.Request) (*channelPool, bool) {
 	key := pairKey{provider: req.Provider, host: req.Host}.String()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return nil, false
+	}
 	if p, ok := m.pools[key]; ok {
-		return p
+		return p, true
 	}
 	p := newChannelPool(m, key)
 	m.pools[key] = p
-	return p
+	return p, true
 }
 
-// acquire returns an open channel, reusing an idle one or dialing a new one.
+// acquire returns an open channel for one exchange: it reuses an idle pooled
+// connection when one exists, otherwise it dials a new one under a reserved
+// slot. When the per-host cap is reached it waits — honouring ctx cancellation
+// and pool shutdown — for a returned connection or a freed slot, so a caller
+// queued behind the cap takes over the connection a busy request leaves behind
+// instead of parking forever.
 func (m *ChannelManager) acquire(ctx context.Context, req tee.Request) (*channel, error) {
-	pool := m.poolFor(req)
-	if ch := pool.getIdle(); ch != nil {
+	pool, ok := m.poolFor(req)
+	if !ok {
+		return nil, net.ErrClosed
+	}
+	ch, dial, err := pool.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !dial {
 		return ch, nil
 	}
-	return m.dial(ctx, pool, req)
+	conn, err := m.dialTCP(ctx, req)
+	if err != nil {
+		pool.releaseSlot()
+		return nil, err
+	}
+	return &channel{conn: conn, br: bufio.NewReader(conn), pool: pool}, nil
 }
 
 // release returns an open channel to its pool, or closes it when keep is false.
@@ -363,21 +409,6 @@ func (m *ChannelManager) release(ch *channel, keep bool) {
 		return
 	}
 	ch.pool.reuse(ch)
-}
-
-func (m *ChannelManager) dial(ctx context.Context, pool *channelPool, req tee.Request) (*channel, error) {
-	// Reserve a slot for a brand-new connection before dialing. This bounds the
-	// resident set per (provider, host); a caller blocked here waits until an
-	// existing connection dies and frees its slot.
-	if err := pool.reserveSlot(); err != nil {
-		return nil, err
-	}
-	conn, err := m.dialTCP(ctx, req)
-	if err != nil {
-		pool.releaseSlot()
-		return nil, err
-	}
-	return &channel{conn: conn, br: bufio.NewReader(conn), pool: pool}, nil
 }
 
 // dialTCP opens the raw pipe to req.Host and wraps it in TLS when the scheme

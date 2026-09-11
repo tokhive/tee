@@ -291,11 +291,16 @@ type Outcome struct {
 // request to perform". The Hub selects and prices providers from the model it
 // resolved locally.
 //
-// The ordering is load-bearing in two places. Quota is checked before
+// The ordering is load-bearing in three places. Quota is checked before
 // dispatch, so a refused request never consumes a ProviderSeq — if it did,
 // ordinary rate limiting would punch holes in the provider's sequence and be
-// indistinguishable from the Hub hiding executions. And the receipt is
-// verified before anything is charged, so a forged receipt cannot move money.
+// indistinguishable from the Hub hiding executions. The receipt is verified
+// before anything is charged, so a forged receipt cannot move money. And the
+// receipt is stored before the ledger settles, so money books only when the
+// provider's audit record is durable: a store failure means the exchange did
+// not happen as far as the books are concerned, and the buyer is not charged
+// for an answer whose receipt was never kept (a retry is a fresh purchase, not
+// a double charge).
 func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec, body []byte,
 	onChunk func([]byte) error, onStart ...func(tee.Response)) (Outcome, error) {
 	if h.quota != nil && !h.quota.Allow(tenant, h.clock()) {
@@ -344,7 +349,17 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, ErrResponseStartMismatch
 	}
 
-	charged, err := Price(card, model, res.Receipt.Receipt)
+	// Price by the bytes actually relayed, not by the job's cap: the TEE
+	// rejects whole chunks that cross MaxResponseBytes, so the delivered
+	// prefix can end far below the cap (or at zero), while the receipt's
+	// ResponseBytes counts everything the provider sent. The chunk stream was
+	// just verified against the receipt's hash, so its length is attested by
+	// construction.
+	var relayed uint64
+	for _, chunk := range res.Chunks {
+		relayed += uint64(len(chunk))
+	}
+	charged, err := Price(card, model, relayed, res.Receipt.Receipt)
 	if err != nil {
 		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, err
 	}
@@ -357,17 +372,29 @@ func (h *Hub) Execute(ctx context.Context, tenant, model string, spec jobs.Spec,
 		return Outcome{Chunks: res.Chunks, StatusCode: res.Status}, fmt.Errorf("%w: charged %d plus commission %d",
 			ErrPriceOverflow, charged, commission)
 	}
-	h.ledger.NoteSettled(spec.Provider, charged)
-	h.ledger.NoteCommission(spec.Provider, commission)
-
 	seq := res.Receipt.Receipt.ProviderSeq
 	if h.withhold != nil && h.withhold(seq) {
+		// A withheld receipt is the test seam for a Hub that hides an
+		// execution: it is settled (the ledger records the charge) but never
+		// stored, so the provider can prove the gap. The normal path stores
+		// before settling; this path skips the store deliberately, not because
+		// it failed.
+		h.ledger.NoteSettled(spec.Provider, charged)
+		h.ledger.NoteCommission(spec.Provider, commission)
 		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer}, nil
 	}
 	if err := h.store.Put(spec.Provider, res.Receipt); err != nil {
+		// The receipt is not durable, so nothing is charged: the ledger is the
+		// record of money that moved, and money must not move without the
+		// provider's audit record behind it. The caller still receives the
+		// priced outcome so it can report what would have been charged.
 		return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer},
 			fmt.Errorf("store receipt: %w", err)
 	}
+	// Store first, then settle: the ledger is in-memory and cannot fail, so
+	// once Put has succeeded the settlement is guaranteed to be recorded.
+	h.ledger.NoteSettled(spec.Provider, charged)
+	h.ledger.NoteCommission(spec.Provider, commission)
 	return Outcome{Receipt: res.Receipt, Chunks: res.Chunks, StatusCode: res.Status, Charged: charged, Commission: commission, Buyer: buyer, Stored: true}, nil
 }
 

@@ -297,6 +297,66 @@ func TestRunRealtimeByteCapTruncatesNotSettled(t *testing.T) {
 	}
 }
 
+func TestRunRealtimeSettlesUplinkTeardownTail(t *testing.T) {
+	// The Hub relays one uplink frame, but the receipt attests none of it —
+	// exactly the session-end race where the user's final bytes are counted by
+	// the Hub while the tunnel is already closed, so they never reach the TEE.
+	// The receipt is still the attested record of what was delivered, so the
+	// session must settle rather than forfeit.
+	down := [][]byte{[]byte("data: {}\n\n")}
+	up := uint64(len("config:first\n"))
+	fake := &ScriptedTEE{
+		OpenReply: func(_ int, spec jobs.Spec) (SessionConn, error) {
+			return &scriptTunnel{frames: down, rec: sessionReceipt(spec.JobID, 0, down, 101)}, nil
+		},
+	}
+	h := mustHub(t, Config{
+		TEE:   fake,
+		Rates: ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 100}}),
+	})
+	link := &userLink{}
+	link.addUp("config:first\n")
+
+	outcome, err := h.RunRealtime(context.Background(), "tenant", "m", buildSession, link)
+	if err != nil {
+		t.Fatalf("run realtime: %v (a teardown tail must not forfeit the session)", err)
+	}
+	if !outcome.Stored {
+		t.Fatalf("receipt not stored for a settled session")
+	}
+	// Billing follows the receipt: the buyer pays for what the TEE attested
+	// was delivered (the flat fee here), not for the tail the Hub counted.
+	if outcome.Charged != 100 {
+		t.Errorf("charged = %d, want 100", outcome.Charged)
+	}
+	// The Hub still reports what it observed, even when it exceeds the receipt.
+	if outcome.UplinkBytes != up {
+		t.Errorf("uplink reported = %d, want %d (the Hub's own count)", outcome.UplinkBytes, up)
+	}
+}
+
+func TestRunRealtimeRejectsInflatedUplink(t *testing.T) {
+	// The fraud direction: the receipt attests more uplink than the Hub ever
+	// relayed. The Hub counts every byte before writing it, so a receipt
+	// beyond that bound describes an exchange that did not happen — refusing
+	// it is what protects the buyer from an inflated bill.
+	down := [][]byte{[]byte("data: {}\n\n")}
+	fake := &ScriptedTEE{
+		OpenReply: func(_ int, spec jobs.Spec) (SessionConn, error) {
+			return &scriptTunnel{frames: down, rec: sessionReceipt(spec.JobID, 999, down, 101)}, nil
+		},
+	}
+	h := mustHub(t, Config{
+		TEE:   fake,
+		Rates: ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 100}}),
+	})
+
+	_, err := h.RunRealtime(context.Background(), "tenant", "m", buildSession, &userLink{})
+	if !errors.Is(err, ErrSessionStreamMismatch) {
+		t.Fatalf("err = %v, want ErrSessionStreamMismatch", err)
+	}
+}
+
 func TestRunRealtimeQuotaBlocksBeforeOpen(t *testing.T) {
 	fake := &ScriptedTEE{
 		OpenReply: func(_ int, spec jobs.Spec) (SessionConn, error) {

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -582,5 +583,261 @@ func TestChannelSchemeValidation(t *testing.T) {
 	}
 	if _, err := NewChannelManager(ChannelConfig{Scheme: "http"}); !errors.Is(err, ErrPlaintextNotAllowed) {
 		t.Fatalf("error = %v, want ErrPlaintextNotAllowed", err)
+	}
+}
+
+// --- pool saturation -------------------------------------------------------
+
+// gateServer serves requests that park in the handler until the caller opens
+// the gate. Each request signals its arrival on entered first.
+func gateServer(t *testing.T, entered chan struct{}, gate chan struct{}) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-gate
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	})
+	return newConnCountingServer(t, handler)
+}
+
+func cappedManager(t *testing.T, maxConns int) *ChannelManager {
+	t.Helper()
+	cm, err := NewChannelManager(ChannelConfig{
+		Scheme:          "http",
+		AllowPlaintext:  true,
+		MaxConnsPerHost: maxConns,
+	})
+	if err != nil {
+		t.Fatalf("NewChannelManager: %v", err)
+	}
+	t.Cleanup(func() { _ = cm.Close() })
+	return cm
+}
+
+func poolDo(cm *ChannelManager, host string) func(ctx context.Context) error {
+	return func(ctx context.Context) error {
+		_, err := cm.Do(ctx, testReq(tee.Request{Method: "POST", Host: host, Path: "/v1/x", Body: []byte("{}")}),
+			func([]byte) error { return nil })
+		return err
+	}
+}
+
+// TestChannelWaiterTakesOverTheReturnedConnection is the TEE-01 regression:
+// with the per-host cap at one, a request queued behind a busy connection must
+// take over that connection the moment it is returned to the pool. The old code
+// never woke waiters when a healthy connection came back idle, so the queued
+// request parked forever (or until the idle reaper ran).
+func TestChannelWaiterTakesOverTheReturnedConnection(t *testing.T) {
+	entered := make(chan struct{}, 8)
+	gate := make(chan struct{})
+	var gateOnce sync.Once
+	open := func() { gateOnce.Do(func() { close(gate) }) }
+	defer open()
+
+	srv, conns := gateServer(t, entered, gate)
+	cm := cappedManager(t, 1)
+	do := poolDo(cm, hostOf(srv))
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- do(context.Background()) }()
+	<-entered // request 1 holds the only slot, parked in the handler
+
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- do(context.Background()) }()
+	// Let request 2 queue on the saturated pool before the gate opens.
+	time.Sleep(200 * time.Millisecond)
+
+	open() // request 1 finishes; request 2 must take over the SAME connection
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second request (should reuse the returned connection): %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued request never released after the connection was returned")
+	}
+	if n := conns.Load(); n != 1 {
+		t.Errorf("server saw %d connections, want 1 (the waiter must reuse, not re-dial)", n)
+	}
+}
+
+// TestChannelWaiterHonoursCancellation is the TEE-01 regression for the wait
+// itself: a request queued behind the cap must give up when its context ends,
+// not pin its execution resources on a pool that may never free a slot.
+func TestChannelWaiterHonoursCancellation(t *testing.T) {
+	entered := make(chan struct{}, 8)
+	gate := make(chan struct{})
+	var gateOnce sync.Once
+	open := func() { gateOnce.Do(func() { close(gate) }) }
+	defer open()
+
+	srv, _ := gateServer(t, entered, gate)
+	cm := cappedManager(t, 1)
+	do := poolDo(cm, hostOf(srv))
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- do(context.Background()) }()
+	<-entered // request 1 occupies the only slot
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := do(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("queued request returned %v, want DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("waiting request took %v to honour its deadline", elapsed)
+	}
+
+	open()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+}
+
+// TestChannelPoolServesABurstWithinTheCap is the saturation smoke test: many
+// concurrent requests against a cap of two must all succeed without deadlock,
+// never exceed the cap on the wire, and reuse the same two connections for the
+// whole burst.
+func TestChannelPoolServesABurstWithinTheCap(t *testing.T) {
+	var mu sync.Mutex
+	var live, peak, total int
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch state {
+		case http.StateNew:
+			total++
+			live++
+			if live > peak {
+				peak = live
+			}
+		case http.StateClosed, http.StateHijacked:
+			live--
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+
+	cm, err := NewChannelManager(ChannelConfig{
+		Scheme:          "http",
+		AllowPlaintext:  true,
+		MaxConnsPerHost: 2,
+	})
+	if err != nil {
+		t.Fatalf("NewChannelManager: %v", err)
+	}
+	defer func() { _ = cm.Close() }()
+
+	do := poolDo(cm, hostOf(srv))
+	const requests = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, requests)
+	for i := 0; i < requests; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- do(context.Background())
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+	}
+	mu.Lock()
+	gotPeak, gotTotal := peak, total
+	mu.Unlock()
+	if gotPeak > 2 {
+		t.Errorf("server saw %d simultaneous connections, want at most 2 (the cap)", gotPeak)
+	}
+	if gotTotal != 2 {
+		t.Errorf("server saw %d connections in total, want exactly 2 (the resident set reused across the burst)", gotTotal)
+	}
+}
+
+// TestChannelRequestsRefusedAfterClose pins Close as terminal: once the manager
+// is closed, new work must fail fast with net.ErrClosed instead of silently
+// minting fresh pools and connections that no sweeper would ever reap.
+func TestChannelRequestsRefusedAfterClose(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	cm, err := NewChannelManager(ChannelConfig{
+		Scheme:          "http",
+		AllowPlaintext:  true,
+		MaxConnsPerHost: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewChannelManager: %v", err)
+	}
+	defer func() { _ = cm.Close() }()
+
+	do := poolDo(cm, hostOf(srv))
+	if err := do(context.Background()); err != nil {
+		t.Fatalf("request before close: %v", err)
+	}
+	if err := cm.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := do(context.Background()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("request after close returned %v, want net.ErrClosed", err)
+	}
+	if _, err := cm.OpenSession(context.Background(), testReq(tee.Request{Method: "GET", Host: hostOf(srv), Path: "/v1/x"})); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("OpenSession after close returned %v, want net.ErrClosed", err)
+	}
+}
+
+// TestChannelWaiterReleasesWhenThePoolCloses covers the shutdown half of the
+// wait: a request queued behind the cap must return promptly when the manager
+// is closed, rather than sleeping on a pool that is gone.
+func TestChannelWaiterReleasesWhenThePoolCloses(t *testing.T) {
+	entered := make(chan struct{}, 8)
+	gate := make(chan struct{})
+	var gateOnce sync.Once
+	open := func() { gateOnce.Do(func() { close(gate) }) }
+	defer open()
+
+	srv, _ := gateServer(t, entered, gate)
+	cm := cappedManager(t, 1)
+	do := poolDo(cm, hostOf(srv))
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- do(context.Background()) }()
+	<-entered // request 1 occupies the only slot
+
+	waiterDone := make(chan error, 1)
+	go func() { waiterDone <- do(context.Background()) }()
+	time.Sleep(150 * time.Millisecond) // let the waiter queue behind the cap
+
+	if err := cm.Close(); err != nil {
+		t.Fatalf("close manager: %v", err)
+	}
+	select {
+	case err := <-waiterDone:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("queued request after pool close returned %v, want net.ErrClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued request never released by the pool shutdown")
+	}
+
+	open()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first request: %v", err)
 	}
 }

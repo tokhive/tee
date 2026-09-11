@@ -44,7 +44,7 @@ const (
 const (
 	headerLen  = 13
 	maxPayload = 1 << 20 // one stream write can span several frames, so no single frame needs more
-	maxBuf     = 8 << 20 // inbound buffering cap per stream; further data stalls the sender
+	maxBuf     = 8 << 20 // inbound buffering cap per stream; further data resets that stream
 )
 
 var (
@@ -406,19 +406,34 @@ func (s *Stream) Close() error {
 	return nil
 }
 
-// push queues inbound bytes, applying backpressure once the buffered backlog
-// passes maxBuf. It no-ops after the stream has ended.
+// push queues inbound bytes. It never blocks its caller, which is the single
+// read loop: a stream whose consumer is not draining is reset rather than
+// waiting, so one stuck stream cannot freeze every other stream — and then the
+// carrier itself, once TCP backpressure reaches the peer. The reset ends just
+// this stream: its reader drains what was buffered and then sees io.EOF, and
+// the peer is told with a close frame. No-op after the stream has ended.
 func (s *Stream) push(data []byte) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for len(s.buf) >= maxBuf && !s.eof {
-		s.cond.Wait()
-	}
 	if s.eof {
+		s.mu.Unlock()
+		return
+	}
+	if len(s.buf)+len(data) > maxBuf {
+		// The consumer is not draining. Unblock this stream's reader with EOF
+		// and tell the peer, both off the read loop. The close frame goes out
+		// on its own goroutine because writing it can itself block on a stalled
+		// carrier — and would then hold the shared write lock — which must not
+		// happen on the read loop. Exactly one such goroutine is minted per
+		// stream: the eof flag set below makes every later push return early.
+		s.eof = true
+		s.cond.Broadcast()
+		s.mu.Unlock()
+		go s.Close()
 		return
 	}
 	s.buf = append(s.buf, data...)
 	s.cond.Signal()
+	s.mu.Unlock()
 }
 
 // eofNow breaks the stream unconditionally and never reopens it.

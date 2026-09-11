@@ -240,3 +240,68 @@ func TestTunnelShutdownEndsStreams(t *testing.T) {
 		t.Fatal("stream read hung after tunnel shutdown")
 	}
 }
+
+// TestSlowStreamIsResetWithoutStallingOthers guards the multiplexer against one
+// stream's backpressure freezing the shared read loop. A stream whose consumer
+// never drains must be reset — its peer told, its reader ended — while a
+// sibling stream on the same tunnel keeps carrying bytes.
+//
+// The read path is driven inline, exactly as the read loop drives it, so the
+// ordering is deterministic: before the fix, deliver blocked forever once the
+// slow stream's buffer passed maxBuf, so the sibling's bytes never arrived and
+// this test timed out.
+func TestSlowStreamIsResetWithoutStallingOthers(t *testing.T) {
+	a, b := net.Pipe()
+	m := New(a, High)
+	defer func() { _ = m.Close(); _ = a.Close(); _ = b.Close() }()
+	// Drain the mux's outbound so a reset's close frame never parks on net.Pipe.
+	go func() { _, _ = io.Copy(io.Discard, b) }()
+
+	slowCh := make(chan *Stream, 1)
+	sibCh := make(chan *Stream, 1)
+	m.Serve(func(s *Stream, open []byte) {
+		if string(open) == "slow" {
+			slowCh <- s
+			return // no consumer: this stream is never read
+		}
+		sibCh <- s
+	})
+
+	m.acceptOpen(1, []byte("slow"))
+	m.acceptOpen(2, nil)
+	slow := <-slowCh
+	sib := <-sibCh
+
+	// Cross the per-stream buffer cap, then deliver to a sibling from the same
+	// (single) read path. If push blocked, this goroutine never finishes.
+	done := make(chan struct{})
+	go func() {
+		chunk := bytes.Repeat([]byte("x"), maxPayload)
+		for i := 0; i < maxBuf/maxPayload+2; i++ {
+			m.deliver(1, chunk)
+		}
+		m.deliver(2, []byte("pong"))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deliver blocked on a slow stream: the shared read loop would stall")
+	}
+
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(sib, buf); err != nil {
+		t.Fatalf("sibling read while a stream was stuck: %v", err)
+	}
+	if string(buf) != "pong" {
+		t.Fatalf("sibling read = %q, want %q", buf, "pong")
+	}
+
+	// The overrun stream was reset, not left half-open: draining it ends in EOF.
+	if n, err := io.Copy(io.Discard, slow); err != nil {
+		t.Fatalf("draining reset stream: %v", err)
+	} else if n == 0 {
+		t.Fatalf("reset stream buffered nothing; overflow path not exercised")
+	}
+}
