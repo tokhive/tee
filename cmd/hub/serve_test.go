@@ -432,6 +432,83 @@ func TestUserRouteRequiresATenantKey(t *testing.T) {
 	}
 }
 
+// TestProviderFieldPinsTheSource locks the request-side source selection: a
+// route body that names a provider is honored exactly — an unknown source is
+// refused (404) rather than silently routed to a substitute, and a serving
+// source passes through. This is what lets a buyer ask for a specific AI
+// source, not just the cheapest.
+func TestProviderFieldPinsTheSource(t *testing.T) {
+	h := newServeTestHub(t, []byte("data: {\"id\":\"chatcmpl-sim1\"}\n\n"))
+	route := userRoutes[0]
+	cfg := serveConfig{Host: "127.0.0.1:18080", Query: "", Max: 1 << 20}
+
+	// cheap-sim is on the fixture market table and serves sim-mock-0.5b: a
+	// pinned dispatch to it succeeds. nobody is not a server: the dispatch is
+	// refused before any provider answers, exactly like an unknown model.
+	run := func(body string) int {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, route.Path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(tenantKeyHeader, "tenant-test")
+		rec := httptest.NewRecorder()
+		handler := &userHandler{h: h, cfg: cfg, route: route}
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if got := run(`{"model":"sim-mock-0.5b","provider":"cheap-sim"}`); got != http.StatusOK {
+		t.Fatalf("pinned request to a serving provider = %d, want 200", got)
+	}
+	if got := run(`{"model":"sim-mock-0.5b","provider":"nobody"}`); got != http.StatusNotFound {
+		t.Fatalf("pinned request to an unknown provider = %d, want 404 (must not fall back)", got)
+	}
+	if got := run(`{"model":"sim-mock-0.5b","provider":"cheap-sim"}`); got != http.StatusOK {
+		t.Fatalf("pinned request again = %d, want 200", got)
+	}
+}
+
+// TestProviderFieldIsOptional pins that a route body without a provider still
+// works: the buyer who names only a model gets the cheapest server, exactly as
+// before this feature.
+func TestProviderFieldIsOptional(t *testing.T) {
+	body, _ := postBody(t, userRoutes[0], `{"model":"sim-mock-0.5b","messages":[{"role":"user","content":"hi"}]}`)
+	if !strings.Contains(body, "chatcmpl-sim1") {
+		t.Fatalf("provider-less request did not relay: %q", body)
+	}
+}
+
+// TestModelsEndpointProviderAndModelFilters pins that /v1/models honors the
+// expanded market view through the wire: ?provider= narrows to one source and
+// ?model= to one model family. The envelope is the same JSON shape; the row
+// semantics live in the hub package's MarketQuotes tests.
+func TestModelsEndpointProviderAndModelFilters(t *testing.T) {
+	h := newServeTestHub(t, []byte("x"))
+	handler := modelsHandler(h)
+
+	run := func(path string) string {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", path, rec.Code)
+		}
+		return strings.TrimSpace(rec.Body.String())
+	}
+
+	// With no provider argument and no agent gate, every filtered view is the
+	// empty list — same envelope, non-null.
+	for _, path := range []string{
+		modelsPath + "?provider=cheap-sim",
+		modelsPath + "?model=sim-mock",
+		modelsPath + "?provider=cheap-sim&model=sim-mock",
+	} {
+		if body := run(path); body != `{"models":[]}` {
+			t.Fatalf("%s = %q, want {\"models\":[]}", path, body)
+		}
+	}
+}
+
 // TestTenantResolverMapsKeyToTenant pins that a provisioned key resolves to its
 // tenant rather than being used verbatim: otherwise a caller could name any
 // tenant by presenting any key.

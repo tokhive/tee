@@ -180,23 +180,69 @@ func (h *Hub) ModelDirectory() []ModelQuote {
 	return h.SearchModels("")
 }
 
+// MarketQuotes returns the expanded buyer-facing market view: every model every
+// online agent declares, each with the price its provider charges. Unlike the
+// model-aggregated SearchModels directory, the same model served by two
+// providers appears as two rows — the source matters to a buyer who wants to
+// pick not just the cheapest but the *provider* of a model, or to survey what a
+// particular source offers.
+//
+// provider, when non-empty, narrows the view to one provider; model, when
+// non-empty, narrows it by a case-insensitive substring of the model ID. Both
+// may be set: one provider's quote for a matching model family. Rows are sorted
+// by provider then model, so the view is a pure function of supply.
+func (h *Hub) MarketQuotes(provider, model string) []ModelQuote {
+	if !h.agentsEnabled() {
+		return nil
+	}
+	model = strings.ToLower(model)
+	var quotes []ModelQuote
+	for _, p := range h.agents.onlineProviders() {
+		if provider != "" && p != provider {
+			continue
+		}
+		conn, ok := h.agents.conn(p)
+		if !ok {
+			continue
+		}
+		for _, m := range conn.models {
+			if m == "" || (model != "" && !strings.Contains(strings.ToLower(m), model)) {
+				continue
+			}
+			price, ok := h.bookPrice(p, m)
+			if !ok {
+				continue
+			}
+			quotes = append(quotes, ModelQuote{Model: m, Provider: p, PriceMicros: price})
+		}
+	}
+	sort.Slice(quotes, func(i, j int) bool {
+		if quotes[i].Provider != quotes[j].Provider {
+			return quotes[i].Provider < quotes[j].Provider
+		}
+		return quotes[i].Model < quotes[j].Model
+	})
+	return quotes
+}
+
 // SearchModels filters the model directory by name: a case-insensitive
 // substring match, so a buyer can search by an exact model ID ("gpt-4o") or by
 // a prefix or fragment ("deepseek" matches both "deepseek-pro" and
 // "deepseek-flash"). An empty query returns the whole directory.
+//
+// This is the model-aggregated view: each model appears once, at the lowest
+// price any source charges for it. A buyer who wants to see every source of a
+// model or every model of one source uses MarketQuotes instead.
 func (h *Hub) SearchModels(query string) []ModelQuote {
-	if !h.agentsEnabled() {
-		return nil
-	}
 	seen := make(map[string]struct{})
-	for _, provider := range h.agents.onlineProviders() {
-		conn, ok := h.agents.conn(provider)
+	for _, p := range h.agents.onlineProviders() {
+		conn, ok := h.agents.conn(p)
 		if !ok {
 			continue
 		}
-		for _, model := range conn.models {
-			if model != "" {
-				seen[model] = struct{}{}
+		for _, m := range conn.models {
+			if m != "" {
+				seen[m] = struct{}{}
 			}
 		}
 	}
@@ -257,6 +303,35 @@ func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []
 	if len(providers) == 0 {
 		return Outcome{}, h.supplyError(model)
 	}
+	return h.executeForProviders(ctx, tenant, model, providers, body, build, onChunk, onStart...)
+}
+
+// ExecuteForProvider runs a job for a model pinned to one named source, with no
+// fallback to another provider. It answers the buyer who asks for a specific
+// AI source by name — through a route's optional "provider" field — and must be
+// honored exactly: routing a pinned job to a different provider would silently
+// override the buyer's choice of source.
+//
+// The named provider must be a current server of the model; otherwise the job
+// is refused before dispatch (ErrNoProviderForModel), never fired elsewhere. A
+// provider that fails after committing is final, exactly as in ExecuteForModel:
+// splicing in a second provider's bytes would corrupt the reply and double-bill.
+func (h *Hub) ExecuteForProvider(ctx context.Context, tenant, model, provider string, body []byte,
+	build func(provider string) (jobs.Spec, error), onChunk func([]byte) error, onStart ...func(tee.Response)) (Outcome, error) {
+
+	if !h.providerServes(provider, model) {
+		return Outcome{}, fmt.Errorf("%w: model %q from provider %q", ErrNoProviderForModel, model, provider)
+	}
+	return h.executeForProviders(ctx, tenant, model, []string{provider}, body, build, onChunk, onStart...)
+}
+
+// executeForProviders is the shared workhorse behind ExecuteForModel and
+// ExecuteForProvider: run a job against an explicit, price-ordered candidate
+// list, falling back down it for a model-based dispatch (the list holds every
+// server, cheapest first. For a provider-pinned dispatch the list holds the one
+// named source, so the fallback loop is exactly "try it once".
+func (h *Hub) executeForProviders(ctx context.Context, tenant, model string, providers []string, body []byte,
+	build func(provider string) (jobs.Spec, error), onChunk func([]byte) error, onStart ...func(tee.Response)) (Outcome, error) {
 
 	var (
 		last    Outcome
@@ -333,4 +408,18 @@ func (h *Hub) ExecuteForModel(ctx context.Context, tenant, model string, body []
 		return Outcome{}, h.supplyError(model)
 	}
 	return last, err
+}
+
+// providerServes reports whether a named provider is a current server of a
+// model: with an agent gate, the provider must hold an online tunnel that
+// declares the model (or declares nothing, which serves anything); without one,
+// it must be listed on the market table. It is the pinned counterpart of the
+// candidate list providersForModel builds.
+func (h *Hub) providerServes(provider, model string) bool {
+	if !h.agentsEnabled() {
+		_, ok := h.rates[provider]
+		return ok
+	}
+	conn, ok := h.agents.conn(provider)
+	return ok && conn.serves(model)
 }

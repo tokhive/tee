@@ -212,7 +212,8 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Model string `json:"model"`
+		Model    string `json:"model"`
+		Provider string `json:"provider,omitempty"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil || req.Model == "" {
 		writeJSONError(w, http.StatusBadRequest, "model is required")
@@ -271,27 +272,33 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	isSuccess := func() bool { return status >= 200 && status < 300 }
 
 	var chunks int
-	outcome, err := c.h.ExecuteForModel(r.Context(), tenant, req.Model, body,
-		func(provider string) (jobs.Spec, error) {
-			return buildSpec(provider, c.cfg.Host, c.route.Path, c.cfg.Query, body, c.cfg.Max)
-		},
-		func(chunk []byte) error {
-			// The chunk is already the upstream's SSE bytes — mockprovider
-			// frames `data: {…}` and the data path relays raw body bytes, so
-			// re-wrapping here would emit `data: data: {…}` and break every
-			// OpenAI SDK. The Hub's only job is byte-pass-through.
-			commit(tee.Response{})
-			if _, werr := w.Write(chunk); werr != nil {
-				return werr
-			}
-			chunks++
-			if flusher != nil {
-				flusher.Flush()
-			}
-			return nil
-		},
-		commit)
-
+	onChunk := func(chunk []byte) error {
+		// The chunk is already the upstream's SSE bytes — mockprovider
+		// frames `data: {…}` and the data path relays raw body bytes, so
+		// re-wrapping here would emit `data: data: {…}` and break every
+		// OpenAI SDK. The Hub's only job is byte-pass-through.
+		commit(tee.Response{})
+		if _, werr := w.Write(chunk); werr != nil {
+			return werr
+		}
+		chunks++
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	}
+	var outcome hub.Outcome
+	if req.Provider != "" {
+		outcome, err = c.h.ExecuteForProvider(r.Context(), tenant, req.Model, req.Provider, body,
+			func(provider string) (jobs.Spec, error) {
+				return buildSpec(provider, c.cfg.Host, c.route.Path, c.cfg.Query, body, c.cfg.Max)
+			}, onChunk, commit)
+	} else {
+		outcome, err = c.h.ExecuteForModel(r.Context(), tenant, req.Model, body,
+			func(provider string) (jobs.Spec, error) {
+				return buildSpec(provider, c.cfg.Host, c.route.Path, c.cfg.Query, body, c.cfg.Max)
+			}, onChunk, commit)
+	}
 	if !started {
 		// Nothing was committed to the wire: either a dispatch failure, or
 		// every provider failed before its response began and the last attempt
@@ -351,13 +358,36 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // modelsHandler answers GET /v1/models: the buyer-facing market directory.
-// Each row is a model an online agent declared it can serve, priced at the
-// lowest current per-request book price. The optional ?q= query filters by a
-// case-insensitive substring of the model name, so a buyer can look up an
-// exact model or scan a family ("deepseek" returns every deepseek-* listing).
+//
+// The endpoint exposes two views. The default is the model-aggregated
+// directory: each model an online agent declared it can serve appears once, at
+// the lowest current per-request book price. The optional ?q= query filters
+// that view by a case-insensitive substring of the model name, so a buyer can
+// look up an exact model or scan a family ("deepseek" returns every
+// deepseek-* listing).
+//
+// Two declarations switch to the expanded market view, where the same model
+// served by two sources appears as two rows:
+//
+//	?provider=NAME      every model one source offers
+//	?model=NAME         every source offering a model (substring)
+//
+// A buyer who names no source gets the cheapest server by default; one who
+// names a source — either to survey it or to pin a request to it — gets that
+// source's rows.
 func modelsHandler(h *hub.Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		quotes := h.SearchModels(r.URL.Query().Get("q"))
+		query := r.URL.Query()
+		provider, model := query.Get("provider"), query.Get("model")
+		var quotes []hub.ModelQuote
+		switch {
+		case provider != "" || model != "":
+			quotes = h.MarketQuotes(provider, model)
+		case query.Get("q") != "":
+			quotes = h.SearchModels(query.Get("q"))
+		default:
+			quotes = h.ModelDirectory()
+		}
 		if quotes == nil {
 			quotes = []hub.ModelQuote{}
 		}
@@ -445,7 +475,8 @@ func (c *sessionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Model string `json:"model"`
+		Model    string `json:"model"`
+		Provider string `json:"provider,omitempty"`
 	}
 	if err := json.Unmarshal(first, &req); err != nil || req.Model == "" {
 		return
@@ -456,7 +487,12 @@ func (c *sessionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	outcome, err := c.h.RunRealtime(r.Context(), tenant, req.Model, c.buildSession, &sessionLink{conn: conn, first: first})
+	var outcome hub.SessionOutcome
+	if req.Provider != "" {
+		outcome, err = c.h.RunRealtimeForProvider(r.Context(), tenant, req.Model, req.Provider, c.buildSession, &sessionLink{conn: conn, first: first})
+	} else {
+		outcome, err = c.h.RunRealtime(r.Context(), tenant, req.Model, c.buildSession, &sessionLink{conn: conn, first: first})
+	}
 	log.Printf("session model=%q tenant=%q provider=%q uplink=%d downlink=%d charged=%.2f commission=%.2f buyer=%.2f err=%v",
 		req.Model, tenant, outcome.Provider, outcome.UplinkBytes, outcome.DownlinkBytes,
 		float64(outcome.Charged)/microsPerUnit, float64(outcome.Commission)/microsPerUnit,

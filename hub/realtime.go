@@ -89,11 +89,32 @@ type SessionOutcome struct {
 func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
 
+	return h.openSession(ctx, tenant, model, "", build)
+}
+
+// OpenSessionForProvider opens a streaming session to a named provider pinned
+// source, with no fallback. It mirrors ExecuteForProvider for the session path:
+// the buyer who asks for a specific AI source by name gets exactly that source,
+// never a substitute. The named provider must be a current server of the model,
+// otherwise the open is refused before a byte moves.
+func (h *Hub) OpenSessionForProvider(ctx context.Context, tenant, model, provider string,
+	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
+
+	return h.openSession(ctx, tenant, model, provider, build)
+}
+
+// openSession opens a session either for the cheapest server of a model
+// (provider empty) or pinned to one named provider. It admits the tenant and,
+// on a failed open, returns the reserved share so a failed open never holds a
+// running job.
+func (h *Hub) openSession(ctx context.Context, tenant, model, provider string,
+	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
+
 	release, err := h.beginJob(tenant)
 	if err != nil {
 		return nil, jobs.Spec{}, err
 	}
-	conn, spec, err := h.openSessionForModel(ctx, model, build)
+	conn, spec, err := h.openSessionFor(ctx, model, provider, build)
 	if err != nil {
 		// Nothing came up, so the share this admission reserved goes straight
 		// back: a failed open is not a running job and must not hold one.
@@ -103,25 +124,33 @@ func (h *Hub) OpenSessionForModel(ctx context.Context, tenant, model string,
 	return newFlightConn(conn, release), spec, nil
 }
 
-// openSessionForModel opens the session itself, without admitting the tenant.
+// openSessionFor opens the session itself, without admitting the tenant.
 // It is split out so admission happens once, above, and so the slot it reserves
 // is still in hand when the caller decides whether the session came up.
-func (h *Hub) openSessionForModel(ctx context.Context, model string,
+func (h *Hub) openSessionFor(ctx context.Context, model, provider string,
 	build func(provider string) (jobs.Spec, error)) (SessionConn, jobs.Spec, error) {
 
-	providers := h.providersForModel(model)
-	if len(providers) == 0 {
-		return nil, jobs.Spec{}, h.supplyError(model)
+	var providers []string
+	if provider != "" {
+		if !h.providerServes(provider, model) {
+			return nil, jobs.Spec{}, fmt.Errorf("%w: model %q from provider %q", ErrNoProviderForModel, model, provider)
+		}
+		providers = []string{provider}
+	} else {
+		providers = h.providersForModel(model)
+		if len(providers) == 0 {
+			return nil, jobs.Spec{}, h.supplyError(model)
+		}
 	}
-	for _, provider := range providers {
-		spec, berr := build(provider)
+	for _, p := range providers {
+		spec, berr := build(p)
 		if berr != nil {
-			return nil, jobs.Spec{}, fmt.Errorf("build session spec for %q: %w", provider, berr)
+			return nil, jobs.Spec{}, fmt.Errorf("build session spec for %q: %w", p, berr)
 		}
 		spec = h.boundSession(spec)
 		spec, aerr := h.attachCredential(spec)
 		if aerr != nil {
-			return nil, jobs.Spec{}, fmt.Errorf("attach credential for %q: %w", provider, aerr)
+			return nil, jobs.Spec{}, fmt.Errorf("attach credential for %q: %w", p, aerr)
 		}
 		attemptCtx, cancel := h.attemptContext(ctx)
 		conn, oerr := h.tee.OpenSession(attemptCtx, spec)
@@ -180,7 +209,38 @@ func (h *Hub) boundSession(spec jobs.Spec) jobs.Spec {
 func (h *Hub) RunRealtime(ctx context.Context, tenant, model string,
 	build func(provider string) (jobs.Spec, error), link RealtimeLink) (SessionOutcome, error) {
 
-	conn, spec, err := h.OpenSessionForModel(ctx, tenant, model, build)
+	return h.runRealtime(ctx, tenant, model, "", build, link)
+}
+
+// RunRealtimeForProvider drives a streaming session pinned to one named
+// provider, with no fallback. It is the session counterpart of
+// ExecuteForProvider (and of the route's optional "provider" field): the buyer
+// gets exactly the source they asked for. An open that cannot find the named
+// provider serving the model is refused before a byte moves.
+func (h *Hub) RunRealtimeForProvider(ctx context.Context, tenant, model, provider string,
+	build func(provider string) (jobs.Spec, error), link RealtimeLink) (SessionOutcome, error) {
+
+	return h.runRealtime(ctx, tenant, model, provider, build, link)
+}
+
+// runRealtime drives a streaming session end to end: select the cheapest
+// provider for model (or the pinned provider), open the tunnel through the TEE,
+// relay the user's frames, and settle the terminal receipt. It returns the
+// settled outcome together with the relay error (if the session was cut short
+// by a bound or a transport failure).
+func (h *Hub) runRealtime(ctx context.Context, tenant, model, provider string,
+	build func(provider string) (jobs.Spec, error), link RealtimeLink) (SessionOutcome, error) {
+
+	var (
+		conn SessionConn
+		spec jobs.Spec
+		err  error
+	)
+	if provider != "" {
+		conn, spec, err = h.OpenSessionForProvider(ctx, tenant, model, provider, build)
+	} else {
+		conn, spec, err = h.OpenSessionForModel(ctx, tenant, model, build)
+	}
 	if err != nil {
 		return SessionOutcome{}, err
 	}
