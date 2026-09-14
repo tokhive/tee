@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 )
@@ -115,4 +116,58 @@ func TestServeExecuteBoundsTheRequestBody(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("at-cap body status = %d, want 400 (decode failure, not 413)", rec.Code)
 	}
+}
+
+// TestServeExecuteClearsTheBodyReadDeadline pins both halves of the bound on
+// reading the request body. Once the body is in hand the deadline must go: it
+// sits on the same socket the SSE answer streams over, and net/http keeps a
+// background read armed on that socket for the whole request, so a deadline
+// left in place expires under a long execution, fails that background read,
+// and makes the server cancel the request context — cutting a healthy job
+// mid-stream for no reason but its duration. On the oversize path the opposite
+// holds: bytes are still arriving and net/http drains up to 256 KiB of them
+// after the handler returns, so the deadline must stay on or a peer dribbling
+// an oversized chunked body pins the connection.
+func TestServeExecuteClearsTheBodyReadDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		body  []byte
+		clear bool
+	}{
+		{"body_in_hand", []byte("not-canonical-cbor"), true},
+		{"oversize_body", bytes.Repeat([]byte("x"), MaxExecuteBody+1), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+			req := httptest.NewRequest(http.MethodPost, "/v1/execute", bytes.NewReader(tc.body))
+			ServeExecute(nil, rec, req)
+
+			if len(rec.deadlines) == 0 || rec.deadlines[0].IsZero() {
+				t.Fatal("the body read was not bounded by a deadline")
+			}
+			cleared := len(rec.deadlines) == 2 && rec.deadlines[1].IsZero()
+			if tc.clear && !cleared {
+				t.Fatalf("read deadline left set (%v); it would cut any execution that outlives it", rec.deadlines)
+			}
+			if !tc.clear && cleared {
+				t.Fatal("read deadline cleared with the body still arriving; the post-handler drain would be unbounded")
+			}
+			if len(rec.deadlines) > 2 {
+				t.Fatalf("unexpected deadline churn: %v", rec.deadlines)
+			}
+		})
+	}
+}
+
+// deadlineRecorder is an httptest.ResponseRecorder that also satisfies the
+// SetReadDeadline half of http.ResponseController, recording what the handler
+// asks the socket for.
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadlines []time.Time
+}
+
+func (d *deadlineRecorder) SetReadDeadline(t time.Time) error {
+	d.deadlines = append(d.deadlines, t)
+	return nil
 }

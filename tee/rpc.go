@@ -109,16 +109,31 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 	// declared length cannot allocate unbounded memory. The read of one extra
 	// byte past the cap is what distinguishes "exactly at the cap" from "over
 	// it" without trusting Content-Length.
-	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(executeReadTimeout))
+	control := http.NewResponseController(w)
+	_ = control.SetReadDeadline(time.Now().Add(executeReadTimeout))
 	raw, err := io.ReadAll(io.LimitReader(r.Body, MaxExecuteBody+1))
 	if err != nil {
 		http.Error(w, "read body", http.StatusBadRequest)
 		return
 	}
 	if len(raw) > MaxExecuteBody {
+		// The deadline stays on: bytes are still arriving, and net/http drains
+		// up to 256 KiB of them after this handler returns so the connection can
+		// be reused. Cleared here, that drain would be unbounded and a peer that
+		// dribbles an oversized chunked body could pin the connection — exactly
+		// what the deadline exists to prevent.
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+	// The body is in hand and at EOF, so nothing is left for net/http to drain
+	// and the bound has done its work. It must not outlive the read: the
+	// deadline belongs to the same socket the streamed answer rides on, and
+	// net/http keeps a background read armed on that socket for the life of the
+	// request. Left set, it expires under a long execution, that background read
+	// fails, and the server cancels the request context — cutting every job that
+	// outlives the window mid-stream, however healthy it is. Bounding the body
+	// read must not bound the answer.
+	_ = control.SetReadDeadline(time.Time{})
 	req, err := DecodeExecuteRequest(raw)
 	if err != nil {
 		http.Error(w, "decode request: "+err.Error(), http.StatusBadRequest)
