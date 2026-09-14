@@ -61,6 +61,14 @@ var (
 	// broken and no new one can be opened.
 	ErrClosed = errors.New("tunnel: multiplexer closed")
 
+	// ErrTunnelFailed means the tunnel itself went down — the carrier's read or
+	// write failed, or a peer sent a frame the framing cannot accept — so every
+	// stream on it was cut mid-transfer. A consumer that took io.EOF for that
+	// would report a whole transfer, which for a session (whose stream carries no
+	// framing of its own) is the only evidence of a cut there is. A stream the
+	// peer closed, and a stream ended by a deliberate Close, still end in io.EOF.
+	ErrTunnelFailed = errors.New("tunnel: carrier or framing failure")
+
 	// ErrStreamReset means a stream was reset rather than closed: one side's
 	// consumer fell so far behind that its buffer crossed maxBuf, so the stream
 	// was torn down instead of stalling the shared read loop (see push). Both
@@ -169,24 +177,10 @@ func (m *Multiplexer) Dial(open []byte) (*Stream, error) {
 	return s, nil
 }
 
-// Close shuts the multiplexer down, ending every stream.
+// Close shuts the multiplexer down, ending every stream cleanly: a deliberate
+// shutdown is not a broken transfer, so its streams report io.EOF.
 func (m *Multiplexer) Close() error {
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return nil
-	}
-	m.closed = true
-	streams := make([]*Stream, 0, len(m.streams))
-	for _, s := range m.streams {
-		streams = append(streams, s)
-	}
-	m.streams = make(map[uint64]*Stream)
-	m.mu.Unlock()
-
-	for _, s := range streams {
-		s.eofNow()
-	}
+	m.teardown(nil)
 	return nil
 }
 
@@ -201,17 +195,7 @@ func (m *Multiplexer) writeFrame(kind Kind, id uint64, payload []byte) error {
 		return ErrClosed
 	}
 	if err := writeFrames(m.conn, kind, id, payload); err != nil {
-		m.mu.Lock()
-		m.closed = true
-		streams := make([]*Stream, 0, len(m.streams))
-		for _, s := range m.streams {
-			streams = append(streams, s)
-		}
-		m.streams = make(map[uint64]*Stream)
-		m.mu.Unlock()
-		for _, s := range streams {
-			s.eofNow()
-		}
+		m.fail(err)
 		return err
 	}
 	return nil
@@ -410,8 +394,20 @@ func endBoth(a, b io.ReadWriteCloser, err error) {
 	_ = Reset(b)
 }
 
-// fail tears the whole tunnel down after a read/write error.
-func (m *Multiplexer) fail(err error) {
+// fail tears the whole tunnel down after a read/write error on the carrier.
+// Every stream on it ends with ErrTunnelFailed wrapping the cause, rather than a
+// clean EOF: the bytes they were carrying are cut, and a consumer told io.EOF
+// would take what it got for the whole of it. For a session that is the only
+// evidence the stream can give, so a flattened failure is what lets a cut
+// conversation be settled as a finished one.
+func (m *Multiplexer) fail(cause error) {
+	m.teardown(fmt.Errorf("%w: %v", ErrTunnelFailed, cause))
+}
+
+// teardown marks the tunnel shut and ends every stream with reason: a carrier
+// fault, or nothing for a deliberate Close. It is idempotent, so the reader and
+// any number of writers can race into it and the first reason stands.
+func (m *Multiplexer) teardown(reason error) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -425,7 +421,7 @@ func (m *Multiplexer) fail(err error) {
 	m.streams = make(map[uint64]*Stream)
 	m.mu.Unlock()
 	for _, s := range streams {
-		s.eofNow()
+		s.end(reason)
 	}
 }
 
@@ -450,10 +446,12 @@ func newStream(m *Multiplexer, id uint64) *Stream {
 	return s
 }
 
-// Read delivers the next inbound bytes. After the peer has closed (or the
-// tunnel failed) and the queued bytes are drained, it returns io.EOF — or
-// ErrStreamReset when the stream was reset, so a consumer cannot mistake a
-// truncated transfer for a complete one.
+// Read delivers the next inbound bytes. Once the queued bytes are drained it
+// returns io.EOF for a clean end — the peer closed the stream, or the tunnel was
+// shut down deliberately — and otherwise the reason the transfer was cut:
+// ErrStreamReset for a stream reset (see push), ErrTunnelFailed for a tunnel
+// that went down. A consumer must not treat those as ends: reporting a truncated
+// transfer as whole is what a receipt may never do.
 func (s *Stream) Read(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

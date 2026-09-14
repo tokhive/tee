@@ -320,6 +320,15 @@ func (a *Agent) runOnce(ctx context.Context) error {
 	// until the Hub tears the tunnel down or the connection drops, either of
 	// which returns here and lets Run reconnect.
 	if _, err := io.Copy(io.Discard, control); err != nil {
+		// A tunnel that went down is how a lease usually ends — the Hub
+		// restarted, the network blipped — so it is reported as the end of a
+		// cycle that got online, not as a failure to get online: Run resets the
+		// reconnect delay for it instead of doubling the wait, which for an
+		// agent that has been serving traffic would otherwise ratchet to the
+		// maximum and keep it offline for no reason.
+		if errors.Is(err, tunnel.ErrTunnelFailed) {
+			return nil
+		}
 		return err
 	}
 	return nil

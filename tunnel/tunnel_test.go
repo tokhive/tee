@@ -229,15 +229,45 @@ func TestTunnelShutdownEndsStreams(t *testing.T) {
 	_ = a.Close()
 	_ = b.Close()
 
-	// Either EOF or an environment error is acceptable; it must not hang.
+	// A carrier that goes away is a failure, not a clean end, and it must not
+	// hang: the stream reports ErrTunnelFailed so a consumer can tell a cut
+	// transfer from a closed one.
 	buf := make([]byte, 32)
 	rdone := make(chan error, 1)
 	go func() { _, err := s.Read(buf); rdone <- err }()
 	select {
-	case <-rdone:
-		// broke out; fine
+	case err := <-rdone:
+		if !errors.Is(err, ErrTunnelFailed) {
+			t.Fatalf("read after a carrier failure = %v, want ErrTunnelFailed", err)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("stream read hung after tunnel shutdown")
+	}
+}
+
+// TestCarrierFailureEndsItsStreamsAsFailed pins the other end of the contract:
+// when the tunnel itself goes down, the streams on it end with ErrTunnelFailed
+// — readers and writers alike — because a consumer handed io.EOF would settle a
+// cut transfer as a whole one.
+func TestCarrierFailureEndsItsStreamsAsFailed(t *testing.T) {
+	a, b := net.Pipe()
+	m := New(a, High)
+	peer := New(b, Low)
+	defer func() { _ = m.Close(); _ = peer.Close(); _ = b.Close() }()
+	peer.Serve(func(*Stream, []byte) {})
+
+	s, err := m.Dial(nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	_ = a.Close() // the carrier dies under both directions
+
+	var buf [4]byte
+	if _, rerr := s.Read(buf[:]); !errors.Is(rerr, ErrTunnelFailed) {
+		t.Fatalf("read after a carrier failure = %v, want ErrTunnelFailed", rerr)
+	}
+	if _, werr := s.Write([]byte("x")); !errors.Is(werr, ErrTunnelFailed) {
+		t.Fatalf("write after a carrier failure = %v, want ErrTunnelFailed", werr)
 	}
 }
 
