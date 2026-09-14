@@ -298,11 +298,126 @@ func TestSlowStreamIsResetWithoutStallingOthers(t *testing.T) {
 		t.Fatalf("sibling read = %q, want %q", buf, "pong")
 	}
 
-	// The overrun stream was reset, not left half-open: draining it ends in EOF.
-	if n, err := io.Copy(io.Discard, slow); err != nil {
-		t.Fatalf("draining reset stream: %v", err)
-	} else if n == 0 {
+	// The overrun stream was reset, not left half-open and not closed: draining
+	// it ends in ErrStreamReset. The distinction is the point — the bytes past
+	// the cap were dropped, and a consumer told io.EOF would report a whole
+	// transfer where only a prefix arrived.
+	n, err := io.Copy(io.Discard, slow)
+	if !errors.Is(err, ErrStreamReset) {
+		t.Fatalf("draining reset stream: err = %v, want ErrStreamReset", err)
+	}
+	if n == 0 {
 		t.Fatalf("reset stream buffered nothing; overflow path not exercised")
+	}
+}
+
+// TestStreamResetIsCarriedToThePeer pins the other half of the reset contract:
+// the side whose bytes are being dropped is told the stream was reset rather
+// than handed a clean end. That side can be the one attesting the transcript —
+// a Hub that reset a stalled relay stream, a TEE reading a provider session —
+// and a clean end there certifies, and bills, bytes that never arrived.
+func TestStreamResetIsCarriedToThePeer(t *testing.T) {
+	a, b := net.Pipe()
+	m := New(a, High)
+	peer := New(b, Low)
+	defer func() { _ = m.Close(); _ = peer.Close(); _ = a.Close(); _ = b.Close() }()
+
+	served := make(chan *Stream, 1)
+	m.Serve(func(s *Stream, _ []byte) { served <- s })
+
+	s, err := peer.Dial(nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	inner := <-served
+
+	// Overrun the served stream's buffer with nobody reading it, exactly as the
+	// read loop would: the stream resets and the close frame follows.
+	chunk := bytes.Repeat([]byte("x"), maxPayload)
+	for i := 0; i < maxBuf/maxPayload+2; i++ {
+		m.deliver(inner.id, chunk)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		var buf [4]byte
+		_, rerr := s.Read(buf[:])
+		done <- rerr
+	}()
+	select {
+	case rerr := <-done:
+		if !errors.Is(rerr, ErrStreamReset) {
+			t.Fatalf("peer read after a reset = %v, want ErrStreamReset", rerr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the peer was never told its stream was reset")
+	}
+
+	// The writer learns the same thing: its bytes were dropped, not delivered to
+	// a peer that closed.
+	if _, werr := s.Write([]byte("more")); !errors.Is(werr, ErrStreamReset) {
+		t.Fatalf("peer write after a reset = %v, want ErrStreamReset", werr)
+	}
+}
+
+// TestBridgePropagatesReset covers the hop. The Hub and the agent each bridge
+// two tunnels, so a reset raised on one side has to survive the bridge to be
+// worth anything: a peer that is handed a clean close there will report a whole
+// transfer, and a receipt built on that pays for bytes it never relayed.
+func TestBridgePropagatesReset(t *testing.T) {
+	leftEnd, leftFarEnd := net.Pipe()
+	rightEnd, rightFarEnd := net.Pipe()
+	hub := New(leftEnd, Low)
+	hubFar := New(leftFarEnd, High)
+	side := New(rightEnd, Low)
+	sideFar := New(rightFarEnd, High)
+	defer func() {
+		_ = hub.Close()
+		_ = hubFar.Close()
+		_ = side.Close()
+		_ = sideFar.Close()
+		_ = leftEnd.Close()
+		_ = leftFarEnd.Close()
+		_ = rightEnd.Close()
+		_ = rightFarEnd.Close()
+	}()
+
+	// The far ends of both tunnels are in the test's hands, which is what lets it
+	// observe what each side of the bridge is told.
+	served := func(m *Multiplexer) chan *Stream {
+		ch := make(chan *Stream, 1)
+		m.Serve(func(s *Stream, _ []byte) { ch <- s })
+		return ch
+	}
+	leftFarStreams := served(hubFar)
+	rightFarStreams := served(sideFar)
+
+	left, err := hub.Dial(nil)
+	if err != nil {
+		t.Fatalf("dial left: %v", err)
+	}
+	right, err := side.Dial(nil)
+	if err != nil {
+		t.Fatalf("dial right: %v", err)
+	}
+	go Bridge(left, right)
+
+	leftPeer := <-leftFarStreams
+	rightPeer := <-rightFarStreams
+
+	// The far side of one tunnel resets the stream under the bridge, as it would
+	// if its own consumer fell behind.
+	rightPeer.Reset()
+
+	// The bridged end is told the transfer was cut...
+	var buf [4]byte
+	if _, err := left.Read(buf[:]); !errors.Is(err, ErrStreamReset) {
+		t.Fatalf("bridged stream read = %v, want ErrStreamReset", err)
+	}
+	// ...and so is the far side of the *other* tunnel, which is the end that may
+	// be attesting the transcript.
+	if _, err := leftPeer.Read(buf[:]); !errors.Is(err, ErrStreamReset) {
+		t.Fatalf("far side of the other tunnel read = %v, want ErrStreamReset", err)
 	}
 }
 

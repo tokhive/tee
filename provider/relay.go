@@ -232,6 +232,11 @@ func (c relayConn) Write(p []byte) (int, error) {
 
 func (c relayConn) touch() { c.last.Store(time.Now().UnixNano()) }
 
+// Reset forwards the stream's abnormal end through the wrapper, so a bridge over
+// a metered connection still tells the far side a transfer was truncated instead
+// of handing it a clean close.
+func (c relayConn) Reset() error { return tunnel.Reset(c.ReadWriteCloser) }
+
 // ioReadWriteCloser narrows a full ReadWriteCloser to the surface bridge needs,
 // so the tap wrapper and the raw stream both fit the same parameter.
 type ioReadWriteCloser interface {
@@ -250,6 +255,7 @@ type tapRWC struct {
 
 func (t tapRWC) Read(p []byte) (int, error) { return t.rw.Read(p) }
 func (t tapRWC) Close() error               { return t.rw.Close() }
+func (t tapRWC) Reset() error               { return tunnel.Reset(t.rw) }
 func (t tapRWC) Write(p []byte) (int, error) {
 	if t.tap != nil {
 		_, _ = t.tap.Write(p)
