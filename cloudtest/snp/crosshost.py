@@ -285,11 +285,27 @@ def main() -> None:
 
 
 def describe(ec2, iid: str) -> dict:
-    return ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+    """Describe one instance; {} when it no longer exists.
+
+    A record in crosshost.json can outlive its instance (it was terminated, or
+    purged after the retention window). describe_instances then returns no
+    Reservations, so callers must treat "absent" as a first-class state instead
+    of indexing an empty list.
+    """
+    res = ec2.describe_instances(InstanceIds=[iid]).get("Reservations", [])
+    for r in res:
+        for i in r.get("Instances", []):
+            return i
+    return {}
 
 
 def host_state(ec2, iid: str) -> str:
-    return describe(ec2, iid)["State"]["Name"]
+    """Instance state, or "terminated" when the instance is gone.
+
+    "Gone" collapses to "terminated" because neither can be reused: any recorded
+    instance that no longer exists must trigger a fresh launch.
+    """
+    return describe(ec2, iid).get("State", {}).get("Name", "terminated")
 
 
 def boto3(service: str):
