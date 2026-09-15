@@ -19,6 +19,16 @@ const (
 	// PlatformAWSSEVSNP identifies an AWS confidential VM backed by AMD SEV-SNP.
 	PlatformAWSSEVSNP = "aws-sev-snp"
 
+	// PlatformAlibabaCloud identifies an Alibaba Cloud confidential-computing
+	// guest. Reserved for future support: the skeleton verifier is wired, but
+	// attestation verification is not yet implemented.
+	PlatformAlibabaCloud = "alicloud"
+
+	// PlatformTencentCloud identifies a Tencent Cloud confidential-computing
+	// guest. Reserved for future support: the skeleton verifier is wired, but
+	// attestation verification is not yet implemented.
+	PlatformTencentCloud = "tencent"
+
 	// SignatureAlgorithmECDSAP256SHA256ASN1 is the RA-TLS epoch key algorithm.
 	SignatureAlgorithmECDSAP256SHA256ASN1 = "ecdsa-p256-sha256-asn1"
 
@@ -30,6 +40,11 @@ var (
 	ErrNotReady = errors.New("TEE platform is not ready")
 	// ErrInvalidSigningDomain means a caller did not provide a usable domain.
 	ErrInvalidSigningDomain = errors.New("invalid signing domain")
+	// ErrAttestationNotImplemented means a platform verifier skeleton exists
+	// but its attestation verification is not yet implemented. It must never
+	// admit trusted work: the verifier refuses every receipt until the
+	// evidence path is implemented.
+	ErrAttestationNotImplemented = errors.New("attestation verification not yet implemented for this platform")
 )
 
 // Identity is the public identity of one attested key epoch.

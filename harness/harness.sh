@@ -26,13 +26,15 @@
 #  14  streaming session      -> a WebSocket session egresses over the reverse
 #                               tunnel and its receipt verifies offline
 #  15  lowest-price dispatch  -> the Hub schedules by model to the cheapest
-#                               online agent, with commission on the buyer bill
-#  16  auto-discovery + catalog: agents come online WITHOUT -models, each
-#       infers and fetches its upstream /v1/models, registers the discovered
-#       list, and the /v1/models directory lists them at the lowest online
-#       price; ?q= search filters by exact ID and by substring.
+#                               online agent, with commission on the buyer bill;
+#                               agents auto-discover their upstream /v1/models
+#                               and the catalog lists them at the lowest price
+#  16  Anthropic /v1/messages + OpenAI /v1/responses user APIs
 #  17  streaming session via  -> the Hub user API WebSocket: select + settle
 #      the Hub user API          + duplex
+#  18  Hub↔TEE mTLS             -> the TEE listener demands a Hub client cert;
+#       pinning + identity        the Hub pins the TEE's RA-TLS certificate;
+#                                 unpinned peers and plain HTTP are refused
 #
 # Every hub that hosts the reverse tunnel does so with per-provider agent keys
 # (-agent-keys) and a relay key (-relay-key): a dial-in is bound to exactly one
@@ -63,7 +65,7 @@ sleep 0.3
 # --- build ---------------------------------------------------------------
 echo "==> building simulation binaries"
 mkdir -p "$BIN"
-for pkg in mockprovider faketee hub verify tee agent streamer sessiondriver; do
+for pkg in mockprovider faketee hub tee agent streamer sessiondriver; do
   echo "    building $pkg"
   go build -o "$BIN/$pkg" "./tokenhive/cmd/$pkg" || { echo "build failed for $pkg"; exit 1; }
 done
@@ -108,6 +110,12 @@ TEE_PORT=18090
 STATS_PORT=18081
 
 # --- start mock provider (real TLS via generated test CA) -----------------
+# The sellers' access tokens. They live only in the agent processes (and, for
+# the one-shot simulation tools that talk to a TEE directly, in their -credential
+# flag): the TEE receives them sealed, and the Hub never sees them in the clear.
+TOKEN_OAI="sk-sim-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+TOKEN_CHEAP="sk-sim-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+
 # A separate plain-HTTP stats listener (/stats, /reset) peers at the provider's
 # connection count WITHOUT dialing a connection of its own, so a probe can never
 # perturb the very number it reports.
@@ -126,21 +134,21 @@ section() { echo; echo "=================================================="; ech
 
 # --- 1. normal flow ---------------------------------
 section "1. normal flow (5 requests)"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -n 5
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -credential "$TOKEN_OAI" -n 5
 
 # --- 2. policy denial (wrong host) ---------------------------------------
 section "2. policy denial: Hub sends disallowed host 1.2.3.4:18080"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -host "1.2.3.4:18080" || true
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -credential "$TOKEN_OAI" -host "1.2.3.4:18080" || true
 
 # --- 3/4/5. provider faults ---------------------------------------------
 section "3. provider returns 401 (CompletionFailed)"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -query "fault=401" || true
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -credential "$TOKEN_OAI" -query "fault=401" || true
 
 section "4. provider returns 429 (CompletionFailed)"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -query "fault=429" || true
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -credential "$TOKEN_OAI" -query "fault=429" || true
 
 section "5. provider drops connection mid-stream (CompletionTruncated)"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -query "fault=truncate" || true
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -credential "$TOKEN_OAI" -query "fault=truncate" || true
 
 # --- 6. cross-restart ProviderSeq survival -------------------------------
 section "6. restart faketee; ProviderSeq must keep climbing"
@@ -150,7 +158,7 @@ kill "$TEE_PID" 2>/dev/null; wait "$TEE_PID" 2>/dev/null
 TEE_PID=$!
 wait_for_port 127.0.0.1 "$TEE_PORT"
 echo "    sending 1 request after restart; expect seq to continue, not reset:"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -n 1
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -credential "$TOKEN_OAI" -n 1
 
 # --- 7. ProviderSeq gap detection ---------------------------------------
 section "7. ProviderSeq gap: Hub hides one record, audit must catch it"
@@ -161,10 +169,10 @@ kill "$TEE_PID" 2>/dev/null; wait "$TEE_PID" 2>/dev/null
 TEE_PID=$!
 wait_for_port 127.0.0.1 "$TEE_PORT"
 echo "    sending 3, withholding the 2nd receipt (expect stored seqs {1,3}):"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -n 3 -drop 2
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -credential "$TOKEN_OAI" -n 3 -drop 2
 echo
 echo "    --> auditing the receipt store:"
-"$BIN/hub" -audit || "$BIN/verify" -provider openai-sim
+"$BIN/hub" -audit
 
 # --- 8. quota refuses before dispatch ------------------------------------
 section "8. quota: 3 attempts, tenant limited to 2"
@@ -175,7 +183,7 @@ kill "$TEE_PID" 2>/dev/null; wait "$TEE_PID" 2>/dev/null
 TEE_PID=$!
 wait_for_port 127.0.0.1 "$TEE_PORT"
 echo "    the 3rd request must be refused by the Hub, never reaching the TEE:"
-"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -n 3 -quota 2 -window 1m -tenant quota-demo
+"$BIN/hub" -tee "http://127.0.0.1:$TEE_PORT" -credential "$TOKEN_OAI" -n 3 -quota 2 -window 1m -tenant quota-demo
 echo
 echo "    --> audit: 2 receipts, no gaps. A refused request that still burned"
 echo "        a ProviderSeq would show up here as a missing number."
@@ -208,12 +216,8 @@ KEY_CHEAP_AGENT="sim-agent-key-cheap"
 # not an open egress proxy for anything that can reach it.
 RELAY_SECRET="sim-relay-secret"
 AGENT_KEYS="openai-sim=$KEY_OAI_AGENT,cheap-sim=$KEY_CHEAP_AGENT"
-# The sellers' access tokens. They live only in the agent processes (and, for
-# the one-shot simulation tools that talk to a TEE directly, in their -credential
-# flag): the TEE receives them sealed, and the Hub never sees them in the clear.
-# providers.json is gone — the harness defines the tokens here instead.
-TOKEN_OAI="sk-sim-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-TOKEN_CHEAP="sk-sim-yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+# The sellers' access tokens (TOKEN_OAI / TOKEN_CHEAP) are defined above, next
+# to the mock provider, because scenarios 1-8 use them too.
 RT_HUB_PORT=18094          # reverse-tunnel hub shared by scenarios 9-14
 RT_HUB_WS="ws://127.0.0.1:$RT_HUB_PORT"
 HUB_WS="ws://127.0.0.1:18085"   # user-facing Hub (scenarios 15-17)
@@ -447,6 +451,7 @@ kill "$TEE_E_PID" 2>/dev/null; wait "$TEE_E_PID" 2>/dev/null
 # scenario 9-14 reverse-tunnel Hub and its agent.
 kill "$AGENT_A_PID" 2>/dev/null; wait "$AGENT_A_PID" 2>/dev/null
 kill "$RT_HUB_PID" 2>/dev/null; wait "$RT_HUB_PID" 2>/dev/null
+kill "$TEE_A_PID" 2>/dev/null; wait "$TEE_A_PID" 2>/dev/null
 
 # =====================================================================
 # Lowest-price scheduling + commission: A Hub user-facing API over a real
@@ -748,6 +753,48 @@ else
 fi
 
 kill "$TEE_G_PID" "$HUB_API17_PID" 2>/dev/null; wait "$TEE_G_PID" "$HUB_API17_PID" 2>/dev/null
+
+# --- Scenario 18: Hub↔TEE mutual TLS --------------------------------------
+section "18. Hub↔TEE mutual TLS: attested-cert pinning + Hub client identity"
+TEE_MTLS_PORT=18095
+echo "    starting faketee with -mtls on :$TEE_MTLS_PORT (demands a Hub client cert)"
+"$BIN/faketee" -addr "127.0.0.1:$TEE_MTLS_PORT" -mtls -seq "$SIM/seqstore-mtls.json" > "$SIM/faketee-mtls.log" 2>&1 &
+TEE_MTLS_PID=$!
+sleep 0.6
+
+if [ ! -f "$SIM/tee-cert.pem" ]; then
+  echo "      !! FAIL: TEE did not publish its RA-TLS certificate to $SIM/tee-cert.pem"
+else
+  echo "      OK: TEE published its RA-TLS certificate for the Hub to pin"
+fi
+
+echo "    one request over mTLS (pinned TEE cert + Hub client identity):"
+"$BIN/hub" -tee "https://127.0.0.1:$TEE_MTLS_PORT" -mtls-ca "$SIM/tee-cert.pem" \
+  -credential "$TOKEN_OAI" -n 1 > "$SIM/hub-mtls.log" 2>&1
+if grep -qE "^\[receipt\].*completion=complete" "$SIM/hub-mtls.log"; then
+  echo "      OK: request completed over mTLS, receipt verified and settled"
+else
+  echo "      !! FAIL: mTLS request did not complete"
+  tail -5 "$SIM/hub-mtls.log"
+fi
+
+echo "    negative: Hub pinning the WRONG certificate must be refused:"
+if "$BIN/hub" -tee "https://127.0.0.1:$TEE_MTLS_PORT" -mtls-ca "$SIM/ca.pem" \
+  -credential "$TOKEN_OAI" -n 1 > "$SIM/hub-mtls-wrongca.log" 2>&1; then
+  echo "      !! FAIL: Hub with an unpinned TEE was admitted"
+else
+  echo "      OK: Hub with an unpinned TEE was refused at the handshake"
+fi
+
+echo "    negative: plain HTTP must not reach an mTLS listener:"
+if "$BIN/hub" -tee "http://127.0.0.1:$TEE_MTLS_PORT" -credential "$TOKEN_OAI" \
+  -n 1 > "$SIM/hub-mtls-plain.log" 2>&1; then
+  echo "      !! FAIL: plain HTTP reached the mTLS listener"
+else
+  echo "      OK: plain HTTP was refused by the mTLS listener"
+fi
+
+kill "$TEE_MTLS_PID" 2>/dev/null; wait "$TEE_MTLS_PID" 2>/dev/null
 
 # --- cleanup -------------------------------------------------------------
 echo

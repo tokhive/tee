@@ -21,20 +21,31 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
+
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/attest"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/alicloud"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/tencent"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
@@ -42,6 +53,13 @@ import (
 // this binary prints. Only the display divides; every calculation stays in
 // integers.
 const microsPerUnit = 1_000_000
+
+// evidenceCache resolves full attestation evidence for hash-only receipts this
+// process has seen, layered on top of the restart-surviving evidence store the
+// TEE publishes. A receipt carrying only an evidence hash resolves against what
+// the Hub actually observed or the TEE recorded; the Hub never trusts an epoch
+// it has not seen evidence for.
+var evidenceCache attest.Cache
 
 // defaultTenantInflight is how many jobs one tenant may run at once unless the
 // operator says otherwise. Unlike the other tenant controls this one ships on:
@@ -79,12 +97,35 @@ func main() {
 	tenantInflight := flag.Int("tenant-inflight", defaultTenantInflight, "how many jobs one tenant may run at once; keeps one buyer from occupying every connection a shared provider has (0 = unlimited)")
 	credential := flag.String("credential", "", "provider access token to register with the TEE before the request loop (simulation one-shot mode: the CLI holds the seller's token and delivers it sealed to -tee, as a dialing agent would through a resident Hub)")
 	audit := flag.Bool("audit", false, "audit the receipt store for gaps and verify signatures")
+	allowed := flag.String("allowed-platforms", "simulated", "comma-separated attestation platforms the Hub trusts (e.g. simulated,aws-sev-snp)")
+	expectedApp := flag.String("expected-app", "", "for aws-sev-snp: the attested application identity the deployment trusts (snp-app:<sha256 hex>)")
+	policyHash := flag.String("policy-set-hash", "", "hex digest the enclave must have bound into its evidence; empty skips the deployment-binding assertion (the Hub pins the platform, not the exact policy digest, at runtime)")
+	evFetchURL := flag.String("evidence-fetch", "", "base URL for remote evidence retrieval (e.g. https://tee:18090); empty = resolve EvidenceHash from the local evidence store only")
+	mtlsCA := flag.String("mtls-ca", "", "PEM file pinning the TEE's RA-TLS certificate (or the CA that signs it); the RA-TLS verification half of Hub↔TEE mTLS. Implies -tee is https://")
+	mtlsCert := flag.String("mtls-cert", "", "client certificate the Hub presents to the TEE under mTLS; empty defaults to <simdir>/hub-client.pem")
+	mtlsKey := flag.String("mtls-key", "", "private key for -mtls-cert; empty defaults to <simdir>/hub-client-key.pem")
 	flag.Parse()
 
 	store := hub.NewReceiptStore(filepath.Join(shared.ConfigDir(), "receipts"))
 
+	teeTLS, err := buildTEEClientTLS(*mtlsCA, *mtlsCert, *mtlsKey)
+	if err != nil {
+		log.Fatalf("tee mtls: %v", err)
+	}
+	// -audit never talks to -tee, so the https:// constraint on the execute
+	// channel does not apply to it; the mTLS client is still built so remote
+	// evidence fetches trust the same pinned RA-TLS certificate.
+	if teeTLS != nil && !strings.HasPrefix(*teeURL, "https://") && !*audit {
+		log.Fatalf("-mtls-ca pins the TEE certificate, so -tee must be an https:// URL (got %q)", *teeURL)
+	}
+	var httpClient *http.Client
+	var teeDialer *websocket.Dialer
+	if teeTLS != nil {
+		httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: teeTLS}}
+		teeDialer = &websocket.Dialer{TLSClientConfig: teeTLS}
+	}
 	if *audit {
-		runAudit(store, *provider)
+		runAudit(store, *provider, *allowed, *expectedApp, *policyHash, *evFetchURL, httpClient)
 		return
 	}
 
@@ -103,7 +144,6 @@ func main() {
 			log.Fatalf("quota: %v", err)
 		}
 	}
-
 	perProviderKeys, err := parseAgentKeys(*agentKeys)
 	if err != nil {
 		log.Fatalf("agent-keys: %v", err)
@@ -121,12 +161,18 @@ func main() {
 		URL:        *teeURL + "/v1/execute",
 		SessionURL: wsEndpoint(*teeURL, "/v1/session"),
 		BaseURL:    *teeURL,
+		Client:     httpClient,
+		Dialer:     teeDialer,
+	}
+	verifier, err := buildVerifier(*allowed, *expectedApp, *policyHash, *evFetchURL, httpClient)
+	if err != nil {
+		log.Fatalf("attestation: %v", err)
 	}
 	h, err := hub.New(hub.Config{
 		TEE:                  teeClient,
 		Rates:                rates,
 		Store:                store,
-		Verify:               verifyReceipt,
+		Verify:               verifier.VerifyFunc(),
 		Quota:                quota,
 		Budgets:              budgets,
 		MaxInflightPerTenant: *tenantInflight,
@@ -257,80 +303,186 @@ func printLedger(ledger *hub.Ledger) {
 	}
 }
 
-func runAudit(store *hub.ReceiptStore, provider string) {
-	report, err := store.Audit(provider, verifyReceipt)
+// runAudit verifies every stored receipt and reports ProviderSeq gaps. With an
+// empty -provider it audits the whole store; a gap exits non-zero so scripts
+// can fail on a missing receipt.
+func runAudit(store *hub.ReceiptStore, provider, allowed, expectedApp, policyHash, evFetchURL string, evClient *http.Client) {
+	verifier, err := buildVerifier(allowed, expectedApp, policyHash, evFetchURL, evClient)
 	if err != nil {
-		log.Fatalf("audit: %v", err)
+		log.Fatalf("attestation: %v", err)
+	}
+	providers := []string{provider}
+	if provider == "" {
+		if providers, err = store.Providers(); err != nil {
+			log.Fatalf("audit: %v", err)
+		}
+		if len(providers) == 0 {
+			fmt.Println("no receipts stored")
+			return
+		}
+	}
+	failed := false
+	for _, p := range providers {
+		if !auditProvider(store, p, verifier) {
+			failed = true
+		}
+	}
+	if failed {
+		os.Exit(1)
+	}
+}
+
+// auditProvider verifies one provider's receipts; true means the store is
+// healthy (no gaps, no bad receipts).
+func auditProvider(store *hub.ReceiptStore, provider string, verifier *attest.Verifier) bool {
+	report, err := store.Audit(provider, verifier.VerifyFunc())
+	if err != nil {
+		fmt.Printf("[%s] audit: %v\n", provider, err)
+		return false
 	}
 	if report.Total == 0 {
-		fmt.Printf("no receipts stored for provider %q\n", provider)
-		return
+		fmt.Printf("[%s] no receipts stored\n", provider)
+		return true
 	}
-	fmt.Printf("verified %d/%d receipts for provider %q\n", report.Verified, report.Total, provider)
-
-	// The deployment binding: receipts issued by a TEE deployed with the
-	// current whitelist carry that policy-set hash in their evidence. When the
-	// local deployment config exists, compare; receipts whose evidence lacks
-	// the binding (issued by an unbound epoch) are flagged as warnings.
-	expectedHash, haveDeployment := localPolicySetHash()
-	if haveDeployment {
-		fmt.Printf("expected deployment policy-set hash: %x\n", expectedHash)
-	}
-
-	// Evidence is checked separately from the signature: a receipt can be
-	// perfectly signed and still point at an attestation that no longer
-	// resolves, which is a cache problem rather than a forgery.
-	receipts, err := store.List(provider)
-	if err != nil {
-		logf("list receipts: %v", err)
-	}
-	for _, signed := range receipts {
-		id, err := signed.Receipt.Identity()
-		if err != nil {
-			fmt.Printf("  [WARN] seq=%d: identity: %v\n", signed.Receipt.ProviderSeq, err)
-			continue
-		}
-		if haveDeployment {
-			if err := simulated.CheckEvidenceForDeployment(id, expectedHash); err != nil {
-				fmt.Printf("  [WARN] seq=%d: deployment binding: %v\n", signed.Receipt.ProviderSeq, err)
-				continue
-			}
-			continue
-		}
-		if err := simulated.CheckEvidence(id); err != nil {
-			fmt.Printf("  [WARN] seq=%d: evidence: %v\n", signed.Receipt.ProviderSeq, err)
-		}
-	}
-
+	fmt.Printf("[%s] verified %d/%d receipts (allowed platforms: %v)\n",
+		provider, report.Verified, report.Total, verifier.AllowedPlatforms())
 	if report.Complete() {
-		fmt.Printf("sequence complete: 1..%d, no gaps\n", report.MaxSeq)
-		return
+		fmt.Printf("    sequence complete: 1..%d, no gaps\n", report.MaxSeq)
+		return true
 	}
-	fmt.Printf(">>> GAP DETECTED: provider was used at least %d times but is missing receipts %v\n",
-		report.MaxSeq, report.Missing)
+	fmt.Printf(">>> [%s] GAP DETECTED: provider was used at least %d times but is missing receipts %v\n",
+		provider, report.MaxSeq, report.Missing)
+	return false
 }
 
-// localPolicySetHash loads the deployment policy config the way cmd/tee does
-// and returns the hash a correctly-deployed TEE would have bound into its
-// evidence. haveDeployment is false when no policy config exists locally, in
-// which case callers fall back to binding-free evidence checks.
-func localPolicySetHash() (hash [32]byte, haveDeployment bool) {
-	set, err := shared.LoadPolicySetAll()
-	if err != nil {
-		return hash, false
+// buildTEEClientTLS assembles the Hub's client TLS config for the Hub↔TEE
+// channel. It pins the TEE's RA-TLS certificate (or its signing CA), which is
+// the deployment's out-of-band statement "this certificate is the attested
+// TEE"; and it presents the Hub's own client certificate so the TEE admits it.
+// Without -mtls-ca it returns nil (plain HTTP/WSS-less operation). The cert and
+// key default to the simulation identity so a local mTLS run needs no flags
+// beyond the pin.
+func buildTEEClientTLS(caFile, certFile, keyFile string) (*tls.Config, error) {
+	if caFile == "" {
+		if certFile != "" || keyFile != "" {
+			return nil, errors.New("-mtls-cert/-mtls-key require -mtls-ca")
+		}
+		return nil, nil
 	}
-	hash, err = set.Hash()
-	if err != nil {
-		logf("hash policy set: %v", err)
-		return hash, false
+	if certFile == "" {
+		certFile = filepath.Join(shared.ConfigDir(), shared.MTLSClientCertPath)
 	}
-	return hash, true
+	if keyFile == "" {
+		keyFile = filepath.Join(shared.ConfigDir(), shared.MTLSClientKeyPath)
+	}
+	if err := shared.EnsureMTLSCerts(); err != nil {
+		return nil, err
+	}
+	return shared.ClientMTLSConfig(caFile, certFile, keyFile)
 }
 
-// verifyReceipt checks a receipt's signature and attestation. The allowed
-// platform list is the trust root; in the simulation it is the software epoch.
-func verifyReceipt(signed proof.SignedReceipt) error {
-	return proof.Verify(signed, proof.VerifyOptions{AllowedPlatforms: []string{simulated.Platform}})
+// buildVerifier assembles the attestation trust root from the operator's
+// allowlist. A platform the operator advertises as trusted but that has no
+// evidence verifier wired here is a wiring error and fails loudly at startup,
+// not at the first receipt. AWS SEV-SNP is additionally refused without a
+// valid application pin: platform authenticity alone is not an image trust
+// root, so an allowlist entry without -expected-app would accept receipts
+// from any hardware-valid SNP application.
+func buildVerifier(allowed, expectedApp, policyHash, evFetchURL string, evClient *http.Client) (*attest.Verifier, error) {
+	lists, err := splitCSV(allowed)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range lists {
+		if p != platform.PlatformAWSSEVSNP {
+			continue
+		}
+		digest := strings.TrimPrefix(expectedApp, "snp-app:")
+		if digest == expectedApp {
+			return nil, fmt.Errorf("-allowed-platforms includes %q: -expected-app must pin the attested application identity as snp-app:<sha256 hex>", platform.PlatformAWSSEVSNP)
+		}
+		if len(digest) != 64 {
+			return nil, fmt.Errorf("-expected-app %q is not a valid snp-app:<sha256 hex> pin", expectedApp)
+		}
+		if _, err := hex.DecodeString(digest); err != nil {
+			return nil, fmt.Errorf("-expected-app %q is not a valid snp-app:<sha256 hex> pin", expectedApp)
+		}
+	}
+	byPlatform := map[string]platform.EvidenceVerifier{
+		simulated.Platform: simulated.Verifier{},
+		platform.PlatformAWSSEVSNP: sevsnp.Verifier{
+			ExpectedApp: expectedApp,
+		},
+		// Cloud skeleton verifiers, reserved for future support: wired so an
+		// allowlist entry is honest, but every receipt is refused with
+		// ErrAttestationNotImplemented until the attestation paths land.
+		platform.PlatformAlibabaCloud: alicloud.Verifier{},
+		platform.PlatformTencentCloud: tencent.Verifier{},
+	}
+	fetcher, err := buildFetcher(evFetchURL, evClient)
+	if err != nil {
+		return nil, err
+	}
+	cfg := attest.Config{
+		AllowedPlatforms: lists,
+		ByPlatform:       byPlatform,
+		Fetcher:          fetcher,
+	}
+	// The deployment binding is opt-in. At runtime the Hub pins the platform
+	// trust root, not the exact policy digest: policy files are rewritten with a
+	// fresh IssuedAt on every startup, so deriving the hash here would race the
+	// TEE's own binding and reject valid receipts. An operator who wants the
+	// strongest bound (prove the enclave ran a specific whitelist config)
+	// passes the digest explicitly.
+	if policyHash != "" {
+		h, err := hex.DecodeString(policyHash)
+		if err != nil {
+			return nil, fmt.Errorf("parse -policy-set-hash: %w", err)
+		}
+		if len(h) != 32 {
+			return nil, fmt.Errorf("-policy-set-hash must be a 32-byte hex digest, got %d bytes", len(h))
+		}
+		copy(cfg.PolicySetHash[:], h)
+	}
+	return attest.New(cfg)
+}
+
+// splitCSV splits a comma-separated allowlist, trimming whitespace.
+func splitCSV(s string) ([]string, error) {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty -allowed-platforms")
+	}
+	return out, nil
+}
+
+// buildFetcher assembles the evidence retrieval path in resolution order: the
+// in-memory cache of epochs this process has verified, then the restart-surviving
+// local store, then an optional remote /v1/evidence endpoint. Each layer is
+// tried in turn until one holds the bytes. The remote layer reuses the Hub's
+// mTLS client so it trusts the same pinned RA-TLS certificate and presents the
+// same client certificate as the Hub↔TEE channel.
+func buildFetcher(evFetchURL string, evClient *http.Client) (attest.Fetcher, error) {
+	backend := &evidence.Chain{}
+	backend.Add(&evidenceCache)
+	if store, err := shared.LoadEvidenceStore(); err == nil {
+		backend.Add(store)
+	}
+	if evFetchURL != "" {
+		httpFetcher, err := evidence.NewHTTPFetcher(evFetchURL, evClient)
+		if err != nil {
+			return nil, err
+		}
+		backend.Add(httpFetcher)
+	}
+	return backend, nil
 }
 
 // withholdSeq models a Hub that hides one execution from the provider. The

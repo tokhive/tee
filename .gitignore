@@ -1,0 +1,5 @@
+# TokenHive cloudtest: never commit secrets or key material.
+# (cloudtest/ also ships its own .gitignore; this guards the repo root too.)
+.env
+*.pem
+*.pem.pub

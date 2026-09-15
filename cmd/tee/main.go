@@ -25,23 +25,26 @@
 //
 // The Hub↔TEE channel is deliberately separate: local sims run plain HTTP, and
 // production enables mTLS at the listener using the platform adapter's
-// ServerTLSConfig (RA-TLS certificates) — see the C4 checklist document for the
-// exact wiring; this file's job is to expose the switches, not to guess at a
-// deployment's certificate topology.
+// ServerTLSConfig (RA-TLS certificates). -mtls switches the listener to that
+// mode; -mtls-client-ca names the CA that signs Hub client certificates.
 package main
 
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
+	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
@@ -54,15 +57,45 @@ import (
 const defaultPlatform = "simulated"
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:18090", "listen address")
-	relay := flag.String("relay", "", "Hub TeeRelay WebSocket URL: every provider connection egresses as a stream over the Hub's reverse tunnel")
-	relayKey := flag.String("relay-key", "", "key to present to the Hub's TeeRelay endpoint (empty = the Hub requires none)")
-	maxConns := flag.Int("max-conns", 0, "max resident provider connections per (provider, host) (0 = default 32)")
-	requestTimeout := flag.Duration("request-timeout", 2*time.Minute, "bound on a single provider exchange, including streaming sessions (0 = no bound)")
-	seqPath := flag.String("seq", "", "ProviderSeq store file (default <simdir>/seqstore.json)")
-	platformName := flag.String("platform", defaultPlatform, "attestation platform: simulated or sevsnp")
-	includeEvidence := flag.Bool("evidence", true, "embed attestation evidence in every receipt (false = resolve EvidenceHash via evidence retrieval)")
-	caFile := flag.String("ca", "", "root CA PEM for provider TLS; empty = sim test CA on simulated, system roots on sevsnp")
+	// Under the measured loader the loader launches this binary twice: once as a
+	// root-only attestation broker (which owns /dev/sev-guest, /dev/tpm0) and once
+	// as the unprivileged app connected to it. When env marks this process as the
+	// broker, serve attestation requests in a loop and exit instead of running the
+	// TEE service (the same split tee_k/tee_t use).
+	if broker, err := rootShared.RunSNPAttestationBrokerIfRequested(); broker {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "SNP attestation broker failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Every CLI flag falls back to an environment variable of the same semantics
+	// so the measured app can be configured purely through the loader's instance-
+	// metadata env injection (see deploy/snp-image/loader fetchMetadataEnv) with no
+	// rebuild: the SHA-256-measured bundle stays byte-identical while runtime
+	// routing (relay URL, ports, bootstrap token) comes from VM metadata.
+	addr := flag.String("addr", envOr("TEE_ADDR", "127.0.0.1:18090"), "listen address")
+	relay := flag.String("relay", envOr("TEE_RELAY", ""), "Hub TeeRelay WebSocket URL: every provider connection egresses as a stream over the Hub's reverse tunnel")
+	// The relay key is part of the same env-driven surface: the measured app
+	// authenticates to the Hub's TeeRelay with it, so a Hub that only admits an
+	// authenticated egress path cannot be bypassed by anything that reaches the
+	// listener, and the instance can be pointed at that Hub by metadata alone.
+	relayKey := flag.String("relay-key", envOr("TEE_RELAY_KEY", ""), "key to present to the Hub's TeeRelay endpoint (empty = the Hub requires none)")
+	maxConns := flag.Int("max-conns", envOrInt("TEE_MAX_CONNS", 0), "max resident provider connections per (provider, host) (0 = default 32)")
+	requestTimeout := flag.Duration("request-timeout", envOrDuration("TEE_REQUEST_TIMEOUT", 2*time.Minute), "bound on a single provider exchange, including streaming sessions (0 = no bound)")
+	seqPath := flag.String("seq", os.Getenv("TEE_SEQ"), "ProviderSeq store file (default <simdir>/seqstore.json)")
+	platformName := flag.String("platform", envOr("TEE_PLATFORM", defaultPlatform), "attestation platform: simulated, sevsnp")
+	includeEvidence := flag.Bool("evidence", envOrBool("TEE_EVIDENCE", true), "embed attestation evidence in every receipt (false = resolve EvidenceHash via evidence retrieval)")
+	caFile := flag.String("ca", os.Getenv("TEE_CA"), "root CA PEM for provider TLS; empty = sim test CA on simulated, system roots on sevsnp")
+	mtls := flag.Bool("mtls", envOrBool("TEE_MTLS", false), "serve the Hub-facing API over mutual TLS: the platform's RA-TLS server certificate (sevsnp) or the sim test certificate (simulated), demanding a Hub client certificate")
+	mtlsClientCA := flag.String("mtls-client-ca", envOr("TEE_MTLS_CLIENT_CA", ""), "PEM CA(s) that sign Hub client certificates; empty defaults to <simdir>/hub-ca.pem (required with -mtls)")
+	// Trust-on-first-use bootstrap: the confidential instance has no out-of-band
+	// channel, so before the Hub can pin our RA-TLS certificate it must fetch it.
+	// A one-shot plain-HTTP listener (gated by TEE_INIT_TOKEN) serves exactly that
+	// leaf over GET /v1/init-cert and nothing else; the Hub never talks TLS to it.
+	initAddr := flag.String("init-addr", envOr("TEE_INIT_ADDR", ""), "plain-HTTP bootstrap listener (e.g. 0.0.0.0:18091); serves /v1/init-cert gated by -init-token")
+	initToken := flag.String("init-token", envOr("TEE_INIT_TOKEN", ""), "bearer token guarding the bootstrap /v1/init-cert endpoint (required with -init-addr)")
 	flag.Parse()
 
 	// Fixtures are idempotent and live under TOKENHIVE_SIM_DIR (default .sim):
@@ -72,6 +105,11 @@ func main() {
 	// sim and cloud — only the file contents differ.
 	if err := shared.EnsureDefaults(); err != nil {
 		log.Fatalf("ensure defaults: %v", err)
+	}
+	if *mtls {
+		if err := shared.EnsureMTLSCerts(); err != nil {
+			log.Fatalf("ensure mtls fixtures: %v", err)
+		}
 	}
 
 	// The whitelist is part of this enclave's measured configuration: load it
@@ -87,12 +125,18 @@ func main() {
 		log.Fatalf("hash policy set: %v", err)
 	}
 
-	epoch, err := buildEpoch(*platformName, policySetHash)
+	epoch, serverTLS, err := buildEpoch(*platformName, policySetHash)
 	if err != nil {
 		log.Fatalf("build platform epoch: %v", err)
 	}
 	if err := shared.WriteTEEIdentity(epoch.Identity()); err != nil {
 		log.Fatalf("write tee identity: %v", err)
+	}
+	// Record this epoch's evidence in the restart-surviving store so a hash-only
+	// receipt (IncludeEvidence=false) resolves against what the verifier saw, and
+	// the /v1/evidence endpoint below can serve it to a Hub on another host.
+	if err := shared.RecordTEEEvidence(epoch.Identity()); err != nil {
+		log.Fatalf("record tee evidence: %v", err)
 	}
 	log.Printf("policy set hash bound into attestation evidence: %x", policySetHash)
 
@@ -164,6 +208,44 @@ func main() {
 	mux.HandleFunc("/v1/credential-key", func(w http.ResponseWriter, r *http.Request) {
 		tee.ServeCredentialKey(inbox, w, r)
 	})
+	// Evidence retrieval: serves the restart-surviving evidence store so a Hub
+	// or auditor can resolve a hash-only receipt's EvidenceHash against a real
+	// (possibly rotated) epoch this TEE presented. GET /v1/evidence/<hex-hash>
+	// returns raw evidence bytes; GET /v1/evidence lists the stored hashes.
+	evStore, err := shared.LoadEvidenceStore()
+	if err != nil {
+		log.Fatalf("open evidence store: %v", err)
+	}
+	evidence.NewHTTPServer(evStore, mux)
+
+	if *mtls {
+		clientCAPath := *mtlsClientCA
+		if clientCAPath == "" {
+			clientCAPath = filepath.Join(shared.ConfigDir(), shared.MTLSClientCAPath)
+		}
+		if serverTLS == nil {
+			log.Fatalf("platform %q provides no RA-TLS server certificate; cannot serve -mtls", *platformName)
+		}
+		cfg, err := shared.ServerMTLSConfig(serverTLS, clientCAPath)
+		if err != nil {
+			log.Fatalf("mtls server config: %v", err)
+		}
+		if err := shared.WriteTEECert(cfg); err != nil {
+			log.Fatalf("publish tee certificate: %v", err)
+		}
+		// Trust-on-first-use bootstrap: hand the exact RA-TLS leaf we serve on the
+		// mTLS plane to any caller that knows the token, so a Hub with no prior pin
+		// can fetch and pin it. The listener is deliberately plain HTTP and serves
+		// this single leaf-only endpoint — nothing else crosses it.
+		if *initAddr != "" {
+			go serveInitCert(*initAddr, *initToken, cfg)
+		}
+		log.Printf("tee (platform=%s, includeEvidence=%t, mtls) listening on https://%s",
+			*platformName, *includeEvidence, *addr)
+		server := &http.Server{Addr: *addr, Handler: mux, TLSConfig: cfg}
+		log.Fatal(server.ListenAndServeTLS("", ""))
+	}
+
 	log.Printf("tee (platform=%s, includeEvidence=%t) listening on http://%s",
 		*platformName, *includeEvidence, *addr)
 	srv := &http.Server{
@@ -199,7 +281,7 @@ func relayHeaders(key string) http.Header {
 func upstreamTLSConfig(platformName, caFile string) (*tls.Config, error) {
 	switch {
 	case caFile != "":
-		pool, err := loadCAPath(caFile)
+		pool, err := shared.LoadCAPath(caFile)
 		if err != nil {
 			return nil, err
 		}
@@ -219,23 +301,102 @@ func upstreamTLSConfig(platformName, caFile string) (*tls.Config, error) {
 	}
 }
 
-func loadCAPath(path string) (*x509.CertPool, error) {
-	der, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read CA %s: %w", path, err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(der) {
-		return nil, fmt.Errorf("no certificates parsed from %s", path)
-	}
-	return pool, nil
-}
-
 // envOr returns the environment variable or a fallback. Used by the sevsnp
-// build for the RA-TLS role name.
+// build for the RA-TLS role name and for every flag's env default.
 func envOr(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
 	}
 	return fallback
+}
+
+// envOrBool parses an environment variable as a boolean, falling back when it
+// is unset (or not a valid boolean).
+func envOrBool(name string, fallback bool) bool {
+	v := os.Getenv(name)
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
+}
+
+// envOrInt parses an environment variable as an integer, falling back when it is
+// unset (or not a valid integer). It keeps the connection cap configurable by
+// instance metadata without a rebuild, like the other measured-app flags.
+func envOrInt(name string, fallback int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+
+// envOrDuration parses an environment variable as a Go duration, falling back
+// when it is unset (or not a valid duration).
+func envOrDuration(name string, fallback time.Duration) time.Duration {
+	v := os.Getenv(name)
+	if v == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fallback
+	}
+	return d
+}
+
+// serveInitCert runs the TOFU bootstrap listener: a plain-HTTP server whose only
+// handler is GET /v1/init-cert, protected by initToken. It returns exactly the
+// RA-TLS leaf PEM the mTLS plane presents, so a Hub can pin it before the first
+// mTLS exchange. The token gates who may read the attested identity; the leaf is
+// public key material and holds nothing secret, but we keep the endpoint
+// unauthenticated-scannable by requiring it.
+func serveInitCert(addr, initToken string, mTLSConfig *tls.Config) {
+	leaf, err := leafCertPEM(mTLSConfig)
+	if err != nil {
+		log.Fatalf("bootstrap: extract RA-TLS leaf: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/init-cert", func(w http.ResponseWriter, r *http.Request) {
+		if initToken != "" && r.FormValue("token") != initToken {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-pem-file")
+		_, _ = w.Write(leaf)
+	})
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatalf("bootstrap listener: %v", err)
+	}
+}
+
+// leafCertPEM extracts the RA-TLS leaf certificate PEM from a server TLS config,
+// mirroring what shared.WriteTEECert writes to disk (the same bytes the Hub pins).
+func leafCertPEM(cfg *tls.Config) ([]byte, error) {
+	var cert *tls.Certificate
+	if cfg.GetCertificate != nil {
+		c, err := cfg.GetCertificate(nil)
+		if err != nil {
+			return nil, err
+		}
+		cert = c
+	} else if len(cfg.Certificates) > 0 {
+		c := cfg.Certificates[0]
+		cert = &c
+	} else {
+		return nil, fmt.Errorf("server TLS config has no certificate to serve")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("parse RA-TLS leaf: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw}), nil
 }

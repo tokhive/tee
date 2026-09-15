@@ -41,6 +41,22 @@ func NewReceiptStore(dir string) *ReceiptStore {
 	return &ReceiptStore{dir: dir}
 }
 
+// Providers lists the provider directories present in the store, sorted.
+func (s *ReceiptStore) Providers() ([]string, error) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, fmt.Errorf("read receipt store: %w", err)
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() {
+			out = append(out, e.Name())
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 // Put writes a receipt for a provider, refusing to overwrite one already held.
 func (s *ReceiptStore) Put(provider string, signed proof.SignedReceipt) error {
 	if err := jobs.ValidateProviderName(provider); err != nil {

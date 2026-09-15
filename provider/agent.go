@@ -67,8 +67,9 @@ type AgentConfig struct {
 	// come online, e.g. ws://127.0.0.1:18085/v1/agent. Required.
 	HubGateURL string
 
-	// SharedKey is the preset shared secret the agent presents at dial-in. It
-	// must match the Hub's AgentSecret or the gate refuses the tunnel. Required.
+	// SharedKey is the preset secret the agent presents at dial-in. It must
+	// match this provider's entry in the Hub's -agent-keys map, or the gate
+	// refuses the tunnel. Required.
 	SharedKey []byte
 
 	// Self announces the agent on registration: which provider it egresses for,

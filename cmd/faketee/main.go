@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
@@ -132,10 +133,17 @@ func queryParam(query, key string) string {
 func main() {
 	addr := flag.String("addr", "127.0.0.1:18091", "listen address")
 	seqPath := flag.String("seq", "", "ProviderSeq store file (default <simdir>/seqstore.json)")
+	mtls := flag.Bool("mtls", false, "serve the Hub-facing API over mutual TLS (sim test certificate, demanding a Hub client certificate)")
+	mtlsClientCA := flag.String("mtls-client-ca", "", "PEM CA(s) that sign Hub client certificates; empty defaults to <simdir>/hub-ca.pem (required with -mtls)")
 	flag.Parse()
 
 	if err := shared.EnsureDefaults(); err != nil {
 		log.Fatalf("ensure defaults: %v", err)
+	}
+	if *mtls {
+		if err := shared.EnsureMTLSCerts(); err != nil {
+			log.Fatalf("ensure mtls fixtures: %v", err)
+		}
 	}
 
 	policies, err := shared.LoadPolicySetAll()
@@ -156,6 +164,12 @@ func main() {
 	}
 	if err := shared.WriteTEEIdentity(epoch.Identity()); err != nil {
 		log.Fatalf("write tee identity: %v", err)
+	}
+	// Record the epoch in the restart-surviving evidence store so a hash-only
+	// receipt (from a TEE with -evidence=false) still verifies offline. The
+	// /v1/evidence endpoint serves the same store to a remote Hub.
+	if err := shared.RecordTEEEvidence(epoch.Identity()); err != nil {
+		log.Fatalf("record tee evidence: %v", err)
 	}
 
 	// The A-layer fake never egresses: its transport answers with canned bytes,
@@ -201,6 +215,35 @@ func main() {
 	mux.HandleFunc("/v1/credential-key", func(w http.ResponseWriter, r *http.Request) {
 		tee.ServeCredentialKey(inbox, w, r)
 	})
+	// Evidence retrieval, mirroring cmd/tee: serve the restart-surviving store
+	// so a remote Hub or auditor resolves a hash-only receipt's EvidenceHash.
+	evStore, err := shared.LoadEvidenceStore()
+	if err != nil {
+		log.Fatalf("open evidence store: %v", err)
+	}
+	evidence.NewHTTPServer(evStore, mux)
+
+	if *mtls {
+		clientCAPath := *mtlsClientCA
+		if clientCAPath == "" {
+			clientCAPath = filepath.Join(shared.ConfigDir(), shared.MTLSClientCAPath)
+		}
+		serverTLS := shared.PlatformServerTLS(epoch)
+		if serverTLS == nil {
+			log.Fatalf("simulated platform provides no RA-TLS server certificate; cannot serve -mtls")
+		}
+		cfg, err := shared.ServerMTLSConfig(serverTLS, clientCAPath)
+		if err != nil {
+			log.Fatalf("mtls server config: %v", err)
+		}
+		if err := shared.WriteTEECert(cfg); err != nil {
+			log.Fatalf("publish tee certificate: %v", err)
+		}
+		log.Printf("faketee (in-memory A-layer TEE, real service, mtls) listening on https://%s", *addr)
+		server := &http.Server{Addr: *addr, Handler: mux, TLSConfig: cfg}
+		log.Fatal(server.ListenAndServeTLS("", ""))
+	}
+
 	log.Printf("faketee (in-memory A-layer TEE, real service) listening on http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }

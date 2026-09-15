@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadSourceS3",
+      "Effect": "Allow",
+      "Action": ["s3:GetBucketLocation", "s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::snp-vmimport-*", "arn:aws:s3:::snp-vmimport-*/*"]
+    },
+    {
+      "Sid": "WriteEC2Snapshot",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:ModifySnapshotAttribute",
+        "ec2:CopySnapshot",
+        "ec2:DescribeSnapshots",
+        "ec2:RegisterImage",
+        "ec2:DescribeImages"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

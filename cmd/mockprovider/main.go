@@ -19,6 +19,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -161,6 +162,13 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:18080", "listen address")
 	useTLS := flag.Bool("tls", true, "serve over HTTPS using a generated test CA")
 	statsAddr := flag.String("stats-addr", "127.0.0.1:18081", "plain-HTTP listener for /stats and /reset")
+	// Fixed identity mode: on a real deployment the provider's CA must reach the
+	// TEE (which lives on another host with no sshd), so the CA rides inside the
+	// measured bundle while these cert/key files deploy with this process. The
+	// given CA is republished at <simdir>/ca.pem for local trust lookups.
+	caFile := flag.String("ca", "", "CA PEM to trust and republish; with -cert/-key serves that fixed identity instead of generating one")
+	certFile := flag.String("cert", "", "server certificate PEM (requires -ca and -key)")
+	keyFile := flag.String("key", "", "server private key PEM (requires -ca and -cert)")
 	flag.Parse()
 
 	// The provider's one HTTP server, whose connections are the thing being
@@ -188,8 +196,29 @@ func main() {
 	}()
 
 	if *useTLS {
+		// Fixtures (rates.json, policy.cbor) live in the shared sim dir; the Hub
+		// fatally requires them at startup, so write them regardless of identity.
 		if err := shared.EnsureDefaults(); err != nil {
 			log.Fatalf("ensure defaults: %v", err)
+		}
+		if *caFile != "" {
+			if *certFile == "" || *keyFile == "" {
+				log.Fatal("mockprovider -ca requires -cert and -key")
+			}
+			caPEM, err := os.ReadFile(*caFile)
+			if err != nil {
+				log.Fatalf("read CA: %v", err)
+			}
+			cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+			if err != nil {
+				log.Fatalf("load cert/key: %v", err)
+			}
+			if err := os.WriteFile(shared.CAPEMPath(), caPEM, 0o644); err != nil {
+				log.Fatalf("write CA: %v", err)
+			}
+			srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+			log.Printf("mockprovider (TLS) listening on https://%s", *addr)
+			log.Fatal(srv.ListenAndServeTLS("", ""))
 		}
 		cfg, caPEM, err := shared.GenCerts()
 		if err != nil {

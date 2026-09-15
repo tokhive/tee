@@ -30,7 +30,11 @@ func (t *HTTPTEE) OpenSession(ctx context.Context, spec jobs.Spec) (SessionConn,
 		return nil, fmt.Errorf("encode session request: %w", err)
 	}
 
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, t.SessionURL, nil)
+	dialer := t.Dialer
+	if dialer == nil {
+		dialer = websocket.DefaultDialer
+	}
+	conn, _, err := dialer.DialContext(ctx, t.SessionURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("dial TEE session: %w", err)
 	}
