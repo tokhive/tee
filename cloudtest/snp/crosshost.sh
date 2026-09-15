@@ -15,6 +15,8 @@
 #                confidential instance, no ordinary host needed)
 #   ./crosshost.sh up        launch ordinary host + confidential tee (crosshost.json)
 #   ./crosshost.sh up --single  launch single-instance mode (one confidential tee)
+#   ./crosshost.sh up --tee-only  launch ONLY the confidential tee (cross-host
+#               bundle's real tee binary), no ordinary host / Hub anywhere
 #   ./crosshost.sh fetch     ssh to host: pull tee RA-TLS cert via /v1/init-cert
 #   ./crosshost.sh deploy    scp binaries+certs, start mockprovider/hub/agent on host
 #   ./crosshost.sh drive     curl a chat request via the host's Hub
@@ -132,8 +134,11 @@ cmd_build_single() {
 
 cmd_up() {
   [ -f "${CERTS_DIR}/hub-ca.pem" ] || { echo "run ./crosshost.sh build first (certs)"; exit 1; }
-  local a token single="" name
-  [[ "${2:-}" == "--single" ]] && single="--single" && name="snp-tokenhive-single" || name="snp-tokenhive"
+  local a token mode="" name="snp-tokenhive"
+  case "${2:-}" in
+    --single)   mode="--single";   name="snp-tokenhive-single" ;;
+    --tee-only) mode="--tee-only" ;;
+  esac
   a="$(ami_id "${name}")"
   log "AMI ${a}"
   # Read or mint the one-shot bootstrap token (stick to one so a re-up reuses).
@@ -143,7 +148,7 @@ cmd_up() {
     token="$(openssl rand -hex 16)"
     printf '%s\n' "${token}" > "${CERTS_DIR}/init-token"
   fi
-  ( cd "${HERE}" && "${PY}" crosshost.py "${a}" --token "${token}" ${single} ) | tee -a "${LOG_DIR}/run.log"
+  ( cd "${HERE}" && "${PY}" crosshost.py "${a}" --token "${token}" ${mode} ) | tee -a "${LOG_DIR}/run.log"
   # Pin the attested app identity for the Hub: the AMI embeds the very tar file
   # whose sha256 the loader exports as SNP_APP_HASH, so record it in state for
   # the later deploy to pass as -expected-app (single mode reads the env instead).
@@ -246,10 +251,18 @@ cmd_verify() {
   # Single-instance mode has no separate host: the supervisor's tee+hub+agent+
   # mockprovider all log to the loader console inside the confidential instance,
   # so verify just dumps that console (which also holds the attestation proof).
-  # The tee record carries mode=single from crosshost.py; a stale "host" key
-  # left over from an earlier cross-host run must not flip us into host mode.
-  if [[ "$(tee_field mode)" == "single" ]]; then
+  # --tee-only has no host either: the cross-host tee logs to the same console.
+  # The tee record carries mode=single / tee-only from crosshost.py; a stale
+  # "host" key left over from an earlier cross-host run must not flip us into
+  # host mode.
+  local mode; mode="$(tee_field mode)"
+  if [[ "${mode}" == "single" ]]; then
     log "step: verify single-instance mode (dump confidential tee console)"
+    dump_tee_console "$(tee_field public_ip)"
+    return
+  fi
+  if [[ "${mode}" == "tee-only" ]]; then
+    log "step: verify tee-only mode (dump confidential tee console; no ordinary host)"
     dump_tee_console "$(tee_field public_ip)"
     return
   fi
@@ -278,6 +291,6 @@ case "${1:-}" in
   verify)  cmd_verify ;;
   down)    cmd_down "${2:-}" ;;
   *)
-    sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1 ;;
 esac
