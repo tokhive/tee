@@ -312,6 +312,11 @@ def main() -> None:
             "ami_id": ami_id,
             "user_data_token": token,
             "mode": "single" if single else ("tee-only" if tee_only else "cross-host"),
+            # Where this tee will dial for a provider connection. Recorded so a
+            # decoupled deploy is self-describing: with no ordinary host in this
+            # state, nothing else on disk says which Hub address the tee aims at
+            # (or that --host-ip was left out and it holds the inert placeholder).
+            "relay_url": relay_url,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
         state["tee"] = tee

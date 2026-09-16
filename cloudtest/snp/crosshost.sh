@@ -16,7 +16,10 @@
 #   ./crosshost.sh up        launch ordinary host + confidential tee (crosshost.json)
 #   ./crosshost.sh up --single  launch single-instance mode (one confidential tee)
 #   ./crosshost.sh up --tee-only  launch ONLY the confidential tee (cross-host
-#               bundle's real tee binary), no ordinary host / Hub anywhere
+#               bundle's real tee binary), no ordinary host / Hub anywhere.
+#               Add --host-ip <hub-ip> when the Hub lives on a separate machine:
+#               it becomes the tee's TEE_RELAY target (the address as the tee
+#               sees the Hub, i.e. the private IP when both share this VPC/SG).
 #   ./crosshost.sh fetch     ssh to host: pull tee RA-TLS cert via /v1/init-cert
 #   ./crosshost.sh deploy    scp binaries+certs, start mockprovider/hub/agent on host
 #   ./crosshost.sh drive     curl a chat request via the host's Hub
@@ -233,11 +236,30 @@ cmd_build_single() {
 
 cmd_up() {
   [ -f "${CERTS_DIR}/hub-ca.pem" ] || { echo "run ./crosshost.sh build first (certs)"; exit 1; }
-  local a token mode="" name="snp-tokenhive" digest
-  case "${2:-}" in
-    --single)   mode="--single";   name="snp-tokenhive-single" ;;
-    --tee-only) mode="--tee-only" ;;
-  esac
+  local a token mode="" name="snp-tokenhive" digest host_ip="" host_arg=""
+  shift || true                       # drop the "up" verb
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --single)   mode="--single";   name="snp-tokenhive-single" ;;
+      --tee-only) mode="--tee-only" ;;
+      --host-ip)  shift; host_ip="${1:-}" ;;
+      *) echo "up: unknown option $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+  # --host-ip names the Hub's address as the TEE reaches it. Only a bare tee
+  # needs it: cross-host mode derives the relay from the ordinary host it just
+  # launched, and single mode runs the Hub on loopback with no relay at all.
+  # Refusing the mismatch is the point — ignoring it would leave a decoupled
+  # deploy quietly aimed at the inert placeholder relay, and nothing dispatches
+  # jobs without a Hub to notice.
+  if [[ -n "${host_ip}" ]]; then
+    [[ "${mode}" == "--tee-only" ]] || {
+      echo "up: --host-ip requires --tee-only (cross-host derives the relay itself; --single has none)" >&2
+      exit 2
+    }
+    host_arg="--host-ip ${host_ip}"
+  fi
   a="$(ami_id "${name}")"
   log "AMI ${a}"
   # Pin the attested app identity for the Hub: the AMI embeds the app bundle
@@ -262,7 +284,7 @@ cmd_up() {
     token="$(openssl rand -hex 16)"
     printf '%s\n' "${token}" > "${CERTS_DIR}/init-token"
   fi
-  ( cd "${HERE}" && "${PY}" crosshost.py "${a}" --token "${token}" ${mode} ) | tee -a "${LOG_DIR}/run.log"
+  ( cd "${HERE}" && "${PY}" crosshost.py "${a}" --token "${token}" ${mode} ${host_arg} ) | tee -a "${LOG_DIR}/run.log"
   # Record it only now that the instance exists: crosshost.py owns the state
   # file (it creates the tee record merged into below), and an identity recorded
   # for an instance that never came up would pin the next deploy to an app that
@@ -426,6 +448,6 @@ case "${1:-}" in
   verify)  cmd_verify ;;
   down)    cmd_down "${2:-}" ;;
   *)
-    sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    awk 'NR==1{next} /^set -euo/{exit} {sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}"
     exit 1 ;;
 esac
