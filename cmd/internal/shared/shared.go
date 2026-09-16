@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"math"
 	"math/big"
 	"net"
 	"os"
@@ -46,6 +47,18 @@ const (
 	providerHost  = "127.0.0.1:18080"
 	providerPath  = "/v1/chat/completions"
 )
+
+// policyNoExpiry is the ExpiresAt stamped on the Hub-predefined public
+// whitelist. That policy is deployment scaffolding every seller onboards
+// against, not a rotating per-seller grant, so its window is deliberately left
+// effectively open: a lapsed default policy would turn every seller
+// unserviceable the moment the clock crossed it, and nothing would say so until
+// a job was refused. It is still replaceable — a policy with a newer IssuedAt
+// wins on install (see policy.Set.InstallAll) — the calendar just never forces
+// it. math.MaxInt64 seconds since the epoch is ~292 billion years, and
+// policy.ValidateAt only requires ExpiresAt > IssuedAt, so this simply never
+// trips ErrPolicyExpired.
+const policyNoExpiry = int64(math.MaxInt64)
 
 // ConfigDir returns the simulation working directory. Override with
 // TOKENHIVE_SIM_DIR to keep runs isolated.
@@ -241,7 +254,7 @@ func providerPolicy(provider string) policy.Policy {
 		Rules:     rules,
 		Limits:    limits,
 		IssuedAt:  now.Unix(),
-		ExpiresAt: now.Add(365 * 24 * time.Hour).Unix(),
+		ExpiresAt: policyNoExpiry,
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 )
 
 // TestWritePolicyDirRoundTrips pins the "bake the whitelist into a policy
@@ -67,5 +68,26 @@ func TestWritePolicyDirRoundTrips(t *testing.T) {
 	}
 	if gotHash != canonicalHash {
 		t.Fatalf("round-tripped set hash %x != canonical %x", gotHash, canonicalHash)
+	}
+}
+
+// TestDefaultPolicyDoesNotLapse pins the "the public default whitelist is
+// open-ended" contract. The default policy is what every seller onboards
+// against, so a finite window would eventually start refusing every job with
+// ErrPolicyExpired while the policy file itself still looked correct — a
+// failure that only shows up as refusals, long after the change that caused it.
+func TestDefaultPolicyDoesNotLapse(t *testing.T) {
+	// ~year 36812: far past any finite grant yet still a representable
+	// timestamp, so an open-ended policy passes and a term of years fails.
+	far := time.Unix(1<<40, 0)
+
+	for _, provider := range []string{providerName, providerCheap} {
+		p := providerPolicy(provider)
+		if err := p.Validate(); err != nil {
+			t.Fatalf("providerPolicy(%q).Validate: %v", provider, err)
+		}
+		if err := p.ValidateAt(far); err != nil {
+			t.Fatalf("providerPolicy(%q) lapsed before t=%d: %v", provider, far.Unix(), err)
+		}
 	}
 }
