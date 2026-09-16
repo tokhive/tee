@@ -65,12 +65,20 @@ func (v Verifier) CheckEvidence(id platform.Identity) error {
 	return nil
 }
 
-// CheckEvidenceForDeployment refuses deployment-bound verification. The
-// deployment's policy files are loaded at runtime from outside the measured
-// bundle, so this verifier cannot attest the supplied digest: accepting any
-// evidence here would let two deployments with different policies pass the
-// same hardware check. Callers that need the binding must pin the policy
-// digest where the platform can prove it.
+// CheckEvidenceForDeployment verifies the deployment binding by verifying the
+// image. The whitelist is staged into the measured bundle as ./policy, so the
+// bundle digest this evidence attests — the attested application identity —
+// covers the exact policy bytes the enclave enforces. Rotating the whitelist
+// changes that digest; there is no second value left to compare, and the
+// supplied digest is therefore not read.
+//
+// It refuses when no application identity is expected. Without one CheckEvidence
+// asserts nothing about which image ran, so nothing would pin the policy either
+// and this would accept any whitelist from any enclave — the outcome this method
+// exists to prevent.
 func (v Verifier) CheckEvidenceForDeployment(id platform.Identity, _ [32]byte) error {
-	return errors.New("aws sev-snp evidence cannot attest the deployment policy set: policy files are loaded at runtime, outside the measured bundle")
+	if v.ExpectedApp == "" {
+		return errors.New("aws sev-snp deployment binding requires an expected application identity: the measured bundle is what pins the policy set")
+	}
+	return v.CheckEvidence(id)
 }
