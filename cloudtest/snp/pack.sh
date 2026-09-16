@@ -91,13 +91,13 @@ bundle_mp() {
 # Requires SNP_HUB_CA / SNP_HUB_CERT / SNP_HUB_KEY (the gencerts outputs).
 # bundle_policy stages the deployment whitelist INSIDE the measured bundle as
 # ./policy/*, so the bytes the enclave enforces (and the Hub advertises on
-# /v1/policies) are covered by the bundle digest = SNP_APP_HASH. A rotated
+# /v1/policies) are covered by the bundle digest = SNP_APP_HASH. Changing the
 # whitelist therefore changes the attestation fingerprint instead of silently
-# widening what the enclave will accept. The operator supplies their real
-# whitelist (policy.cbor + policies/<provider>.cbor, the layout LoadPolicySetAll
-# reads) via SNP_POLICY_DIR; the supervisor points tee and hub at ./policy with
-# -policy-dir. Without it the policy is NOT baked in and the instance must get
-# its whitelist some other provisioning path.
+# widening what the enclave will accept — which is also why no code path inside
+# the enclave may rewrite it. The operator supplies their real whitelist (the
+# single policy.cbor LoadPolicy reads) via SNP_POLICY_DIR; the supervisor points
+# tee and hub at ./policy with -policy-dir. Without it the policy is NOT baked
+# in and the instance must get its whitelist some other provisioning path.
 bundle_policy() {
     local stage="$1"
     if [[ -n "${SNP_POLICY_DIR:-}" && -d "${SNP_POLICY_DIR}" ]]; then
