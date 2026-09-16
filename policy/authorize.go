@@ -34,13 +34,14 @@ type Decision struct {
 	MaxResponseBytes uint64
 	MaxBodyBytes     uint64
 
-	// PolicyHash identifies the exact policy revision this decision was made
-	// under. The TEE copies it into the execution receipt so a provider can
-	// later tell which revision of its own rules authorised a spend.
+	// PolicyHash identifies the whitelist this decision was made under. The
+	// TEE copies it into the execution receipt, so a provider auditing a spend
+	// gets the enclave's own signed statement of which whitelist permitted it —
+	// the part of the proof a verifier can compare against the deployment.
 	//
-	// It is resolved as part of the decision rather than looked up afterwards
-	// because a policy can be rotated at any moment: asking for the hash
-	// separately could name a revision that was never applied to this job.
+	// It is resolved as part of the decision rather than read back later so the
+	// two can never disagree: a hash looked up separately would describe
+	// whatever document is loaded at that moment, not the one that ran here.
 	PolicyHash []byte
 }
 

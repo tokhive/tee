@@ -32,8 +32,10 @@ const bundleDir = "/run/bundle"
 // bundle actually carries a ./policy directory. pack.sh stages the deployment
 // whitelist there, so pointing tee and hub at it means both read the whitelist
 // from inside the measured tar (whose digest is SNP_APP_HASH) instead of a
-// runtime mount — a rotated policy changes the attestation fingerprint instead
-// of silently widening what the enclave accepts.
+// path that could be changed under the running enclave. The whitelist is fixed
+// for the life of the deployment, so changing it is a rebuild — which moves the
+// attestation fingerprint rather than silently widening what the enclave
+// accepts.
 func bundlePolicyArgs() []string {
 	d := filepath.Join(bundleDir, "policy")
 	if _, err := os.Stat(d); err == nil {
