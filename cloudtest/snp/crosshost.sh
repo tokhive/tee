@@ -38,6 +38,13 @@ setup_logs
 
 CLOUDTEST="${HERE}/.."
 CERTS_DIR="${HERE}/.certs"
+# POLICY_DIR is the deployment whitelist baked into the measured bundle. The
+# enclave loads exactly this file at startup and refuses to serve without it, so
+# it is not optional build input: a bundle built without it produces an AMI whose
+# TEE cannot come up. It is generated once and reused, because its bytes are
+# measured — re-emitting it on every build would change SNP_APP_HASH with no
+# code change. Set SNP_POLICY_DIR to ship an operator-authored whitelist.
+POLICY_DIR="${SNP_POLICY_DIR:-${CERTS_DIR}/policy}"
 REPO_ROOT="${HERE}/../../.."            # reclaim-tee
 DEPLOY_DIR="${REPO_ROOT}/deploy"
 HOSTS="${CLOUDTEST}/crosshost.json"
@@ -83,6 +90,17 @@ print(img[-1]["ImageId"])
 PY
 }
 
+# ensure_policy materializes the deployment whitelist ONCE and reuses it.
+ensure_policy() {
+  if [ -f "${POLICY_DIR}/policy.cbor" ]; then
+    log "reusing deployment whitelist ${POLICY_DIR}/policy.cbor"
+    return
+  fi
+  mkdir -p "${POLICY_DIR}"
+  ( cd "${REPO_ROOT}" && go run ./tokenhive/cmd/tee -emit-policy-dir "${POLICY_DIR}" )
+  log "deployment whitelist -> ${POLICY_DIR}/policy.cbor"
+}
+
 # ensure_certs generates the Hub↔TEE and mock-provider TLS fixtures ONCE and
 # reuses them across every build: the CAs are baked into each AMI's bundle at
 # build time, and the same CAs must sign the client/server certs deployed
@@ -99,9 +117,11 @@ ensure_certs() {
 }
 
 cmd_build() {
-  log "step: build (certs + real-tee bundle + AMI + linux binaries)"
+  log "step: build (certs + policy + real-tee bundle + AMI + linux binaries)"
   ensure_certs
-  ( cd "${HERE}" && SNP_HUB_CA="${CERTS_DIR}/hub-ca.pem" \
+  ensure_policy
+  ( cd "${HERE}" && SNP_POLICY_DIR="${POLICY_DIR}" \
+      SNP_HUB_CA="${CERTS_DIR}/hub-ca.pem" \
       SNP_MP_CA="${CERTS_DIR}/mp-ca.pem" SNP_MP_CERT="${CERTS_DIR}/mp-cert.pem" SNP_MP_KEY="${CERTS_DIR}/mp-key.pem" \
       ./pack.sh build )
   local bundle; bundle="${TOKENHIVE_OUT_BUNDLE:-${CLOUDTEST}/bin/tokenhive-app-bundle.tar}"
@@ -113,12 +133,14 @@ cmd_build() {
 }
 
 cmd_build_single() {
-  log "step: build (certs + supervisor bundle + AMI)"
+  log "step: build (certs + policy + supervisor bundle + AMI)"
   ensure_certs
+  ensure_policy
   # The supervisor bundle needs the Hub's TLS identity (hub-cert/key) and the
   # mock provider's TLS identity (mp-cert/key), which the cross-host bundle
   # does not carry (hub and mockprovider run on the ordinary host there).
   ( cd "${HERE}" && TOKENHIVE_BUILD_SINGLE=1 \
+      SNP_POLICY_DIR="${POLICY_DIR}" \
       SNP_HUB_CA="${CERTS_DIR}/hub-ca.pem" \
       SNP_HUB_CERT="${CERTS_DIR}/hub-cert.pem" \
       SNP_HUB_KEY="${CERTS_DIR}/hub-key.pem" \
