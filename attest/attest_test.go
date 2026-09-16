@@ -13,9 +13,17 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 )
 
+// testSigner is a signer plus the whitelist digest its epoch was configured
+// with. A receipt must name the policy its enclave enforced, so the fixture that
+// builds receipts has to know which one that was.
+type testSigner struct {
+	*proof.Signer
+	policy [32]byte
+}
+
 // makeSigner returns a signer bound to a fresh simulated epoch, plus the epoch's
 // public identity for populating an evidence cache.
-func makeSigner(t *testing.T, bound [32]byte) (*proof.Signer, platform.Identity) {
+func makeSigner(t *testing.T, bound [32]byte) (testSigner, platform.Identity) {
 	t.Helper()
 	var e platform.Epoch
 	var err error
@@ -27,14 +35,12 @@ func makeSigner(t *testing.T, bound [32]byte) (*proof.Signer, platform.Identity)
 	if err != nil {
 		t.Fatalf("new epoch: %v", err)
 	}
-	return proof.NewSigner(e), e.Identity()
+	return testSigner{Signer: proof.NewSigner(e), policy: bound}, e.Identity()
 }
 
 // makeReceipt signs a minimal-but-structurally-valid receipt so the signature
 // and structural checks in Check run against a real receipt.
-func makeReceipt(t *testing.T, signer interface {
-	Sign(receipt proof.Receipt) (proof.SignedReceipt, error)
-}) proof.SignedReceipt {
+func makeReceipt(t *testing.T, signer testSigner) proof.SignedReceipt {
 	t.Helper()
 	jobID := make([]byte, proof.JobIDLength)
 	_, _ = rand.Read(jobID)
@@ -58,6 +64,9 @@ func makeReceipt(t *testing.T, signer interface {
 		FinishedAt:    now,
 		RequestBytes:  0,
 		ProviderSeq:   1,
+		// The whitelist the signing enclave was configured with: a receipt that
+		// did not name it would not be a proof of what the enclave enforced.
+		PolicyHash: signer.policy[:],
 	}
 	signed, err := signer.Sign(receipt)
 	if err != nil {
@@ -72,7 +81,7 @@ func defaultConfig(t *testing.T, fetcher Fetcher, policyHash [32]byte) *Verifier
 		AllowedPlatforms: []string{simulated.Platform},
 		ByPlatform:       map[string]platform.EvidenceVerifier{simulated.Platform: simulated.Verifier{}},
 		Fetcher:          fetcher,
-		PolicyHash:    policyHash,
+		PolicyHash:       policyHash,
 	}
 	v, err := New(cfg)
 	if err != nil {
@@ -221,7 +230,7 @@ func TestDeploymentBindingEnforced(t *testing.T) {
 	cfg := Config{
 		AllowedPlatforms: []string{simulated.Platform},
 		ByPlatform:       map[string]platform.EvidenceVerifier{simulated.Platform: simulated.Verifier{}},
-		PolicyHash:    policyHash,
+		PolicyHash:       policyHash,
 	}
 	deployVer, err := New(cfg)
 	if err != nil {
@@ -241,6 +250,18 @@ func TestDeploymentBindingEnforced(t *testing.T) {
 	looseSigner.IncludeEvidence = true
 	if err := deployVer.Check(makeReceipt(t, looseSigner)); err == nil {
 		t.Fatal("Check accepted an unbound receipt against a deployment-bound verifier")
+	}
+
+	// An enclave configured with the pinned policy, signing a receipt that names
+	// another one. The signature is genuine and the evidence is bound, so this
+	// is caught only by comparing the receipt's own statement of its whitelist —
+	// which is the assertion that makes the policy part of the execution proof.
+	misnamed := makeReceipt(t, testSigner{
+		Signer: boundSigner.Signer,
+		policy: sha256Of([]byte("some other whitelist")),
+	})
+	if err := deployVer.Check(misnamed); !errors.Is(err, ErrPolicyMismatch) {
+		t.Fatalf("Check(receipt naming another policy) = %v, want %v", err, ErrPolicyMismatch)
 	}
 }
 

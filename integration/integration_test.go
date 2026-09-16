@@ -284,6 +284,12 @@ func TestJobToReceipt(t *testing.T) {
 // check by comparing hashes rather than by trusting the receipt's own copy of
 // the request fields.
 func TestReceiptDetectsASwappedRequest(t *testing.T) {
+	// Every receipt names the whitelist its enclave enforced.
+	policyDigest := make([]byte, proof.PolicyHashLength)
+	if _, err := rand.Read(policyDigest); err != nil {
+		t.Fatalf("policy digest: %v", err)
+	}
+
 	epoch := newEpoch(t)
 
 	original := jobs.Spec{
@@ -329,6 +335,7 @@ func TestReceiptDetectsASwappedRequest(t *testing.T) {
 		Completion:    proof.CompletionComplete,
 		StartedAt:     now.Unix(),
 		FinishedAt:    now.Unix() + 1,
+		PolicyHash:    policyDigest,
 	}
 	signedReceipt, err := proof.NewSigner(epoch).Sign(receipt)
 	if err != nil {

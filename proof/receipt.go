@@ -130,14 +130,17 @@ type Receipt struct {
 	FinishedAt    int64           `cbor:"14,keyasint"`
 	Attestation   *AttestationRef `cbor:"15,keyasint,omitempty"`
 
-	// PolicyHash identifies the whitelist policy the TEE enforced when it ran
-	// the job. Without it a receipt proves that an enclave produced a response
-	// but not that it stayed inside the bounds the provider's whitelist set,
-	// which is the half of the guarantee a provider actually cares about.
+	// PolicyHash identifies the whitelist the TEE enforced when it ran the job.
+	// Without it a receipt proves an enclave produced a response but not what
+	// that enclave was permitted to do, which is the half of the guarantee the
+	// provider actually cares about: the point of running the job in an enclave
+	// is that the whitelist could not be talked out of.
 	//
-	// Optional so that a receipt stays valid in contexts where no policy was
-	// consulted; the TEE is expected to populate it on every normal job.
-	PolicyHash []byte `cbor:"16,keyasint,omitempty"`
+	// Mandatory. A TEE is configured with a policy before it serves anything,
+	// so a receipt that names none is not a weaker proof, it is an unexplained
+	// one — and a verifier that pins the deployment's whitelist would otherwise
+	// have nothing to compare against.
+	PolicyHash []byte `cbor:"16,keyasint"`
 
 	// RequestBytes is the size of the request body the TEE actually sent to the
 	// provider. The TEE already computes len(body) to enforce MaxResponseBytes,
@@ -193,7 +196,7 @@ func (r Receipt) Validate() error {
 	if len(r.ResponseHeadersHash) != 0 && len(r.ResponseHeadersHash) != StreamHashLength {
 		return fmt.Errorf("%w: length %d, want %d", ErrInvalidHeaderHash, len(r.ResponseHeadersHash), StreamHashLength)
 	}
-	if len(r.PolicyHash) != 0 && len(r.PolicyHash) != PolicyHashLength {
+	if len(r.PolicyHash) != PolicyHashLength {
 		return fmt.Errorf("%w: length %d, want %d", ErrInvalidPolicyHash, len(r.PolicyHash), PolicyHashLength)
 	}
 	if !r.Completion.Valid() {

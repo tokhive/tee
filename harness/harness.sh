@@ -56,6 +56,38 @@ cd "$REPO" || exit 1
 
 echo "==> repo: $REPO"
 
+# wipe removes files and directories without ever issuing one bulk unlink.
+#
+# Nothing in this script measures anything useful against leftover state: every
+# receipt-count assertion below assumes the scenario started from a known store.
+# A single "rm -rf" over a directory holding a few hundred receipts can be
+# refused outright (deletion guards exist, and so do slow filesystems), and a
+# refused wipe is not a harmless no-op — it turns a real assertion into a
+# measurement of the previous scenario. Removing in small batches keeps the
+# cleanup as unconditional as it reads.
+wipe() {
+  local path before after
+  for path in "$@"; do
+    before=0
+    if [ -d "$path" ]; then
+      before="$(find "$path" -type f 2>/dev/null | wc -l | tr -d ' ')"
+      # No stderr suppression: a refused delete must be visible here, not
+      # silently inherited by the next scenario's receipt count.
+      find "$path" -type f -print0 2>/dev/null | xargs -0 -n 40 rm -f
+      rm -rf "$path"
+      after="$(find "$path" -type f 2>/dev/null | wc -l | tr -d ' ')"
+    else
+      rm -f "$path"
+      after=0
+    fi
+    if [ "$before" != "$after" ] || [ "$before" -gt 0 ]; then
+      echo "    [wipe] $path: $before -> $after"
+    fi
+  done
+  return 0
+}
+
+
 # --- kill any stale simulation processes from an interrupted prior run -----
 # (a leftover faketee would still hold :18090 and serve an old policy/seqstore)
 pkill -f "$BIN/" 2>/dev/null
@@ -71,7 +103,7 @@ for pkg in mockprovider faketee hub tee agent streamer sessiondriver; do
 done
 
 # --- fresh state ---------------------------------------------------------
-rm -rf "$SIM"
+wipe "$SIM"
 mkdir -p "$SIM"
 
 wait_for_port() {
@@ -163,7 +195,7 @@ echo "    sending 1 request after restart; expect seq to continue, not reset:"
 # --- 7. ProviderSeq gap detection ---------------------------------------
 section "7. ProviderSeq gap: Hub hides one record, audit must catch it"
 echo "    (reset store + restart faketee for an isolated demo)"
-rm -rf "$SIM/receipts" "$SIM/seqstore.json"
+wipe "$SIM/receipts" "$SIM/seqstore.json"
 kill "$TEE_PID" 2>/dev/null; wait "$TEE_PID" 2>/dev/null
 "$BIN/faketee" -addr "127.0.0.1:$TEE_PORT" -seq "$SIM/seqstore.json" > "$SIM/faketee3.log" 2>&1 &
 TEE_PID=$!
@@ -177,7 +209,7 @@ echo "    --> auditing the receipt store:"
 # --- 8. quota refuses before dispatch ------------------------------------
 section "8. quota: 3 attempts, tenant limited to 2"
 echo "    (fresh store and seqstore so the audit is unambiguous)"
-rm -rf "$SIM/receipts" "$SIM/seqstore.json"
+wipe "$SIM/receipts" "$SIM/seqstore.json"
 kill "$TEE_PID" 2>/dev/null; wait "$TEE_PID" 2>/dev/null
 "$BIN/faketee" -addr "127.0.0.1:$TEE_PORT" -seq "$SIM/seqstore.json" > "$SIM/faketee4.log" 2>&1 &
 TEE_PID=$!
@@ -259,7 +291,7 @@ wait_for_port 127.0.0.1 "$TEE_A"
 # receipts left over from scenarios 1-8 carry ProviderSeq 1..N for the same
 # provider, and a fresh sequence colliding with them would suppress the very
 # "[receipt]" lines scenarios 9-12 assert on.
-rm -rf "$SIM/receipts"
+wipe "$SIM/receipts"
 
 echo "    one normal request over the real path (one-shot mode: the hub registers"
 echo "    the token to this TEE directly, as a dialing agent would through a resident hub)"
@@ -287,7 +319,7 @@ TEE_B_PID=$!
 wait_for_port 127.0.0.1 "$TEE_B"
 
 # Fresh store so the failure receipt's sequence is unambiguous.
-rm -rf "$SIM/receipts"
+wipe "$SIM/receipts"
 
 echo "    launching a slow request (provider sleeps 2s) in the background:"
 "$BIN/hub" -tee "http://127.0.0.1:$TEE_B" -credential "$TOKEN_OAI" -query "fault=slow" > "$SIM/hub-slow.log" 2>&1 &
@@ -365,7 +397,7 @@ echo "    starting fresh real tee C on :$TEE_C, egressing via the reverse tunnel
 # Fresh TEE, fresh seqstore, so the shared receipt store must be isolated too —
 # otherwise tee C's seq 1..N collide with tee A's receipts from scenarios 9-12
 # and the "[receipt]" lines below never print.
-rm -rf "$SIM/receipts"
+wipe "$SIM/receipts"
 "$BIN/tee" -addr "127.0.0.1:$TEE_C" -relay "$RT_HUB_WS/v1/relay" -relay-key "$RELAY_SECRET" \
   -seq "$SIM/seqstore-teec.json" > "$SIM/teeC.log" 2>&1 &
 TEE_C_PID=$!
@@ -549,7 +581,7 @@ kill "$TEE_D_PID" "$HUB_API_PID" 2>/dev/null; wait "$TEE_D_PID" "$HUB_API_PID" 2
 section "16. Anthropic /v1/messages + OpenAI /v1/responses user APIs"
 
 echo "    (fresh hub + stores so receipt counts are unambiguous)"
-rm -rf "$SIM/receipts"
+wipe "$SIM/receipts"
 "$BIN/hub" -serve "127.0.0.1:$HUB_API_PORT" -host "127.0.0.1:$MP_PORT" \
   -tee "http://127.0.0.1:$TEE_D" -agent-keys "$AGENT_KEYS" \
   -relay-key "$RELAY_SECRET" \
@@ -690,7 +722,7 @@ TEE_G=18091
 section "17. streaming session via the Hub user API: select + settle + duplex"
 
 echo "    (fresh hub + stores so the receipt count is unambiguous)"
-rm -rf "$SIM/receipts"
+wipe "$SIM/receipts"
 "$BIN/hub" -serve "127.0.0.1:$HUB_API_PORT" -host "127.0.0.1:$MP_PORT" \
   -tee "http://127.0.0.1:$TEE_G" -commission 1000 \
   -session-timeout 30s -session-max 1048576 -session-idle 5s \

@@ -91,6 +91,9 @@ func testReceipt(t *testing.T) Receipt {
 		// A normal execution receipt binds the response start it relayed, so
 		// the shared fixture carries one.
 		ResponseHeadersHash: digestOf([]byte("response headers")),
+		// Every receipt names the whitelist its enclave enforced; a receipt
+		// without one proves the exchange happened but not what was permitted.
+		PolicyHash: digestOf([]byte("deployment policy")),
 	}
 }
 
@@ -362,6 +365,7 @@ func TestVerifyRejectsTampering(t *testing.T) {
 		"chunk count":           func(r *Receipt) { r.ChunkCount++ },
 		"response bytes":        func(r *Receipt) { r.ResponseBytes++ },
 		"completion":            func(r *Receipt) { r.Completion = CompletionTruncated },
+		"policy hash":           func(r *Receipt) { r.PolicyHash[0] ^= 0xff },
 		"finished at":           func(r *Receipt) { r.FinishedAt++ },
 	}
 
