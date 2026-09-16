@@ -96,7 +96,28 @@ func main() {
 	// leaf over GET /v1/init-cert and nothing else; the Hub never talks TLS to it.
 	initAddr := flag.String("init-addr", envOr("TEE_INIT_ADDR", ""), "plain-HTTP bootstrap listener (e.g. 0.0.0.0:18091); serves /v1/init-cert gated by -init-token")
 	initToken := flag.String("init-token", envOr("TEE_INIT_TOKEN", ""), "bearer token guarding the bootstrap /v1/init-cert endpoint (required with -init-addr)")
+	// On an SNP instance the deployment whitelist is baked inside the measured
+	// bundle at a fixed path. Pointing this flag there means the policy the
+	// enclave enforces IS the measured copy in the bundle tar, whose digest the
+	// loader exports as SNP_APP_HASH — so a rotated whitelist changes the attestation
+	// fingerprint instead of silently widening what the enclave will accept.
+	policyDir := flag.String("policy-dir", envOr("TEE_POLICY_DIR", ""), "directory the deployed whitelist policy is baked into (the measured bundle's policy/ on SNP); empty = load from TOKENHIVE_SIM_DIR")
+	emitPolicyDir := flag.String("emit-policy-dir", "", "write the canonical whitelist policy files to this directory and exit (used by pack.sh to bake the policy into the measured bundle)")
 	flag.Parse()
+
+	// Emission mode is a build-time helper for pack.sh: it materializes the
+	// whitelist on the pack machine (where this sevsnp binary may not even run)
+	// only when a host can execute it; the bundle otherwise stages an operator-provided
+	// policy directory. Either way the policy lands inside the measured bundle tar.
+	if *emitPolicyDir != "" {
+		if err := shared.WritePolicyDir(*emitPolicyDir); err != nil {
+			log.Fatalf("emit policy dir: %v", err)
+		}
+		return
+	}
+	if *policyDir != "" {
+		shared.SetPolicyDir(*policyDir)
+	}
 
 	// Fixtures are idempotent and live under TOKENHIVE_SIM_DIR (default .sim):
 	// on a real deployment that directory is mounted by the provisioning path

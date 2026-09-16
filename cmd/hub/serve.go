@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
@@ -48,6 +50,11 @@ type serveConfig struct {
 	Query   string // extra upstream query (fault injection, for the harness)
 	Max     uint64 // MaxResponseBytes cap passed to the TEE. For a request it caps the body; for a session it caps the downlink, so the session settles for what it delivered instead of being cut un-reconcilably by the Hub
 	Tenants tenantResolver
+	// Policies is the deployed whitelist the Hub advertises on /v1/policies.
+	// It is read-only after load: buyers and sellers see exactly the whitelist
+	// the enclave enforces (the same bundle bytes on an SNP instance), so a
+	// request refused by policy is a fact a buyer could have checked up front.
+	Policies *policy.Set
 }
 
 // tenantKeyHeader is the header a user presents to identify itself. It is the
@@ -133,6 +140,7 @@ const (
 	teeRelayPath      = "/v1/relay"
 	credentialKeyPath = "/v1/credential-key"
 	modelsPath        = "/v1/models"
+	policiesPath      = "/v1/policies"
 )
 
 var relayUpgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -153,8 +161,9 @@ func runServe(h *hub.Hub, cfg serveConfig) {
 	mux.Handle(teeRelayPath, h.TeeRelay(relayUpgrader))
 	mux.HandleFunc(credentialKeyPath, h.CredentialKeyHandler)
 	mux.HandleFunc(modelsPath, modelsHandler(h))
-	log.Printf("hub user-facing API listening on http://%s%v (sessions at %s, models at %s)",
-		cfg.Addr, routePaths(), sessionPath, modelsPath)
+	mux.HandleFunc(policiesPath, policiesHandler(cfg.Policies))
+	log.Printf("hub user-facing API listening on http://%s%v (sessions at %s, models at %s, policies at %s)",
+		cfg.Addr, routePaths(), sessionPath, modelsPath, policiesPath)
 	log.Printf("hub reverse-tunnel endpoints: agent gate %s, tee relay %s, credential key %s",
 		agentGatePath, teeRelayPath, credentialKeyPath)
 	srv := newHubServer(cfg.Addr, mux, defaultRequestReadTimeout)
@@ -395,6 +404,88 @@ func modelsHandler(h *hub.Hub) http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(struct {
 			Models []hub.ModelQuote `json:"models"`
 		}{Models: quotes})
+	}
+}
+
+// policiesHandler answers GET /v1/policies: the deployed whitelist a buyer or
+// seller can check up front, without asking the TEE. It mirrors the /v1/models
+// directory — a read-only view of deployment config, not an execution path.
+//
+// The response names every provider the enclave is configured to accept, its
+// allowed hosts, the request families permitted on them, the per-policy hash
+// (TokenHive.Policy.v1 over the canonical encoding) and the deterministic
+// policy-set hash (TokenHive.PolicySet.v1). A buyer who pins the set hash can
+// spot a rotated whitelist; a seller can confirm the envelope it deployed.
+//
+// The set is nil or empty only when it could not be produced (policy files not
+// materialized); the endpoint says so rather than inventing a whitelist the
+// enclave did not run with.
+func policiesHandler(set *policy.Set) http.HandlerFunc {
+	type ruleView struct {
+		Methods       []string `json:"methods"`
+		Path          string   `json:"path"`
+		AllowStream   bool     `json:"allow_stream,omitempty"`
+		QueryKeys     []string `json:"query_keys,omitempty"`
+		AllowAnyQuery bool     `json:"allow_any_query,omitempty"`
+	}
+	type policyView struct {
+		Provider    string     `json:"provider"`
+		DisplayName string     `json:"display_name,omitempty"`
+		Hosts       []string   `json:"hosts"`
+		Rules       []ruleView `json:"rules"`
+		MaxResponseBytes uint64 `json:"max_response_bytes"`
+		MaxBodyBytes     uint64 `json:"max_body_bytes"`
+		AllowedHeaders   []string `json:"allowed_headers"`
+		IssuedAt         int64    `json:"issued_at"`
+		ExpiresAt        int64    `json:"expires_at"`
+		PolicyHash       string   `json:"policy_hash"`
+	}
+	type response struct {
+		PolicySetHash string       `json:"policy_set_hash"`
+		Policies      []policyView `json:"policies"`
+		Unavailable   bool         `json:"unavailable,omitempty"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		out := response{Policies: []policyView{}}
+		if set == nil || set.Len() == 0 {
+			out.Unavailable = true
+		} else {
+			if h, err := set.Hash(); err == nil {
+				out.PolicySetHash = hex.EncodeToString(h[:])
+			}
+			for _, provider := range set.Providers() {
+				p, ok := set.Get(provider)
+				if !ok {
+					continue
+				}
+				view := policyView{
+					Provider:         p.Provider,
+					DisplayName:      p.DisplayName,
+					Hosts:            p.Hosts,
+					MaxResponseBytes: p.Limits.MaxResponseBytes,
+					MaxBodyBytes:     p.Limits.MaxBodyBytes,
+					AllowedHeaders:   p.Limits.AllowedHeaders,
+					IssuedAt:         p.IssuedAt,
+					ExpiresAt:        p.ExpiresAt,
+				}
+				if h, err := p.Hash(); err == nil {
+					view.PolicyHash = hex.EncodeToString(h[:])
+				}
+				for _, rule := range p.Rules {
+					view.Rules = append(view.Rules, ruleView{
+						Methods:       rule.Methods,
+						Path:          rule.Path,
+						AllowStream:   rule.AllowStream,
+						QueryKeys:     rule.QueryKeys,
+						AllowAnyQuery: rule.AllowAnyQuery,
+					})
+				}
+				out.Policies = append(out.Policies, view)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
 	}
 }
 

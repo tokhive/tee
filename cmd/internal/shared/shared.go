@@ -56,6 +56,26 @@ func ConfigDir() string {
 	return ".sim"
 }
 
+// policyDirOverride, when non-empty, points the whitelist loaders (and the Hub's
+// /v1/policies view) at a directory other than the .sim working directory. On an
+// SNP instance this is the policy directory baked inside the measured bundle, so
+// the whitelist the enclave enforces and the whitelist the Hub advertises are the
+// exact bytes covered by SNP_APP_HASH.
+var policyDirOverride string
+
+// SetPolicyDir redirects where the deployed whitelist policy is loaded from.
+// Empty (the default) keeps the .sim working directory.
+func SetPolicyDir(dir string) { policyDirOverride = dir }
+
+// PolicyDir returns the directory the whitelist policy files are read from: the
+// bundle policy dir when one was set, otherwise the .sim working directory.
+func PolicyDir() string {
+	if policyDirOverride != "" {
+		return policyDirOverride
+	}
+	return ConfigDir()
+}
+
 // EnsureDefaults writes the fixture files if they are missing: a
 // Hub-predefined whitelist policy per provider (deployment config) and the
 // Hub's seller-reported rate table. Credentials are intentionally NOT written:
@@ -133,11 +153,21 @@ func SealCredential(teeBase, provider string, secret tee.Secret) (tee.Envelope, 
 // (a commercial concern), and the whitelist itself is deployment config, whose
 // integrity the TEE binds into its attestation measurement.
 func writePolicy(provider string, p policy.Policy) error {
+	return writePolicyInto(ConfigDir(), provider, p)
+}
+
+// writePolicyInto writes one canonical whitelist policy into dir using the same
+// on-disk layout LoadPolicySetAll reads (policy.cbor for the primary provider,
+// policies/<provider>.cbor for the rest).
+func writePolicyInto(dir, provider string, p policy.Policy) error {
 	enc, err := p.EncodeCanonical()
 	if err != nil {
 		return fmt.Errorf("encode policy: %w", err)
 	}
-	path := policyPathFor(provider)
+	path := filepath.Join(dir, "policy.cbor")
+	if provider != providerName {
+		path = filepath.Join(dir, "policies", provider+".cbor")
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("make policy dir: %w", err)
 	}
@@ -145,6 +175,20 @@ func writePolicy(provider string, p policy.Policy) error {
 		return fmt.Errorf("write policy: %w", err)
 	}
 	return nil
+}
+
+// WritePolicyDir materializes the canonical Hub-predefined whitelist into dir in
+// the layout the sim loaders expect, without booting a TEE. pack.sh uses it so
+// the whitelist travels inside the measured SNP bundle (covered by SNP_APP_HASH),
+// and tests use it to produce a policy directory to point -policy-dir at.
+func WritePolicyDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := writePolicyInto(dir, providerName, providerPolicy(providerName)); err != nil {
+		return err
+	}
+	return writePolicyInto(dir, providerCheap, providerPolicy(providerCheap))
 }
 
 func policyPath() string { return filepath.Join(ConfigDir(), "policy.cbor") }
@@ -206,7 +250,7 @@ func providerPolicy(provider string) policy.Policy {
 // provider signature, so it is installed via the unsigned path — the same
 // Install call the real TEE uses for its deployment config.
 func LoadPolicySet() (*policy.Set, error) {
-	b, err := os.ReadFile(policyPath())
+	b, err := os.ReadFile(filepath.Join(PolicyDir(), "policy.cbor"))
 	if err != nil {
 		return nil, fmt.Errorf("read policy: %w", err)
 	}
@@ -230,8 +274,8 @@ func LoadPolicySetAll() (*policy.Set, error) {
 	set := policy.NewSet()
 	now := time.Now()
 
-	paths := []string{policyPath()}
-	extra, err := filepath.Glob(filepath.Join(ConfigDir(), "policies", "*.cbor"))
+	paths := []string{filepath.Join(PolicyDir(), "policy.cbor")}
+	extra, err := filepath.Glob(filepath.Join(PolicyDir(), "policies", "*.cbor"))
 	if err != nil {
 		return nil, fmt.Errorf("list policies dir: %w", err)
 	}

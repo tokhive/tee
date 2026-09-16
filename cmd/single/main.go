@@ -28,6 +28,20 @@ import (
 // their absolute paths from here regardless of cwd.
 const bundleDir = "/run/bundle"
 
+// bundlePolicyArgs returns the -policy-dir flag pair only when the measured
+// bundle actually carries a ./policy directory. pack.sh stages the deployment
+// whitelist there, so pointing tee and hub at it means both read the whitelist
+// from inside the measured tar (whose digest is SNP_APP_HASH) instead of a
+// runtime mount — a rotated policy changes the attestation fingerprint instead
+// of silently widening what the enclave accepts.
+func bundlePolicyArgs() []string {
+	d := filepath.Join(bundleDir, "policy")
+	if _, err := os.Stat(d); err == nil {
+		return []string{"-policy-dir", d}
+	}
+	return nil
+}
+
 var (
 	simDir    string
 	initToken string
@@ -152,16 +166,17 @@ func waitAll() {
 
 func teeCmd() *exec.Cmd {
 	c := cmd("svc/tee",
-		"-addr", "127.0.0.1:18090",
-		"-relay", "ws://127.0.0.1:18085/v1/relay",
-		"-relay-key", relayKey,
-		"-platform", "sevsnp",
-		"-mtls",
-		"-mtls-client-ca", filepath.Join(bundleDir, "mtls", "hub-ca.pem"),
-		"-init-addr", "127.0.0.1:18091",
-		"-init-token", initToken,
-		"-seq", filepath.Join(simDir, "seqstore.json"),
-	)
+		append([]string{
+			"-addr", "127.0.0.1:18090",
+			"-relay", "ws://127.0.0.1:18085/v1/relay",
+			"-relay-key", relayKey,
+			"-platform", "sevsnp",
+			"-mtls",
+			"-mtls-client-ca", filepath.Join(bundleDir, "mtls", "hub-ca.pem"),
+			"-init-addr", "127.0.0.1:18091",
+			"-init-token", initToken,
+			"-seq", filepath.Join(simDir, "seqstore.json"),
+		}, bundlePolicyArgs()...)...)
 	c.Env = withEnv("SNP_ATTEST_BROKER_FD=3", "TOKENHIVE_SIM_DIR="+simDir)
 	c.ExtraFiles = []*os.File{teeSvcFD3} // -> child fd 3
 	return c
@@ -182,23 +197,24 @@ func mpCmd(port int) *exec.Cmd {
 
 func hubCmd(appHash string) *exec.Cmd {
 	c := cmd("svc/hub",
-		"-serve", "0.0.0.0:18085",
-		// Per-provider keys: the agent below dials in as openai-sim, so the gate
-		// binds that provider to this key. The Hub refuses to start without both
-		// this map and the relay key, matching the cross-host deployment's gate.
-		"-agent-keys", "openai-sim=" + agentKey,
-		"-relay-key", relayKey,
-		"-host", "127.0.0.1:18080",
-		"-model", "sim-mock-0.5b",
-		"-tee", "https://127.0.0.1:18090",
-		"-mtls-ca", teeCert,
-		"-mtls-cert", filepath.Join(bundleDir, "mtls", "hub-cert.pem"),
-		"-mtls-key", filepath.Join(bundleDir, "mtls", "hub-key.pem"),
-		// Real SNP receipts: the hub must trust the platform and pin the exact
-		// measured bundle (the loader exports its digest as SNP_APP_HASH).
-		"-allowed-platforms", "aws-sev-snp",
-		"-expected-app", "snp-app:"+appHash,
-	)
+		append([]string{
+			"-serve", "0.0.0.0:18085",
+			// Per-provider keys: the agent below dials in as openai-sim, so the gate
+			// binds that provider to this key. The Hub refuses to start without both
+			// this map and the relay key, matching the cross-host deployment's gate.
+			"-agent-keys", "openai-sim=" + agentKey,
+			"-relay-key", relayKey,
+			"-host", "127.0.0.1:18080",
+			"-model", "sim-mock-0.5b",
+			"-tee", "https://127.0.0.1:18090",
+			"-mtls-ca", teeCert,
+			"-mtls-cert", filepath.Join(bundleDir, "mtls", "hub-cert.pem"),
+			"-mtls-key", filepath.Join(bundleDir, "mtls", "hub-key.pem"),
+			// Real SNP receipts: the hub must trust the platform and pin the exact
+			// measured bundle (the loader exports its digest as SNP_APP_HASH).
+			"-allowed-platforms", "aws-sev-snp",
+			"-expected-app", "snp-app:" + appHash,
+		}, bundlePolicyArgs()...)...)
 	c.Env = withEnv("TOKENHIVE_SIM_DIR=" + simDir)
 	return c
 }

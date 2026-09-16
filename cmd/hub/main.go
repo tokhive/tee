@@ -46,6 +46,7 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/tencent"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
@@ -100,6 +101,10 @@ func main() {
 	allowed := flag.String("allowed-platforms", "simulated", "comma-separated attestation platforms the Hub trusts (e.g. simulated,aws-sev-snp)")
 	expectedApp := flag.String("expected-app", "", "for aws-sev-snp: the attested application identity the deployment trusts (snp-app:<sha256 hex>)")
 	policyHash := flag.String("policy-set-hash", "", "hex digest the enclave must have bound into its evidence; empty skips the deployment-binding assertion (the Hub pins the platform, not the exact policy digest, at runtime)")
+	// On an SNP bundle the deployment whitelist lives inside the measured tar at
+	// ./policy; point this there so the /v1/policies view (what buyers and sellers
+	// are told the enclave will accept) is the same bytes the enclave enforces.
+	policyDir := flag.String("policy-dir", "", "directory the deployed whitelist policy is baked into (the measured bundle's policy/ on SNP); empty = load from TOKENHIVE_SIM_DIR")
 	evFetchURL := flag.String("evidence-fetch", "", "base URL for remote evidence retrieval (e.g. https://tee:18090); empty = resolve EvidenceHash from the local evidence store only")
 	mtlsCA := flag.String("mtls-ca", "", "PEM file pinning the TEE's RA-TLS certificate (or the CA that signs it); the RA-TLS verification half of Hub↔TEE mTLS. Implies -tee is https://")
 	mtlsCert := flag.String("mtls-cert", "", "client certificate the Hub presents to the TEE under mTLS; empty defaults to <simdir>/hub-client.pem")
@@ -214,13 +219,25 @@ func main() {
 	if err := requireServeKeys(*serveAddr, *agentKeys, *relayKey); err != nil {
 		log.Fatal(err)
 	}
+	if *policyDir != "" {
+		shared.SetPolicyDir(*policyDir)
+	}
 	if *serveAddr != "" {
+		// Load the deployment whitelist for the buyer/seller-facing /v1/policies
+		// view. Best-effort: if the policy files are absent (e.g. a Hub brought up
+		// before any TEE materialized the .sim fixtures) the endpoint reports the
+		// whitelist unavailable rather than taking the whole service down.
+		var policySet *policy.Set
+		if policySet, err = shared.LoadPolicySetAll(); err != nil {
+			log.Printf("policy set unavailable for /v1/policies: %v", err)
+		}
 		runServe(h, serveConfig{
-			Addr:    *serveAddr,
-			Host:    *host,
-			Query:   *query,
-			Max:     *maxBytes,
-			Tenants: tenantResolver{keys: tenants},
+			Addr:     *serveAddr,
+			Host:     *host,
+			Query:    *query,
+			Max:      *maxBytes,
+			Tenants:  tenantResolver{keys: tenants},
+			Policies: policySet,
 		})
 		return
 	}

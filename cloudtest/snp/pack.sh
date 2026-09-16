@@ -89,6 +89,27 @@ bundle_mp() {
 # agent all on loopback inside the single confidential instance; without it the
 # supervisor just execs ./svc/tee (identical behavior to the cross-host bundle).
 # Requires SNP_HUB_CA / SNP_HUB_CERT / SNP_HUB_KEY (the gencerts outputs).
+# bundle_policy stages the deployment whitelist INSIDE the measured bundle as
+# ./policy/*, so the bytes the enclave enforces (and the Hub advertises on
+# /v1/policies) are covered by the bundle digest = SNP_APP_HASH. A rotated
+# whitelist therefore changes the attestation fingerprint instead of silently
+# widening what the enclave will accept. The operator supplies their real
+# whitelist (policy.cbor + policies/<provider>.cbor, the layout LoadPolicySetAll
+# reads) via SNP_POLICY_DIR; the supervisor points tee and hub at ./policy with
+# -policy-dir. Without it the policy is NOT baked in and the instance must get
+# its whitelist some other provisioning path.
+bundle_policy() {
+    local stage="$1"
+    if [[ -n "${SNP_POLICY_DIR:-}" && -d "${SNP_POLICY_DIR}" ]]; then
+        mkdir -p "${stage}/policy"
+        cp -R "${SNP_POLICY_DIR}/." "${stage}/policy/"
+        chmod -R u+rX,go+rX "${stage}/policy"
+        echo "[pack] bundled whitelist policy -> ./policy/ (${SNP_POLICY_DIR})"
+    else
+        echo "[pack] warning: no SNP_POLICY_DIR; whitelist policy NOT baked into the measured bundle"
+    fi
+}
+
 build_single() {
     local stage="$1"
     echo "[pack] compiling supervisor ./app + svc/*"
@@ -122,6 +143,9 @@ build() {
         bundle_ca "${stage}"
         bundle_mp "${stage}"
     fi
+    # Stage the deployment whitelist into the measured bundle for every topology
+    # so the policy covered by SNP_APP_HASH travels with the target image.
+    bundle_policy "${stage}"
     # Deterministic tar regardless of the host's tar flavor (macOS bsdtar has no
     # --sort; GNU tar lives in the image builder), so the bundle digest is
     # byte-reproducible: fixed owner/group, fixed mtime, normalized modes.
