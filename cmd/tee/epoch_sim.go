@@ -8,12 +8,12 @@ import (
 )
 
 // buildSimulatedEpoch returns a fresh software attestation epoch whose
-// evidence binds the deployment's policy-set hash — the simulated stand-in for
+// evidence binds the deployment's policy hash — the simulated stand-in for
 // "the whitelist is part of the measured configuration". It is shared by the
 // default and the sevsnp-tagged builds so that one binary can always run the
 // hermetic local simulation.
-func buildSimulatedEpoch(policySetHash [32]byte) (platform.Epoch, error) {
-	epoch, err := simulated.NewDeploymentEpoch(policySetHash)
+func buildSimulatedEpoch(policyHash [32]byte) (platform.Epoch, error) {
+	epoch, err := simulated.NewDeploymentEpoch(policyHash)
 	if err != nil {
 		return nil, fmt.Errorf("create sim epoch: %w", err)
 	}

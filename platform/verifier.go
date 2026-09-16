@@ -31,5 +31,5 @@ type EvidenceVerifier interface {
 	// (a real SEV-SNP image bakes its config into the measured bundle) may
 	// implement this as CheckEvidence plus a binding assertion, or delegate
 	// entirely to CheckEvidence when the measurement already covers it.
-	CheckEvidenceForDeployment(id Identity, policySetHash [32]byte) error
+	CheckEvidenceForDeployment(id Identity, policyHash [32]byte) error
 }

@@ -70,7 +70,7 @@ type SimEvidence struct {
 	// readability.
 	Policy string `json:"policy"`
 
-	// PolicySetHash is the deployment's whitelist digest, hex-encoded. The TEE
+	// PolicyHash is the deployment's whitelist digest, hex-encoded. The TEE
 	// loads its policy configuration at startup and binds the set hash into its
 	// attestation evidence, so a verifier holding the evidence can confirm the
 	// enclave ran with exactly the whitelist the operator deployed — changing
@@ -83,7 +83,7 @@ type SimEvidence struct {
 	// explicit field instead — same trust assertion, different mechanism. The
 	// empty string means the epoch was created without a deployment binding
 	// (tests, or an operator who chose not to assert one).
-	PolicySetHash string `json:"policy_set_hash,omitempty"`
+	PolicyHash string `json:"policy_hash,omitempty"`
 }
 
 // epoch is the software implementation of platform.Epoch.
@@ -105,16 +105,16 @@ func NewEpoch() (platform.Epoch, error) {
 	return newEpoch("")
 }
 
-// NewDeploymentEpoch is NewEpoch with the deployment's policy-set hash bound
-// into the attestation evidence (see SimEvidence.PolicySetHash). A TEE that
+// NewDeploymentEpoch is NewEpoch with the deployment's policy hash bound
+// into the attestation evidence (see SimEvidence.PolicyHash). A TEE that
 // loads its whitelist at startup should use this constructor so that every
 // receipt it signs is provably tied to the exact policy configuration it was
 // deployed with.
-func NewDeploymentEpoch(policySetHash [32]byte) (platform.Epoch, error) {
-	return newEpoch(fmt.Sprintf("%x", policySetHash))
+func NewDeploymentEpoch(policyHash [32]byte) (platform.Epoch, error) {
+	return newEpoch(fmt.Sprintf("%x", policyHash))
 }
 
-func newEpoch(policySetHash string) (platform.Epoch, error) {
+func newEpoch(policyHash string) (platform.Epoch, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate sim key: %w", err)
@@ -131,7 +131,7 @@ func newEpoch(policySetHash string) (platform.Epoch, error) {
 		HostData:      "tokenhive-simulation",
 		Debug:         false,
 		Policy:        "NO_DEBUG,NO_MIGRATE",
-		PolicySetHash: policySetHash,
+		PolicyHash: policyHash,
 	}
 	evidence, err := json.Marshal(ev)
 	if err != nil {
@@ -264,7 +264,7 @@ func CheckEvidence(id platform.Identity) error {
 // hash. It exists for a verifier that knows which whitelist configuration a
 // TEE was deployed with — the attestation then proves the enclave ran with
 // that configuration, not merely with the trusted image.
-func CheckEvidenceForDeployment(id platform.Identity, policySetHash [32]byte) error {
+func CheckEvidenceForDeployment(id platform.Identity, policyHash [32]byte) error {
 	if err := CheckEvidence(id); err != nil {
 		return err
 	}
@@ -272,12 +272,12 @@ func CheckEvidenceForDeployment(id platform.Identity, policySetHash [32]byte) er
 	if err := json.Unmarshal(id.Evidence, &ev); err != nil {
 		return fmt.Errorf("parse sim evidence: %w", err)
 	}
-	want := fmt.Sprintf("%x", policySetHash)
-	if ev.PolicySetHash == "" {
+	want := fmt.Sprintf("%x", policyHash)
+	if ev.PolicyHash == "" {
 		return errors.New("sim evidence carries no policy-set binding")
 	}
-	if ev.PolicySetHash != want {
-		return fmt.Errorf("sim policy-set hash %q does not match expected %q", ev.PolicySetHash, want)
+	if ev.PolicyHash != want {
+		return fmt.Errorf("sim policy hash %q does not match expected %q", ev.PolicyHash, want)
 	}
 	return nil
 }

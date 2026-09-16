@@ -94,14 +94,12 @@ var e2eEvents = [][]byte{
 	[]byte("data: [DONE]\n\n"),
 }
 
-// policyFor is the Hub-predefined whitelist for the e2e path, with the host
+// policyFor is the deployment whitelist for the e2e path, with the host
 // parameterised: the path targets a local mock provider, not api.openai.com.
 func policyFor(host string) policy.Policy {
 	return policy.Policy{
-		Version:     policy.VersionV1,
-		Provider:    "openai",
-		DisplayName: "E2E quota",
-		Hosts:       []string{host},
+		Version: policy.VersionV1,
+		Hosts:   []string{host},
 		Rules: []policy.Rule{{
 			Methods:     []string{"POST"},
 			Path:        "/v1/chat/completions",
@@ -141,9 +139,9 @@ func e2eStack(t *testing.T, target string, srv *httptest.Server) (*tee.Service, 
 	const agentSecret = "s3cret-e2e-agent"
 
 	// ---- the TEE's insides: whitelist and inbox key. It stores no credential.
-	policies := policy.NewSet()
-	if err := policies.Install(policyFor(target), now); err != nil {
-		t.Fatalf("install policy: %v", err)
+	policies := policyFor(target)
+	if err := policies.Validate(); err != nil {
+		t.Fatalf("deployment policy: %v", err)
 	}
 	inbox, err := tee.GenerateInboxKey()
 	if err != nil {
@@ -216,7 +214,7 @@ func e2eStack(t *testing.T, target string, srv *httptest.Server) (*tee.Service, 
 	t.Cleanup(func() { _ = outbound.Close() })
 
 	service, err = tee.NewService(tee.Config{
-		Policies:  policies,
+		Policy:    &policies,
 		Transport: outbound,
 		Signer:    proof.NewSigner(newEpoch(t)),
 		Clock:     func() time.Time { return now },

@@ -43,18 +43,20 @@ import (
 const defaultRequestReadTimeout = 30 * time.Second
 
 // serveConfig is the routing the resident service hands to the scheduler: the
-// upstream it asks the TEE to reach, per provider.
+// upstream it asks the TEE to reach.
 type serveConfig struct {
 	Addr    string // where the Hub listens for its users
-	Host    string // the AI service host:port (must be in every provider policy)
+	Host    string // the AI service host:port (must be admitted by the deployment policy)
 	Query   string // extra upstream query (fault injection, for the harness)
 	Max     uint64 // MaxResponseBytes cap passed to the TEE. For a request it caps the body; for a session it caps the downlink, so the session settles for what it delivered instead of being cut un-reconcilably by the Hub
 	Tenants tenantResolver
-	// Policies is the deployed whitelist the Hub advertises on /v1/policies.
-	// It is read-only after load: buyers and sellers see exactly the whitelist
-	// the enclave enforces (the same bundle bytes on an SNP instance), so a
-	// request refused by policy is a fact a buyer could have checked up front.
-	Policies *policy.Set
+	// Policy is the deployment whitelist. The Hub advertises it on /v1/policies
+	// and admits every dialing agent against it, so buyers and sellers see
+	// exactly the whitelist the enclave enforces (the same bundle bytes on an
+	// SNP instance) and a request refused by policy is a fact either could have
+	// checked up front. Nil means the whitelist was unavailable at startup:
+	// the endpoint says so, and no agent is admitted.
+	Policy *policy.Policy
 }
 
 // tenantKeyHeader is the header a user presents to identify itself. It is the
@@ -161,7 +163,7 @@ func runServe(h *hub.Hub, cfg serveConfig) {
 	mux.Handle(teeRelayPath, h.TeeRelay(relayUpgrader))
 	mux.HandleFunc(credentialKeyPath, h.CredentialKeyHandler)
 	mux.HandleFunc(modelsPath, modelsHandler(h))
-	mux.HandleFunc(policiesPath, policiesHandler(cfg.Policies))
+	mux.HandleFunc(policiesPath, policiesHandler(cfg.Policy))
 	log.Printf("hub user-facing API listening on http://%s%v (sessions at %s, models at %s, policies at %s)",
 		cfg.Addr, routePaths(), sessionPath, modelsPath, policiesPath)
 	log.Printf("hub reverse-tunnel endpoints: agent gate %s, tee relay %s, credential key %s",
@@ -407,20 +409,20 @@ func modelsHandler(h *hub.Hub) http.HandlerFunc {
 	}
 }
 
-// policiesHandler answers GET /v1/policies: the deployed whitelist a buyer or
+// policiesHandler answers GET /v1/policies: the deployment whitelist a buyer or
 // seller can check up front, without asking the TEE. It mirrors the /v1/models
 // directory — a read-only view of deployment config, not an execution path.
 //
-// The response names every provider the enclave is configured to accept, its
-// allowed hosts, the request families permitted on them, the per-policy hash
-// (TokenHive.Policy.v1 over the canonical encoding) and the deterministic
-// policy-set hash (TokenHive.PolicySet.v1). A buyer who pins the set hash can
-// spot a rotated whitelist; a seller can confirm the envelope it deployed.
+// The response is the one document the enclave runs with: the hosts it may
+// reach, the request families permitted on them, and its hash
+// (TokenHive.Policy.v1 over the canonical encoding). A buyer who pins the hash
+// can spot a rotated whitelist; a seller can confirm the whitelist it is
+// admitted under. There is no per-provider view to ask for, because there is no
+// per-provider policy.
 //
-// The set is nil or empty only when it could not be produced (policy files not
-// materialized); the endpoint says so rather than inventing a whitelist the
-// enclave did not run with.
-func policiesHandler(set *policy.Set) http.HandlerFunc {
+// The policy is nil only when it could not be loaded; the endpoint says so
+// rather than inventing a whitelist the enclave did not run with.
+func policiesHandler(p *policy.Policy) http.HandlerFunc {
 	type ruleView struct {
 		Methods       []string `json:"methods"`
 		Path          string   `json:"path"`
@@ -429,63 +431,84 @@ func policiesHandler(set *policy.Set) http.HandlerFunc {
 		AllowAnyQuery bool     `json:"allow_any_query,omitempty"`
 	}
 	type policyView struct {
-		Provider    string     `json:"provider"`
-		DisplayName string     `json:"display_name,omitempty"`
-		Hosts       []string   `json:"hosts"`
-		Rules       []ruleView `json:"rules"`
-		MaxResponseBytes uint64 `json:"max_response_bytes"`
-		MaxBodyBytes     uint64 `json:"max_body_bytes"`
-		AllowedHeaders   []string `json:"allowed_headers"`
-		IssuedAt         int64    `json:"issued_at"`
-		ExpiresAt        int64    `json:"expires_at"`
-		PolicyHash       string   `json:"policy_hash"`
+		Hosts            []string   `json:"hosts"`
+		Rules            []ruleView `json:"rules"`
+		MaxResponseBytes uint64     `json:"max_response_bytes"`
+		MaxBodyBytes     uint64     `json:"max_body_bytes"`
+		AllowedHeaders   []string   `json:"allowed_headers"`
+		IssuedAt         int64      `json:"issued_at"`
+		ExpiresAt        int64      `json:"expires_at"`
 	}
 	type response struct {
-		PolicySetHash string       `json:"policy_set_hash"`
-		Policies      []policyView `json:"policies"`
-		Unavailable   bool         `json:"unavailable,omitempty"`
+		PolicyHash  string      `json:"policy_hash"`
+		Policy      *policyView `json:"policy"`
+		Unavailable bool        `json:"unavailable,omitempty"`
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		out := response{Policies: []policyView{}}
-		if set == nil || set.Len() == 0 {
+		out := response{}
+		if p == nil {
 			out.Unavailable = true
 		} else {
-			if h, err := set.Hash(); err == nil {
-				out.PolicySetHash = hex.EncodeToString(h[:])
+			if h, err := p.Hash(); err == nil {
+				out.PolicyHash = hex.EncodeToString(h[:])
 			}
-			for _, provider := range set.Providers() {
-				p, ok := set.Get(provider)
-				if !ok {
-					continue
-				}
-				view := policyView{
-					Provider:         p.Provider,
-					DisplayName:      p.DisplayName,
-					Hosts:            p.Hosts,
-					MaxResponseBytes: p.Limits.MaxResponseBytes,
-					MaxBodyBytes:     p.Limits.MaxBodyBytes,
-					AllowedHeaders:   p.Limits.AllowedHeaders,
-					IssuedAt:         p.IssuedAt,
-					ExpiresAt:        p.ExpiresAt,
-				}
-				if h, err := p.Hash(); err == nil {
-					view.PolicyHash = hex.EncodeToString(h[:])
-				}
-				for _, rule := range p.Rules {
-					view.Rules = append(view.Rules, ruleView{
-						Methods:       rule.Methods,
-						Path:          rule.Path,
-						AllowStream:   rule.AllowStream,
-						QueryKeys:     rule.QueryKeys,
-						AllowAnyQuery: rule.AllowAnyQuery,
-					})
-				}
-				out.Policies = append(out.Policies, view)
+			view := &policyView{
+				Hosts:            p.Hosts,
+				Rules:            make([]ruleView, 0, len(p.Rules)),
+				MaxResponseBytes: p.Limits.MaxResponseBytes,
+				MaxBodyBytes:     p.Limits.MaxBodyBytes,
+				AllowedHeaders:   p.Limits.AllowedHeaders,
+				IssuedAt:         p.IssuedAt,
+				ExpiresAt:        p.ExpiresAt,
 			}
+			for _, rule := range p.Rules {
+				view.Rules = append(view.Rules, ruleView{
+					Methods:       rule.Methods,
+					Path:          rule.Path,
+					AllowStream:   rule.AllowStream,
+					QueryKeys:     rule.QueryKeys,
+					AllowAnyQuery: rule.AllowAnyQuery,
+				})
+			}
+			out.Policy = view
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(out)
+	}
+}
+
+// admitAgainstPolicy is the deployment's admission check for a dialing agent.
+//
+// A seller chooses what it charges and which models it declares; it does not get
+// to choose what the enclave will accept. So before an agent becomes
+// schedulable the Hub looks up, by host and path, whether the deployment is
+// willing to reach the upstreams this agent's models travel on. An agent whose
+// models could only be served on a path the whitelist does not cover would
+// otherwise be scheduled and then refused inside the TEE — a refusal the seller
+// never sees the reason for. Refusing at bring-up says so where the seller is
+// standing.
+//
+// The whole route surface is checked, because a buyer picks the route and the
+// Hub picks the seller: a model is only really admitted if the deployment admits
+// every surface it could be asked for on.
+func admitAgainstPolicy(p *policy.Policy, host string) func(hub.AgentRegister) error {
+	return func(reg hub.AgentRegister) error {
+		if p == nil {
+			return fmt.Errorf("no deployment policy loaded: refusing agent %q", reg.Provider)
+		}
+		type route struct{ path, method string }
+		routes := []route{{realtimePath, http.MethodGet}}
+		for _, r := range userRoutes {
+			routes = append(routes, route{r.Path, http.MethodPost})
+		}
+		for _, r := range routes {
+			if err := p.AllowsRoute(host, r.path, r.method); err != nil {
+				return fmt.Errorf("agent %q: upstream %s%s is not admitted: %w",
+					reg.Provider, host, r.path, err)
+			}
+		}
+		return nil
 	}
 }
 
@@ -525,7 +548,16 @@ func sseError(err error) string {
 // sessionPath is the user-facing streaming-session endpoint. A user opens a
 // WebSocket here, the Hub learns the model from the first frame, selects the
 // cheapest provider, and relays the full-duplex session through the TEE.
-const sessionPath = "/v1/session"
+//
+// realtimePath is the upstream path that session is relayed to. The two differ
+// — the session is a Hub-shaped endpoint in front of a provider-shaped one — so
+// the whitelist is written against realtimePath while the route is mounted at
+// sessionPath, and the admission check below names both explicitly rather than
+// deriving one from the other.
+const (
+	sessionPath  = "/v1/session"
+	realtimePath = "/v1/realtime"
+)
 
 // sessionUpgrader upgrades the user's HTTP request to a WebSocket. Origin is
 // unrestricted — the consumer is an API key holder, not a browser, so there is
@@ -607,7 +639,7 @@ func (c *sessionHandler) buildSession(provider string) (jobs.Spec, error) {
 		Provider:         provider,
 		Method:           "GET",
 		Host:             c.cfg.Host,
-		Path:             "/v1/realtime",
+		Path:             realtimePath,
 		Query:            c.cfg.Query,
 		Headers:          map[string]string{},
 		BodyHash:         hashBodyBytes(nil),

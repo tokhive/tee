@@ -146,11 +146,11 @@ func main() {
 		}
 	}
 
-	policies, err := shared.LoadPolicySetAll()
+	policyDoc, err := shared.LoadPolicy()
 	if err != nil {
 		log.Fatalf("load policy set: %v", err)
 	}
-	policySetHash, err := policies.Hash()
+	policyHash, err := policyDoc.Hash()
 	if err != nil {
 		log.Fatalf("hash policy set: %v", err)
 	}
@@ -158,7 +158,7 @@ func main() {
 	// Like the real TEE, the A-layer fake binds its loaded whitelist into the
 	// simulated attestation evidence, so receipts it produces are comparable
 	// to the real TEE's.
-	epoch, err := simulated.NewDeploymentEpoch(policySetHash)
+	epoch, err := simulated.NewDeploymentEpoch(policyHash)
 	if err != nil {
 		log.Fatalf("create sim epoch: %v", err)
 	}
@@ -196,7 +196,7 @@ func main() {
 	}
 
 	svc, err := tee.NewService(tee.Config{
-		Policies:  policies,
+		Policy:    policyDoc,
 		Transport: scriptedTransport{},
 		Signer:    signer,
 		Seq:       store,

@@ -112,14 +112,12 @@ func chatCompletion(t *testing.T) (jobs.Spec, []byte) {
 	return spec, body
 }
 
-// openAIPolicy is the Hub-predefined whitelist that authorises exactly the
-// chat completion above and nothing else.
+// openAIPolicy is the deployment whitelist that authorises exactly the chat
+// completion above and nothing else.
 func openAIPolicy() policy.Policy {
 	return policy.Policy{
-		Version:     policy.VersionV1,
-		Provider:    "openai",
-		DisplayName: "Integration test quota",
-		Hosts:       []string{"api.openai.com"},
+		Version: policy.VersionV1,
+		Hosts:   []string{"api.openai.com"},
 		Rules: []policy.Rule{{
 			Methods:     []string{"POST"},
 			Path:        "/v1/chat/completions",
@@ -160,10 +158,10 @@ func TestJobToReceipt(t *testing.T) {
 		t.Fatalf("policy hash: %v", err)
 	}
 
-	// 2. The TEE loads it from its deployment config.
-	policies := policy.NewSet()
-	if err := policies.Install(providerPolicy, now); err != nil {
-		t.Fatalf("install policy: %v", err)
+	// 2. The TEE runs under it, fixed at deployment.
+	policies := providerPolicy
+	if err := policies.Validate(); err != nil {
+		t.Fatalf("deployment policy: %v", err)
 	}
 
 	// 3. The Hub constructs one specific request. It is the author of the spec,
@@ -383,10 +381,7 @@ func covers(receipt proof.Receipt, spec jobs.Spec) bool {
 // If someone later adds a check upstream of Authorize, or loosens the policy
 // matcher, this fails here rather than in production.
 func TestPolicyIsTheOnlyGuardOnHubCraftedJobs(t *testing.T) {
-	policies := policy.NewSet()
-	if err := policies.Install(openAIPolicy(), now); err != nil {
-		t.Fatalf("install policy: %v", err)
-	}
+	policies := openAIPolicy()
 
 	// Control: the unmodified spec must be authorised. Without this the cases
 	// below would also "pass" if the policy had simply failed to load, which is
@@ -511,17 +506,14 @@ func (s *scriptedTransport) Do(_ context.Context, req tee.Request, onChunk func(
 func newService(t *testing.T, epoch *fakeEpoch, transport tee.Transport) (*tee.Service, []byte) {
 	t.Helper()
 
-	policies := policy.NewSet()
-	if err := policies.Install(openAIPolicy(), now); err != nil {
-		t.Fatalf("install policy: %v", err)
-	}
+	policies := openAIPolicy()
 	inbox, err := tee.GenerateInboxKey()
 	if err != nil {
 		t.Fatalf("inbox key: %v", err)
 	}
 
 	service, err := tee.NewService(tee.Config{
-		Policies:  policies,
+		Policy:    &policies,
 		Transport: transport,
 		Signer:    proof.NewSigner(epoch),
 		Clock:     func() time.Time { return now },

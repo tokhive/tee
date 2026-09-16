@@ -120,12 +120,12 @@ type Config struct {
 	// choice; the verifier accepts either when a Fetcher is set.
 	Fetcher Fetcher
 
-	// PolicySetHash, when non-zero, requires every receipt's evidence to carry
+	// PolicyHash, when non-zero, requires every receipt's evidence to carry
 	// a deployment binding to exactly this whitelist digest. It is how an
 	// auditor proves a receipt is not just from the trusted image, but from the
 	// trusted image configured with the policy set the deployment shipped. Zero
 	// skips the deployment-binding assertion.
-	PolicySetHash [32]byte
+	PolicyHash [32]byte
 }
 
 // Verifier validates signed receipts end to end against a deployer-chosen trust
@@ -136,7 +136,7 @@ type Verifier struct {
 	fetcher    Fetcher
 
 	havePolicy    bool
-	policySetHash [32]byte
+	policyHash [32]byte
 }
 
 // New validates a Config and returns a ready Verifier.
@@ -163,10 +163,10 @@ func New(cfg Config) (*Verifier, error) {
 		allowed:    allowed,
 		byPlatform: cfg.ByPlatform,
 		fetcher:    cfg.Fetcher,
-		havePolicy: cfg.PolicySetHash != [32]byte{},
+		havePolicy: cfg.PolicyHash != [32]byte{},
 	}
-	if cfg.PolicySetHash != [32]byte{} {
-		v.policySetHash = cfg.PolicySetHash
+	if cfg.PolicyHash != [32]byte{} {
+		v.policyHash = cfg.PolicyHash
 	}
 
 	// A platform the operator advertises as trusted but provides no verifier
@@ -228,7 +228,7 @@ func (v *Verifier) Check(signed proof.SignedReceipt) error {
 		return fmt.Errorf("attest: no evidence verifier for platform %q", id.Platform)
 	}
 	if v.havePolicy {
-		return platformVerifier.CheckEvidenceForDeployment(id, v.policySetHash)
+		return platformVerifier.CheckEvidenceForDeployment(id, v.policyHash)
 	}
 	return platformVerifier.CheckEvidence(id)
 }

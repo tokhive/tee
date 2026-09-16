@@ -174,7 +174,7 @@ type testEnv struct {
 	transport *fakeTransport
 	inbox     *InboxKey
 	secret    Secret
-	policies  *policy.Set
+	policy    policy.Policy
 	epoch     *testEpoch
 }
 
@@ -187,9 +187,9 @@ type envOption func(*Config)
 func newTestEnv(t *testing.T, opts ...envOption) *testEnv {
 	t.Helper()
 
-	policies := policy.NewSet()
-	if err := policies.Install(defaultPolicy(), baseTime); err != nil {
-		t.Fatalf("install policy: %v", err)
+	doc := defaultPolicy()
+	if err := doc.Validate(); err != nil {
+		t.Fatalf("default test policy: %v", err)
 	}
 
 	inbox := newInbox(t)
@@ -203,7 +203,7 @@ func newTestEnv(t *testing.T, opts ...envOption) *testEnv {
 	epoch := newTestEpoch(t)
 
 	cfg := Config{
-		Policies:  policies,
+		Policy:    &doc,
 		Transport: transport,
 		Signer:    proof.NewSigner(epoch),
 		Clock:     func() time.Time { return baseTime },
@@ -224,7 +224,7 @@ func newTestEnv(t *testing.T, opts ...envOption) *testEnv {
 		transport: transport,
 		inbox:     inbox,
 		secret:    Secret{Token: "sk-test-credential", Header: "authorization", Scheme: "Bearer"},
-		policies:  policies,
+		policy:    *cfg.Policy,
 		epoch:     epoch,
 	}
 }
@@ -288,10 +288,8 @@ func (e *testEnv) specNoCredential(t *testing.T, body []byte) jobs.Spec {
 // (see Secret) — so the policy is purely the whitelist.
 func defaultPolicy() policy.Policy {
 	return policy.Policy{
-		Version:     policy.VersionV1,
-		Provider:    "openai",
-		DisplayName: "test quota",
-		Hosts:       []string{"api.openai.com"},
+		Version: policy.VersionV1,
+		Hosts:   []string{"api.openai.com"},
 		Rules: []policy.Rule{{
 			Methods:     []string{"POST"},
 			Path:        "/v1/chat/completions",
@@ -307,19 +305,15 @@ func defaultPolicy() policy.Policy {
 	}
 }
 
-// replacePolicy swaps in a modified policy. It is used to exercise a policy
-// whose decision differs from the default.
-func replacePolicy(t *testing.T, env *testEnv, mutate func(*policy.Policy)) {
-	t.Helper()
-
-	next := defaultPolicy()
-	mutate(&next)
-	// Keep the issuance time moving forward or Set.Install will reject the
-	// update as a rollback.
-	next.IssuedAt = baseTime.Unix()
-
-	if err := env.policies.Install(next, baseTime); err != nil {
-		t.Fatalf("install policy: %v", err)
+// withPolicy builds the test service under a policy derived from the default
+// one. The deployment whitelist is fixed when the enclave is configured and
+// never changes afterwards, so a test that needs different rules configures a
+// different enclave instead of rotating one underneath a running service.
+func withPolicy(mutate func(*policy.Policy)) envOption {
+	return func(cfg *Config) {
+		next := defaultPolicy()
+		mutate(&next)
+		cfg.Policy = &next
 	}
 }
 
@@ -708,12 +702,11 @@ func TestExecuteKeepsTheStatusOnceTheStartArrived(t *testing.T) {
 // service, not merely requested of the transport. A transport that ignored the
 // cap would otherwise be able to make the TEE attest to an unbounded response.
 func TestExecuteEnforcesTheResponseCap(t *testing.T) {
-	env := newTestEnv(t)
 	// The policy would allow 10 bytes; the job asks for 8. The stricter of the
 	// two governs, so the cap in force is 8.
-	replacePolicy(t, env, func(p *policy.Policy) {
+	env := newTestEnv(t, withPolicy(func(p *policy.Policy) {
 		p.Limits.MaxResponseBytes = 10
-	})
+	}))
 
 	env.transport.chunks = [][]byte{
 		[]byte("1234"),
@@ -799,15 +792,14 @@ func TestExecuteMarksTruncationWhenTheConsumerStops(t *testing.T) {
 // then the only thing standing between the caller and a forged identity is
 // this check. Overwriting silently would turn the guard into a no-op.
 func TestExecuteRefusesCredentialClash(t *testing.T) {
-	env := newTestEnv(t)
 	// The registered secret occupies x-api-key (a raw-key provider like
 	// Anthropic), which the whitelist also lets callers set. A job that sets it
 	// itself must be refused: silently overwriting would turn the guard into a
 	// no-op and let a caller forge the provider's identity.
-	env.setSecret(Secret{Token: "sk-test-credential", Header: "x-api-key"})
-	replacePolicy(t, env, func(p *policy.Policy) {
+	env := newTestEnv(t, withPolicy(func(p *policy.Policy) {
 		p.Limits.AllowedHeaders = []string{"content-type", "x-api-key"}
-	})
+	}))
+	env.setSecret(Secret{Token: "sk-test-credential", Header: "x-api-key"})
 
 	body := []byte(`{"model":"gpt-4o"}`)
 	spec := env.spec(t, body)
@@ -974,10 +966,9 @@ func TestExecuteRejectsExpiredJob(t *testing.T) {
 // TestExecuteRejectsOversizedBody checks the request-side cap. It is the
 // counterpart to the response cap and equally easy to forget.
 func TestExecuteRejectsOversizedBody(t *testing.T) {
-	env := newTestEnv(t)
-	replacePolicy(t, env, func(p *policy.Policy) {
+	env := newTestEnv(t, withPolicy(func(p *policy.Policy) {
 		p.Limits.MaxBodyBytes = 4
-	})
+	}))
 
 	body := []byte(`{"model":"gpt-4o","messages":[]}`)
 	spec := env.spec(t, body)
@@ -999,10 +990,9 @@ func TestExecuteRejectsOversizedBody(t *testing.T) {
 // quietly capped, because a Hub that wants a megabyte when ten bytes were
 // offered is not a job the policy meant to permit.
 func TestExecuteRejectsJobOverPolicyCap(t *testing.T) {
-	env := newTestEnv(t)
-	replacePolicy(t, env, func(p *policy.Policy) {
+	env := newTestEnv(t, withPolicy(func(p *policy.Policy) {
 		p.Limits.MaxResponseBytes = 10
-	})
+	}))
 
 	body := []byte(`{"model":"gpt-4o"}`)
 	spec := env.spec(t, body)
@@ -1025,8 +1015,9 @@ func TestExecuteRejectsJobOverPolicyCap(t *testing.T) {
 // job, at which point the mistake is much harder to attribute.
 func TestServiceRequiresConfiguration(t *testing.T) {
 	complete := func() Config {
+		doc := defaultPolicy()
 		return Config{
-			Policies:  policy.NewSet(),
+			Policy:    &doc,
 			Transport: &fakeTransport{failAfter: -1},
 			Signer:    proof.NewSigner(newTestEpoch(t)),
 			Seq:       NewMemorySeqStore(),
@@ -1039,7 +1030,7 @@ func TestServiceRequiresConfiguration(t *testing.T) {
 		want error
 		edit func(*Config)
 	}{
-		{"no policy set", ErrNoPolicySet, func(c *Config) { c.Policies = nil }},
+		{"no policy", ErrNoPolicy, func(c *Config) { c.Policy = nil }},
 		{"no inbox key", ErrNoInboxKey, func(c *Config) { c.InboxKey = nil }},
 		{"no transport", ErrNoTransport, func(c *Config) { c.Transport = nil }},
 		{"no signer", ErrNoSigner, func(c *Config) { c.Signer = nil }},
@@ -1064,8 +1055,9 @@ func TestServiceRequiresConfiguration(t *testing.T) {
 // sign a CompletionFailed proof for a request it never attempted, which is a
 // signed statement that is not true.
 func TestServiceWithoutTransportIsUnconstructible(t *testing.T) {
+	doc := defaultPolicy()
 	_, err := NewService(Config{
-		Policies: policy.NewSet(),
+		Policy:   &doc,
 		Signer:   proof.NewSigner(newTestEpoch(t)),
 		Seq:      NewMemorySeqStore(),
 		InboxKey: newInbox(t),
@@ -1143,16 +1135,8 @@ func TestSubmitterVerifierGatesJobs(t *testing.T) {
 // of its own rules permitted it.
 func TestReceiptBindsThePolicyRevision(t *testing.T) {
 	env := newTestEnv(t)
-	replacePolicy(t, env, func(p *policy.Policy) {
-		p.DisplayName = "tightened quota"
-		p.Nonce = randomBytes(t, 8)
-	})
 
-	current, ok := env.policies.Get("openai")
-	if !ok {
-		t.Fatal("policy not installed")
-	}
-	want, err := current.Hash()
+	want, err := env.policy.Hash()
 	if err != nil {
 		t.Fatalf("hash policy: %v", err)
 	}

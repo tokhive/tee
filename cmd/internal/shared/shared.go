@@ -41,6 +41,12 @@ import (
 )
 
 // Default fixtures.
+//
+// providerName and providerCheap name the two seller agents the simulation runs:
+// they are device identities, keyed by each agent's dial-in key and by the Hub's
+// rate table. They are deliberately NOT upstreams — what a seller charges and
+// which agent it is have nothing to do with which AI endpoint the deployment
+// reaches, which is the whitelist's business (see DefaultPolicy).
 const (
 	providerName  = "openai-sim"
 	providerCheap = "cheap-sim"
@@ -101,13 +107,10 @@ func EnsureDefaults() error {
 	if err := writeIfAbsent(filepath.Join(dir, "rates.json"), DefaultRates()); err != nil {
 		return err
 	}
-	// primary provider
-	if err := writePolicy(providerName, providerPolicy(providerName)); err != nil {
-		return err
-	}
-	// a second, cheaper provider so the harness can exercise lowest-price
-	// scheduling over two policies pointing at the same upstream.
-	if err := writePolicy(providerCheap, providerPolicy(providerCheap)); err != nil {
+	// The one deployment whitelist. It is not per-provider: every agent the
+	// simulation brings online egresses under this single document, which is
+	// what lets the Hub price and schedule sellers independently of it.
+	if err := writePolicy(dir, DefaultPolicy()); err != nil {
 		return err
 	}
 	return nil
@@ -161,109 +164,82 @@ func SealCredential(teeBase, provider string, secret tee.Secret) (tee.Envelope, 
 	return envelope, nil
 }
 
-// writePolicy encodes and writes a Hub-predefined whitelist policy to its
-// per-provider path. The policy is unsigned: pricing lives in the Hub's rates.json
-// (a commercial concern), and the whitelist itself is deployment config, whose
+// writePolicy encodes and writes the deployment whitelist into dir as
+// policy.cbor. The policy is unsigned: pricing lives in the Hub's rates.json (a
+// commercial concern), and the whitelist itself is deployment config, whose
 // integrity the TEE binds into its attestation measurement.
-func writePolicy(provider string, p policy.Policy) error {
-	return writePolicyInto(ConfigDir(), provider, p)
-}
-
-// writePolicyInto writes one canonical whitelist policy into dir using the same
-// on-disk layout LoadPolicySetAll reads (policy.cbor for the primary provider,
-// policies/<provider>.cbor for the rest).
-func writePolicyInto(dir, provider string, p policy.Policy) error {
+func writePolicy(dir string, p policy.Policy) error {
 	enc, err := p.EncodeCanonical()
 	if err != nil {
 		return fmt.Errorf("encode policy: %w", err)
 	}
-	path := filepath.Join(dir, "policy.cbor")
-	if provider != providerName {
-		path = filepath.Join(dir, "policies", provider+".cbor")
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("make policy dir: %w", err)
 	}
-	if err := os.WriteFile(path, enc, 0o644); err != nil {
+	if err := os.WriteFile(policyPathIn(dir), enc, 0o644); err != nil {
 		return fmt.Errorf("write policy: %w", err)
 	}
 	return nil
 }
 
-// WritePolicyDir materializes the canonical Hub-predefined whitelist into dir in
-// the layout the sim loaders expect, without booting a TEE. pack.sh uses it so
-// the whitelist travels inside the measured SNP bundle (covered by SNP_APP_HASH),
-// and tests use it to produce a policy directory to point -policy-dir at.
+// WritePolicyDir materializes the deployment whitelist into dir in the layout
+// the loaders expect, without booting a TEE. pack.sh uses it so the whitelist
+// travels inside the measured SNP bundle (covered by SNP_APP_HASH), and tests
+// use it to produce a policy directory to point -policy-dir at.
 func WritePolicyDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	if err := writePolicyInto(dir, providerName, providerPolicy(providerName)); err != nil {
-		return err
-	}
-	return writePolicyInto(dir, providerCheap, providerPolicy(providerCheap))
+	return writePolicy(dir, DefaultPolicy())
 }
 
-func policyPath() string { return filepath.Join(ConfigDir(), "policy.cbor") }
-func policyPathFor(p string) string {
-	if p == providerName {
-		return policyPath()
-	}
-	return filepath.Join(ConfigDir(), "policies", p+".cbor")
-}
+func policyPath() string            { return policyPathIn(PolicyDir()) }
+func policyPathIn(dir string) string { return filepath.Join(dir, "policy.cbor") }
 
-// providerPolicy is the Hub-predefined whitelist the simulated TEE enforces
-// for one provider. It is the real policy.Policy type — the simulation loads
-// it through the genuine policy.Set, not a parallel hand-rolled structure.
-// The two providers differ only in price, so the Hub's lowest-price scheduler
-// has something to choose between; both point at the same upstream host.
+// DefaultPolicy is the deployment whitelist the simulation ships. It is the
+// real policy.Policy type — the simulation loads it through the genuine policy
+// engine, not a parallel hand-rolled structure.
+//
+// One document covers the whole deployment: every provider agent egresses under
+// it and none of them can widen it. Hosts name the upstreams the deployment is
+// willing to reach, so the list is the two real API endpoints the whitelist
+// exists to bound plus the mock host the simulation runs them behind.
 //
 // The whitelisted paths mirror the Hub's user-facing routes: the OpenAI chat
 // completions endpoint, the OpenAI Responses endpoint, the Anthropic messages
-// endpoint, and the streaming-session endpoint. In a real deployment these
-// paths would live on different hosts per provider (api.openai.com vs
-// api.anthropic.com); the simulation runs all shapes behind one mock host so
-// a single Hub-predefined whitelist per provider covers all four routes.
-func providerPolicy(provider string) policy.Policy {
-	now := time.Now()
-	hosts := []string{providerHost}
-	rules := []policy.Rule{
-		{Methods: []string{"POST"}, Path: providerPath, AllowStream: true, QueryKeys: []string{"fault"}},
-		// The OpenAI Responses API: a streaming endpoint served by the same
-		// mock host, whitelisted so /v1/responses user requests can dispatch
-		// to these providers.
-		{Methods: []string{"POST"}, Path: "/v1/responses", AllowStream: true, QueryKeys: []string{"fault"}},
-		// The Anthropic Messages API: same pattern, so /v1/messages user
-		// requests (model: claude-*) can dispatch to these providers.
-		{Methods: []string{"POST"}, Path: "/v1/messages", AllowStream: true, QueryKeys: []string{"fault"}},
-		// The streaming-session endpoint: a WebSocket upgrade, so it is a GET
-		// with no body whose whole framing is the Hub's business. AllowStream is
-		// set because the tunnel is unbounded by definition.
-		{Methods: []string{"GET"}, Path: "/v1/realtime", AllowStream: true, AllowAnyQuery: true},
-	}
-	limits := policy.Limits{
-		MaxResponseBytes: 1 << 20,
-		MaxBodyBytes:     1 << 20,
-		AllowedHeaders:   []string{"Content-Type"},
-	}
-
+// endpoint, and the streaming-session endpoint. In a real deployment the first
+// two live on api.openai.com and the third on api.anthropic.com; the simulation
+// serves all four shapes from one mock host so a single whitelist covers every
+// route.
+func DefaultPolicy() policy.Policy {
 	return policy.Policy{
-		Version:   policy.VersionV1,
-		Provider:  provider,
-		Hosts:     hosts,
-		Rules:     rules,
-		Limits:    limits,
-		IssuedAt:  now.Unix(),
+		Version: policy.VersionV1,
+		Hosts: []string{
+			providerHost,
+			"api.openai.com",
+			"api.anthropic.com",
+		},
+		Rules: []policy.Rule{
+			{Methods: []string{"POST"}, Path: providerPath, AllowStream: true, QueryKeys: []string{"fault"}},
+			{Methods: []string{"POST"}, Path: "/v1/responses", AllowStream: true, QueryKeys: []string{"fault"}},
+			{Methods: []string{"POST"}, Path: "/v1/messages", AllowStream: true, QueryKeys: []string{"fault"}},
+			// The streaming-session endpoint: a WebSocket upgrade, so it is a GET
+			// with no body whose whole framing is the Hub's business. AllowStream
+			// is set because the tunnel is unbounded by definition.
+			{Methods: []string{"GET"}, Path: "/v1/realtime", AllowStream: true, AllowAnyQuery: true},
+		},
+		Limits: policy.Limits{
+			MaxResponseBytes: 1 << 20,
+			MaxBodyBytes:     1 << 20,
+			AllowedHeaders:   []string{"Content-Type"},
+		},
+		IssuedAt:  time.Now().Unix(),
 		ExpiresAt: policyNoExpiry,
 	}
 }
 
-// LoadPolicySet reads the primary provider's whitelist policy and installs it
-// into a policy.Set. The policy is a Hub-predefined deployment document, not a
-// provider signature, so it is installed via the unsigned path — the same
-// Install call the real TEE uses for its deployment config.
-func LoadPolicySet() (*policy.Set, error) {
-	b, err := os.ReadFile(filepath.Join(PolicyDir(), "policy.cbor"))
+// LoadPolicy reads the deployment whitelist. There is exactly one, so the TEE
+// that enforces it and the Hub that advertises and admits against it read the
+// same bytes and agree by construction.
+func LoadPolicy() (*policy.Policy, error) {
+	b, err := os.ReadFile(policyPath())
 	if err != nil {
 		return nil, fmt.Errorf("read policy: %w", err)
 	}
@@ -271,45 +247,7 @@ func LoadPolicySet() (*policy.Set, error) {
 	if err := canonical.Unmarshal(b, &p); err != nil {
 		return nil, fmt.Errorf("decode policy: %w", err)
 	}
-	set := policy.NewSet()
-	if err := set.Install(p, time.Now()); err != nil {
-		return nil, fmt.Errorf("install policy: %w", err)
-	}
-	return set, nil
-}
-
-// LoadPolicySetAll loads every installed provider policy: the primary
-// policy.cbor plus any per-provider file under policies/. The real TEE uses
-// this so that multi-provider scenarios see the whole supply; summaries that
-// keep using LoadPolicySet are unaffected because the primary provider's
-// policy is always included first.
-func LoadPolicySetAll() (*policy.Set, error) {
-	set := policy.NewSet()
-	now := time.Now()
-
-	paths := []string{filepath.Join(PolicyDir(), "policy.cbor")}
-	extra, err := filepath.Glob(filepath.Join(PolicyDir(), "policies", "*.cbor"))
-	if err != nil {
-		return nil, fmt.Errorf("list policies dir: %w", err)
-	}
-	paths = append(paths, extra...)
-
-	policies := make([]policy.Policy, 0, len(paths))
-	for _, path := range paths {
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read policy %s: %w", path, err)
-		}
-		var p policy.Policy
-		if err := canonical.Unmarshal(b, &p); err != nil {
-			return nil, fmt.Errorf("decode policy %s: %w", path, err)
-		}
-		policies = append(policies, p)
-	}
-	if err := set.InstallAll(policies, now); err != nil {
-		return nil, fmt.Errorf("install policies: %w", err)
-	}
-	return set, nil
+	return &p, nil
 }
 
 // WriteTEEIdentity persists the public identity of a sim epoch so the verifier

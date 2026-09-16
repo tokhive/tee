@@ -3,6 +3,7 @@ package hub
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -141,6 +142,18 @@ func (h *Hub) serveAgentTunnel(conn *websocket.Conn, authedProvider string) {
 			// claim to a name this agent did not authenticate as.
 			_ = control.Close()
 			return
+		}
+		// The deployment's whitelist gets to refuse a seller before it ever
+		// becomes schedulable. The lookup is by upstream host and path: an
+		// agent whose models the whitelist does not cover would otherwise be
+		// scheduled and then refused inside the TEE, where the seller cannot
+		// see the reason. Refusing here says why, where the seller is standing.
+		if h.admit != nil {
+			if err := h.admit(reg); err != nil {
+				log.Printf("agent %q refused at admission: %v", reg.Provider, err)
+				_ = control.Close()
+				return
+			}
 		}
 		price, ok := h.agentPrice(reg)
 		if !ok {

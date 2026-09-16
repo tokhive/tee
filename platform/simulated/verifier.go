@@ -18,6 +18,6 @@ func (Verifier) CheckEvidence(id platform.Identity) error { return CheckEvidence
 
 // CheckEvidenceForDeployment validates the evidence and asserts the deployment
 // policy-set binding it carries.
-func (Verifier) CheckEvidenceForDeployment(id platform.Identity, policySetHash [32]byte) error {
-	return CheckEvidenceForDeployment(id, policySetHash)
+func (Verifier) CheckEvidenceForDeployment(id platform.Identity, policyHash [32]byte) error {
+	return CheckEvidenceForDeployment(id, policyHash)
 }

@@ -102,7 +102,7 @@ func main() {
 	// loader exports as SNP_APP_HASH — so a rotated whitelist changes the attestation
 	// fingerprint instead of silently widening what the enclave will accept.
 	policyDir := flag.String("policy-dir", envOr("TEE_POLICY_DIR", ""), "directory the deployed whitelist policy is baked into (the measured bundle's policy/ on SNP); empty = load from TOKENHIVE_SIM_DIR")
-	emitPolicyDir := flag.String("emit-policy-dir", "", "write the canonical whitelist policy files to this directory and exit (used by pack.sh to bake the policy into the measured bundle)")
+	emitPolicyDir := flag.String("emit-policy-dir", "", "write the deployment whitelist policy to this directory and exit (used by pack.sh to bake the policy into the measured bundle)")
 	flag.Parse()
 
 	// Emission mode is a build-time helper for pack.sh: it materializes the
@@ -136,17 +136,17 @@ func main() {
 	// The whitelist is part of this enclave's measured configuration: load it
 	// before the epoch so its hash can be bound into the attestation evidence.
 	// A receipt then proves not just "the trusted image ran" but "the trusted
-	// image ran with exactly this policy set".
-	policies, err := shared.LoadPolicySetAll()
+	// image ran with exactly this policy".
+	policyDoc, err := shared.LoadPolicy()
 	if err != nil {
-		log.Fatalf("load policy set: %v", err)
+		log.Fatalf("load policy: %v", err)
 	}
-	policySetHash, err := policies.Hash()
+	policyHash, err := policyDoc.Hash()
 	if err != nil {
-		log.Fatalf("hash policy set: %v", err)
+		log.Fatalf("hash policy: %v", err)
 	}
 
-	epoch, serverTLS, err := buildEpoch(*platformName, policySetHash)
+	epoch, serverTLS, err := buildEpoch(*platformName, policyHash)
 	if err != nil {
 		log.Fatalf("build platform epoch: %v", err)
 	}
@@ -159,7 +159,7 @@ func main() {
 	if err := shared.RecordTEEEvidence(epoch.Identity()); err != nil {
 		log.Fatalf("record tee evidence: %v", err)
 	}
-	log.Printf("policy set hash bound into attestation evidence: %x", policySetHash)
+	log.Printf("policy hash bound into attestation evidence: %x", policyHash)
 
 	// The credential inbox: the TEE's own keypair for accepting agent-registered
 	// tokens. The private half never leaves this process and nothing about it is
@@ -203,7 +203,7 @@ func main() {
 	signer.IncludeEvidence = *includeEvidence
 
 	svc, err := tee.NewService(tee.Config{
-		Policies:       policies,
+		Policy:         policyDoc,
 		Transport:      cm,
 		Signer:         signer,
 		Seq:            store,

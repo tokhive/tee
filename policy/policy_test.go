@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -15,14 +14,13 @@ import (
 // Fixed clock so that expiry assertions do not depend on when the test runs.
 var now = time.Unix(1_800_000_000, 0)
 
-// openAIPolicy is a representative Hub-predefined whitelist: chat, embeddings,
-// and one parametrised read path on a single host.
+// openAIPolicy is a representative deployment whitelist: chat, embeddings,
+// and one parametrised read path on a single host. It names no provider, which
+// is the point — one document serves every seller agent.
 func openAIPolicy() Policy {
 	return Policy{
-		Version:     VersionV1,
-		Provider:    "openai",
-		DisplayName: "OpenAI shared quota",
-		Hosts:       []string{"api.openai.com"},
+		Version: VersionV1,
+		Hosts:   []string{"api.openai.com"},
 		Rules: []Rule{
 			{
 				Methods:     []string{"POST"},
@@ -237,11 +235,6 @@ func TestPolicyValidateRejectsMalformed(t *testing.T) {
 			change: func(p *Policy) { p.IssuedAt = 0 },
 		},
 		{
-			name:   "short nonce",
-			want:   ErrInvalidNonce,
-			change: func(p *Policy) { p.Nonce = []byte("short") },
-		},
-		{
 			name:   "invalid query key",
 			want:   ErrInvalidQueryKey,
 			change: func(p *Policy) { p.Rules[2].QueryKeys = []string{"a[b]"} },
@@ -285,9 +278,6 @@ func TestAuthorizeAllowsMatchingJob(t *testing.T) {
 	if err != nil {
 		t.Fatalf("authorize: %v", err)
 	}
-	if decision.Provider != "openai" {
-		t.Fatalf("provider = %q, want openai", decision.Provider)
-	}
 	if decision.MaxResponseBytes != 1<<16 {
 		t.Fatalf("MaxResponseBytes = %d, want the job's own %d", decision.MaxResponseBytes, 1<<16)
 	}
@@ -307,13 +297,6 @@ func TestAuthorizeRejectsBypasses(t *testing.T) {
 		want   error
 		change func(*jobs.Spec)
 	}{
-		{
-			name: "provider mismatch",
-			want: ErrProviderMismatch,
-			change: func(s *jobs.Spec) {
-				s.Provider = "anthropic"
-			},
-		},
 		{
 			name: "host not in policy",
 			want: ErrHostNotAllowed,
@@ -483,118 +466,6 @@ func TestHostMatches(t *testing.T) {
 	}
 }
 
-func TestPolicySetInstallAndAuthorize(t *testing.T) {
-	set := NewSet()
-
-	// The deployment path: a Hub-predefined whitelist, installed as-is.
-	if err := set.Install(openAIPolicy(), now); err != nil {
-		t.Fatalf("install: %v", err)
-	}
-	if set.Len() != 1 {
-		t.Fatalf("Len() = %d, want 1", set.Len())
-	}
-	if providers := set.Providers(); len(providers) != 1 || providers[0] != "openai" {
-		t.Fatalf("Providers() = %v, want [openai]", providers)
-	}
-
-	decision, err := set.Authorize(spec(t, nil))
-	if err != nil {
-		t.Fatalf("authorize: %v", err)
-	}
-	if decision.Provider != "openai" {
-		t.Fatalf("provider = %q", decision.Provider)
-	}
-
-	unknown := spec(t, func(s *jobs.Spec) { s.Provider = "anthropic" })
-	if _, err := set.Authorize(unknown); !errors.Is(err, ErrUnknownProvider) {
-		t.Fatalf("unknown provider: error = %v, want %v", err, ErrUnknownProvider)
-	}
-
-	set.Remove("openai")
-	if _, err := set.Authorize(spec(t, nil)); !errors.Is(err, ErrUnknownProvider) {
-		t.Fatalf("after remove: error = %v, want %v", err, ErrUnknownProvider)
-	}
-}
-
-func TestPolicySetRejectsExpiredAndStale(t *testing.T) {
-	set := NewSet()
-
-	if err := set.Install(openAIPolicy(), now); err != nil {
-		t.Fatalf("install: %v", err)
-	}
-
-	// Expired: valid once, not now.
-	expired := openAIPolicy()
-	expired.IssuedAt = now.Unix() - 7200
-	expired.ExpiresAt = now.Unix() - 3600
-	if err := set.Install(expired, now); !errors.Is(err, ErrPolicyExpired) {
-		t.Fatalf("expired policy: error = %v, want %v", err, ErrPolicyExpired)
-	}
-
-	// Rollback: an older policy must not replace a newer one.
-	newer := openAIPolicy()
-	newer.IssuedAt = now.Unix()
-	if err := set.Install(newer, now); err != nil {
-		t.Fatalf("install newer: %v", err)
-	}
-	if err := set.Install(openAIPolicy(), now); !errors.Is(err, ErrPolicyRollback) {
-		t.Fatalf("rollback: error = %v, want %v", err, ErrPolicyRollback)
-	}
-}
-
-func TestPolicySetInstallAllIsAtomic(t *testing.T) {
-	set := NewSet()
-	good := openAIPolicy()
-
-	// Structurally invalid after the fact, so InstallAll must fail partway and
-	// install nothing.
-	bad := openAIPolicy()
-	bad.Provider = "anthropic"
-	bad.Limits.MaxResponseBytes = 0
-
-	before := set.Len()
-	if err := set.InstallAll([]Policy{good, bad}, now); err == nil {
-		t.Fatal("InstallAll accepted an invalid entry")
-	}
-	if set.Len() != before {
-		t.Fatalf("InstallAll partially applied: Len() = %d, want %d", set.Len(), before)
-	}
-
-	other := openAIPolicy()
-	other.Provider = "anthropic"
-	if err := set.InstallAll([]Policy{good, other}, now); err != nil {
-		t.Fatalf("InstallAll: %v", err)
-	}
-	if set.Len() != 2 {
-		t.Fatalf("Len() = %d, want 2", set.Len())
-	}
-}
-
-func TestPolicySetConcurrentAccess(t *testing.T) {
-	set := NewSet()
-	if err := set.Install(openAIPolicy(), now); err != nil {
-		t.Fatalf("install: %v", err)
-	}
-
-	// A policy set is read on every job while policies are rotated in the
-	// background, so concurrent access is the normal case, not an edge case.
-	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 64; j++ {
-				_ = set.Providers()
-				if _, err := set.Authorize(spec(t, nil)); err != nil {
-					t.Errorf("authorize under concurrency: %v", err)
-					return
-				}
-			}
-		}()
-	}
-	wg.Wait()
-}
-
 func TestPolicyRoundTrip(t *testing.T) {
 	policy := openAIPolicy()
 
@@ -687,17 +558,62 @@ func TestPlaceholderCannotEscapeItsSegment(t *testing.T) {
 	}
 }
 
-// TestPolicyUsesJobProviderRules asserts the policy package delegates provider
-// name validation to jobs rather than keeping a second copy that can drift.
-func TestPolicyUsesJobProviderRules(t *testing.T) {
-	for _, name := range []string{"openai", "anthropic-2", "a_b", "OpenAI", "bad name", ""} {
-		policy := openAIPolicy()
-		policy.Provider = name
+// TestPolicyIsNotKeyedByProvider is the point of a singular whitelist: the same
+// document authorises every seller agent identically, so no agent can hold — or
+// declare — rules of its own.
+func TestPolicyIsNotKeyedByProvider(t *testing.T) {
+	policy := openAIPolicy()
 
-		policyErr := policy.Validate()
-		jobErr := jobs.ValidateProviderName(name)
-		if (policyErr == nil) != (jobErr == nil) {
-			t.Errorf("provider %q: policy said %v, jobs said %v", name, policyErr, jobErr)
+	for _, agent := range []string{"openai-sim", "cheap-sim", "bee-9f3a"} {
+		decision, err := policy.Authorize(spec(t, func(s *jobs.Spec) { s.Provider = agent }))
+		if err != nil {
+			t.Fatalf("agent %q refused by a whitelist that names no provider: %v", agent, err)
 		}
+		if len(decision.PolicyHash) == 0 {
+			t.Fatalf("agent %q: decision names no policy revision", agent)
+		}
+	}
+}
+
+// TestAllowsRouteIsTheAdmissionLookup pins the host+path lookup the Hub performs
+// at bring-up: it must answer, without a whole job, exactly what Authorize
+// answers about where egress would go.
+func TestAllowsRouteIsTheAdmissionLookup(t *testing.T) {
+	policy := openAIPolicy()
+
+	for _, ok := range []struct{ host, path, method string }{
+		{"api.openai.com", "/v1/chat/completions", "POST"},
+		{"api.openai.com", "/v1/embeddings", "POST"},
+		{"api.openai.com", "/v1/models/gpt-4o", "GET"},
+	} {
+		if err := policy.AllowsRoute(ok.host, ok.path, ok.method); err != nil {
+			t.Fatalf("admitted route %s %s%s refused: %v", ok.method, ok.host, ok.path, err)
+		}
+	}
+
+	cases := []struct {
+		name             string
+		host, path, meth string
+		want             error
+	}{
+		{"host outside the whitelist", "evil.example.com", "/v1/chat/completions", "POST", ErrHostNotAllowed},
+		{"path outside the whitelist", "api.openai.com", "/v1/admin/keys", "POST", ErrPathNotAllowed},
+		{"method outside the whitelist", "api.openai.com", "/v1/embeddings", "GET", ErrMethodNotAllowed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := policy.AllowsRoute(tc.host, tc.path, tc.meth); !errors.Is(err, tc.want) {
+				t.Fatalf("AllowsRoute() error = %v, want %v", err, tc.want)
+			}
+		})
+	}
+
+	// An invalid document must not admit anything, however well-formed the
+	// route looks: admission is a policy question, not a lookup that can be
+	// answered from a broken file.
+	broken := openAIPolicy()
+	broken.Hosts = nil
+	if err := broken.AllowsRoute("api.openai.com", "/v1/chat/completions", "POST"); !errors.Is(err, ErrNoHosts) {
+		t.Fatalf("broken policy admitted a route: %v", err)
 	}
 }

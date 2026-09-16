@@ -14,7 +14,6 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
@@ -31,16 +30,13 @@ func newMTLSServer(t *testing.T, transport tee.Transport) (*httptest.Server, []b
 	if err != nil {
 		t.Fatalf("sim epoch: %v", err)
 	}
-	policies := policy.NewSet()
-	if err := policies.Install(openAIPolicy(), now); err != nil {
-		t.Fatalf("install policy: %v", err)
-	}
+	policies := openAIPolicy()
 	inbox, err := tee.GenerateInboxKey()
 	if err != nil {
 		t.Fatalf("inbox key: %v", err)
 	}
 	service, err := tee.NewService(tee.Config{
-		Policies:  policies,
+		Policy:    &policies,
 		Transport: transport,
 		Signer:    proof.NewSigner(epoch),
 		Clock:     func() time.Time { return now },

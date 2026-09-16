@@ -100,7 +100,7 @@ func main() {
 	audit := flag.Bool("audit", false, "audit the receipt store for gaps and verify signatures")
 	allowed := flag.String("allowed-platforms", "simulated", "comma-separated attestation platforms the Hub trusts (e.g. simulated,aws-sev-snp)")
 	expectedApp := flag.String("expected-app", "", "for aws-sev-snp: the attested application identity the deployment trusts (snp-app:<sha256 hex>)")
-	policyHash := flag.String("policy-set-hash", "", "hex digest the enclave must have bound into its evidence; empty skips the deployment-binding assertion (the Hub pins the platform, not the exact policy digest, at runtime)")
+	policyHash := flag.String("policy-hash", "", "hex digest the enclave must have bound into its evidence; empty skips the deployment-binding assertion (the Hub pins the platform, not the exact policy digest, at runtime)")
 	// On an SNP bundle the deployment whitelist lives inside the measured tar at
 	// ./policy; point this there so the /v1/policies view (what buyers and sellers
 	// are told the enclave will accept) is the same bytes the enclave enforces.
@@ -173,6 +173,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("attestation: %v", err)
 	}
+	// The deployment whitelist, loaded once and shared by everything the Hub
+	// does with it: the /v1/policies view, and the admission check every dialing
+	// agent passes before it can become schedulable. Best-effort — a Hub brought
+	// up before any TEE materialized the fixtures still starts, but it reports
+	// the whitelist unavailable and admits nobody, rather than admitting sellers
+	// the enclave would then refuse job by job.
+	if *policyDir != "" {
+		shared.SetPolicyDir(*policyDir)
+	}
+	var policyDoc *policy.Policy
+	if policyDoc, err = shared.LoadPolicy(); err != nil {
+		log.Printf("policy unavailable: %v", err)
+	}
+
 	h, err := hub.New(hub.Config{
 		TEE:                  teeClient,
 		Rates:                rates,
@@ -192,6 +206,7 @@ func main() {
 		AgentKeys:            perProviderKeys,
 		RelaySecret:          []byte(*relayKey),
 		Credentials:          teeClient,
+		AdmitAgent:           admitAgainstPolicy(policyDoc, *host),
 	})
 	if err != nil {
 		log.Fatalf("build hub: %v", err)
@@ -219,25 +234,14 @@ func main() {
 	if err := requireServeKeys(*serveAddr, *agentKeys, *relayKey); err != nil {
 		log.Fatal(err)
 	}
-	if *policyDir != "" {
-		shared.SetPolicyDir(*policyDir)
-	}
 	if *serveAddr != "" {
-		// Load the deployment whitelist for the buyer/seller-facing /v1/policies
-		// view. Best-effort: if the policy files are absent (e.g. a Hub brought up
-		// before any TEE materialized the .sim fixtures) the endpoint reports the
-		// whitelist unavailable rather than taking the whole service down.
-		var policySet *policy.Set
-		if policySet, err = shared.LoadPolicySetAll(); err != nil {
-			log.Printf("policy set unavailable for /v1/policies: %v", err)
-		}
 		runServe(h, serveConfig{
-			Addr:     *serveAddr,
-			Host:     *host,
-			Query:    *query,
-			Max:      *maxBytes,
-			Tenants:  tenantResolver{keys: tenants},
-			Policies: policySet,
+			Addr:    *serveAddr,
+			Host:    *host,
+			Query:   *query,
+			Max:     *maxBytes,
+			Tenants: tenantResolver{keys: tenants},
+			Policy:  policyDoc,
 		})
 		return
 	}
@@ -454,12 +458,12 @@ func buildVerifier(allowed, expectedApp, policyHash, evFetchURL string, evClient
 	if policyHash != "" {
 		h, err := hex.DecodeString(policyHash)
 		if err != nil {
-			return nil, fmt.Errorf("parse -policy-set-hash: %w", err)
+			return nil, fmt.Errorf("parse -policy-hash: %w", err)
 		}
 		if len(h) != 32 {
-			return nil, fmt.Errorf("-policy-set-hash must be a 32-byte hex digest, got %d bytes", len(h))
+			return nil, fmt.Errorf("-policy-hash must be a 32-byte hex digest, got %d bytes", len(h))
 		}
-		copy(cfg.PolicySetHash[:], h)
+		copy(cfg.PolicyHash[:], h)
 	}
 	return attest.New(cfg)
 }

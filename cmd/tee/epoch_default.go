@@ -19,11 +19,11 @@ import (
 // flag from go-sev-guest. Cloud deployments compile with `-tags sevsnp`
 // (real AWS adapter via epoch_sevsnp.go); any other platform name is a
 // descriptive error here.
-func buildEpoch(platformName string, policySetHash [32]byte) (platform.Epoch, *tls.Config, error) {
+func buildEpoch(platformName string, policyHash [32]byte) (platform.Epoch, *tls.Config, error) {
 	if platformName != "simulated" {
 		return nil, nil, fmt.Errorf("platform %q is not in this binary; only simulated is built by default (rebuild with `-tags sevsnp` for AWS SEV-SNP)", platformName)
 	}
-	epoch, err := buildSimulatedEpoch(policySetHash)
+	epoch, err := buildSimulatedEpoch(policyHash)
 	if err != nil {
 		return nil, nil, err
 	}

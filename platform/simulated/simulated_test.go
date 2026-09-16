@@ -7,7 +7,7 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 )
 
-func TestDeploymentEpochBindsPolicySetHash(t *testing.T) {
+func TestDeploymentEpochBindsPolicyHash(t *testing.T) {
 	var want [32]byte
 	for i := range want {
 		want[i] = byte(i + 1)
@@ -25,11 +25,11 @@ func TestDeploymentEpochBindsPolicySetHash(t *testing.T) {
 	if err := json.Unmarshal(identity.Evidence, &ev); err != nil {
 		t.Fatalf("decode evidence: %v", err)
 	}
-	if ev.PolicySetHash == "" {
-		t.Fatal("deployment epoch evidence carries no policy-set hash")
+	if ev.PolicyHash == "" {
+		t.Fatal("deployment epoch evidence carries no policy hash")
 	}
-	if got := ev.PolicySetHash; got != hexOf(want) {
-		t.Fatalf("evidence policy-set hash = %q, want %q", got, hexOf(want))
+	if got := ev.PolicyHash; got != hexOf(want) {
+		t.Fatalf("evidence policy hash = %q, want %q", got, hexOf(want))
 	}
 
 	// The verifier-side check passes for the bound hash...
@@ -40,7 +40,7 @@ func TestDeploymentEpochBindsPolicySetHash(t *testing.T) {
 	var other [32]byte
 	other[0] = 0xff
 	if err := CheckEvidenceForDeployment(identity, other); err == nil {
-		t.Fatal("evidence accepted with the wrong policy-set hash")
+		t.Fatal("evidence accepted with the wrong policy hash")
 	}
 
 	// The binding is part of the evidence hash: a plain epoch (no deployment)

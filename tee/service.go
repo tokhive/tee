@@ -59,7 +59,7 @@ import (
 // Configuration errors, all of which mean the service was built wrong rather
 // than that a job was bad.
 var (
-	ErrNoPolicySet     = errors.New("no policy set configured")
+	ErrNoPolicy        = errors.New("no policy configured")
 	ErrNoInboxKey      = errors.New("no inbox key configured")
 	ErrNoSigner        = errors.New("no receipt signer configured")
 	ErrCredentialClash = errors.New("job already sets the header the credential occupies")
@@ -138,8 +138,10 @@ type Result struct {
 // service that cannot authorise, execute, or attest must not be constructible —
 // the failure should surface at wiring time, not on the first job.
 type Config struct {
-	// Policies decides whether a job may spend a provider's credential.
-	Policies *policy.Set
+	// Policy is the deployment whitelist: the only thing that decides whether
+	// a job may spend a provider's credential, and the same document every
+	// provider agent egresses under.
+	Policy *policy.Policy
 
 	// Transport performs the outbound request.
 	Transport Transport
@@ -180,7 +182,7 @@ type Config struct {
 
 // Service executes jobs inside the enclave. It is safe for concurrent use.
 type Service struct {
-	policies        *policy.Set
+	policy          policy.Policy
 	transport       Transport
 	signer          *proof.Signer
 	seq             SeqStore
@@ -192,8 +194,8 @@ type Service struct {
 
 // NewService validates a configuration and returns a ready service.
 func NewService(cfg Config) (*Service, error) {
-	if cfg.Policies == nil {
-		return nil, ErrNoPolicySet
+	if cfg.Policy == nil {
+		return nil, ErrNoPolicy
 	}
 	if cfg.InboxKey == nil {
 		return nil, ErrNoInboxKey
@@ -212,7 +214,7 @@ func NewService(cfg Config) (*Service, error) {
 		clock = time.Now
 	}
 	return &Service{
-		policies:        cfg.Policies,
+		policy:          *cfg.Policy,
 		transport:       cfg.Transport,
 		signer:          cfg.Signer,
 		seq:             cfg.Seq,
@@ -267,7 +269,7 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onSta
 		return nil, ErrBodyMismatch
 	}
 
-	decision, err := s.policies.AuthorizeAt(job.Spec, now)
+	decision, err := s.policy.AuthorizeAt(job.Spec, now)
 	if err != nil {
 		return nil, err
 	}
@@ -612,7 +614,7 @@ func (s *Service) OpenSession(ctx context.Context, job Job) (*Session, error) {
 		return nil, fmt.Errorf("%w: Spec.Session is false", ErrSessionBody)
 	}
 
-	decision, err := s.policies.AuthorizeAt(job.Spec, now)
+	decision, err := s.policy.AuthorizeAt(job.Spec, now)
 	if err != nil {
 		return nil, err
 	}

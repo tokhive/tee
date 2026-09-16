@@ -15,7 +15,6 @@ import (
 // distinct from the validation errors in policy.go, a caller can tell a broken
 // job apart from a forbidden one.
 var (
-	ErrProviderMismatch = errors.New("policy provider does not match the job")
 	ErrHostNotAllowed   = errors.New("host is not allowed by policy")
 	ErrPathNotAllowed   = errors.New("path is not allowed by policy")
 	ErrMethodNotAllowed = errors.New("method is not allowed by policy")
@@ -23,7 +22,6 @@ var (
 	ErrQueryNotAllowed  = errors.New("query parameter is not allowed by policy")
 	ErrStreamNotAllowed = errors.New("streaming is not allowed by policy")
 	ErrLimitExceeded    = errors.New("job exceeds a policy limit")
-	ErrUnknownProvider  = errors.New("no policy for provider")
 )
 
 // Decision is the outcome of an allowed job: the rule that admitted it and the
@@ -32,7 +30,6 @@ var (
 // The limits are already resolved — the TEE does not need to remember to take
 // the minimum of the job's request and the policy's cap.
 type Decision struct {
-	Provider         string
 	Rule             Rule
 	MaxResponseBytes uint64
 	MaxBodyBytes     uint64
@@ -49,6 +46,22 @@ type Decision struct {
 
 // AllowStream reports whether the admitted job may use a streamed response.
 func (d Decision) AllowStream() bool { return d.Rule.AllowStream }
+
+// AllowsRoute reports whether the whitelist admits a host, path and method.
+//
+// It is the same host+path lookup Authorize performs, minus the request-shaped
+// concerns, so a caller that only knows where egress would go — the Hub, at
+// bring-up — can ask the deployment's own question without inventing a job.
+func (p Policy) AllowsRoute(host, path, method string) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	if !p.HostAllowed(host) {
+		return fmt.Errorf("%w: %q", ErrHostNotAllowed, host)
+	}
+	_, err := p.findRule(path, method)
+	return err
+}
 
 // Authorize checks a job spec against the policy: host, path, method, headers,
 // query, streaming, and size limits.
@@ -81,15 +94,11 @@ func (p Policy) AuthorizeAt(spec jobs.Spec, now time.Time) (Decision, error) {
 func (p Policy) authorize(spec jobs.Spec) (Decision, error) {
 	var empty Decision
 
-	if p.Provider != spec.Provider {
-		return empty, fmt.Errorf("%w: policy %q, job %q",
-			ErrProviderMismatch, p.Provider, spec.Provider)
-	}
 	if !p.HostAllowed(spec.Host) {
 		return empty, fmt.Errorf("%w: %q", ErrHostNotAllowed, spec.Host)
 	}
 
-	rule, err := p.findRule(spec)
+	rule, err := p.findRule(spec.Path, spec.Method)
 	if err != nil {
 		return empty, err
 	}
@@ -121,7 +130,6 @@ func (p Policy) authorize(spec jobs.Spec) (Decision, error) {
 	}
 
 	return Decision{
-		Provider:         p.Provider,
 		Rule:             rule,
 		MaxResponseBytes: maxResponseBytes,
 		MaxBodyBytes:     p.Limits.MaxBodyBytes,
@@ -146,21 +154,21 @@ func (p Policy) HostAllowed(host string) bool {
 // the method is not, "method not allowed" is far more actionable than "path not
 // allowed", and the distinction tells a legitimate caller they are one word
 // away from a working request rather than entirely outside the policy.
-func (p Policy) findRule(spec jobs.Spec) (Rule, error) {
+func (p Policy) findRule(requestPath, method string) (Rule, error) {
 	pathMatched := false
 	for _, rule := range p.Rules {
-		if !matchPathRule(rule.Path, spec.Path) {
+		if !matchPathRule(rule.Path, requestPath) {
 			continue
 		}
 		pathMatched = true
-		if rule.MethodAllowed(spec.Method) {
+		if rule.MethodAllowed(method) {
 			return rule, nil
 		}
 	}
 	if pathMatched {
-		return Rule{}, fmt.Errorf("%w: %s %s", ErrMethodNotAllowed, spec.Method, spec.Path)
+		return Rule{}, fmt.Errorf("%w: %s %s", ErrMethodNotAllowed, method, requestPath)
 	}
-	return Rule{}, fmt.Errorf("%w: %s", ErrPathNotAllowed, spec.Path)
+	return Rule{}, fmt.Errorf("%w: %s", ErrPathNotAllowed, requestPath)
 }
 
 // MethodAllowed reports whether a rule permits an HTTP method.

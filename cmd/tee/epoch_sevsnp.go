@@ -22,11 +22,11 @@ import (
 // SEV-SNP AWS guest. The simulated branch stays available so one binary can
 // run both the hermetic local sim and the cloud build.
 //
-// The policy-set hash is bound into the simulated epoch's evidence. On a real
+// The policy hash is bound into the simulated epoch's evidence. On a real
 // SEV-SNP host the whitelist ships inside the measured image, so the hardware
 // measurement covers it by construction; the parameter is threaded through for
 // API symmetry and is not otherwise used by the sevsnp branch.
-func buildEpoch(platformName string, policySetHash [32]byte) (platform.Epoch, *tls.Config, error) {
+func buildEpoch(platformName string, policyHash [32]byte) (platform.Epoch, *tls.Config, error) {
 	switch platformName {
 	case "sevsnp":
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -43,7 +43,7 @@ func buildEpoch(platformName string, policySetHash [32]byte) (platform.Epoch, *t
 		}
 		return snapshot, adapter.ServerTLSConfig(), nil
 	case "simulated":
-		epoch, err := buildSimulatedEpoch(policySetHash)
+		epoch, err := buildSimulatedEpoch(policyHash)
 		if err != nil {
 			return nil, nil, err
 		}

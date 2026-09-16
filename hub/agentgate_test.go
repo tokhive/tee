@@ -2,6 +2,7 @@ package hub
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -43,27 +44,32 @@ func dialGate(t *testing.T, url string, hdr http.Header) (*websocket.Conn, *http
 	return d.Dial(url, hdr)
 }
 
-// agentSession dials the gate and opens one control stream carrying reg.
-func agentSession(t *testing.T, url string, hdr http.Header, reg AgentRegister) (*tunnel.Multiplexer, error) {
+// agentSession dials the gate and opens one control stream carrying reg. The
+// control stream is returned alongside the tunnel because it is also the
+// evidence a register was refused: the Hub ends it, and the connection with it.
+func agentSession(t *testing.T, url string, hdr http.Header, reg AgentRegister) (*tunnel.Multiplexer, *tunnel.Stream, error) {
 	t.Helper()
 	conn, _, err := dialGate(t, url, hdr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	mux := tunnel.New(tunnel.WrapWS(conn), tunnel.High)
 	payload, err := json.Marshal(reg)
 	if err != nil {
 		mux.Close()
-		return nil, err
+		return nil, nil, err
 	}
-	if _, err := mux.Dial(payload); err != nil {
+	control, err := mux.Dial(payload)
+	if err != nil {
 		mux.Close()
-		return nil, err
+		return nil, nil, err
 	}
-	return mux, nil
+	return mux, control, nil
 }
 
-// waitOnline polls until the provider has a live tunnel, or gives up.
+// waitOnline polls until the provider has a live tunnel, or gives up. The bound
+// only ever elapses on a wrong answer — the Hub registers synchronously on the
+// control stream, so a correct admission is visible within microseconds.
 func waitOnline(t *testing.T, h *Hub, provider string) bool {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -74,6 +80,28 @@ func waitOnline(t *testing.T, h *Hub, provider string) bool {
 		time.Sleep(2 * time.Millisecond)
 	}
 	return false
+}
+
+// expectRefused blocks until the Hub tears this tunnel down, which is how a
+// rejected register shows itself: the control stream ends, and the connection
+// closes with it.
+//
+// This is an observation, not a grace period. Waiting a fixed interval for
+// something not to happen is both slower than the refusal and weaker than it —
+// it passes for a Hub that is merely slow. The bound below exists only so that a
+// Hub which wrongly keeps the tunnel open fails the test instead of hanging it.
+func expectRefused(t *testing.T, control *tunnel.Stream) {
+	t.Helper()
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		_, _ = io.Copy(io.Discard, control)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the Hub kept a tunnel it should have refused")
+	}
 }
 
 func agentHub(t *testing.T, cfg Config) *Hub {
@@ -140,7 +168,7 @@ func TestAgentGatePerProviderKeyBindsTunnel(t *testing.T) {
 	}
 
 	// A key for cheap cannot register as dear on the control stream.
-	mux, err := agentSession(t, url, http.Header{
+	mux, control, err := agentSession(t, url, http.Header{
 		AgentKeyHeader:      {"cheap-key"},
 		AgentProviderHeader: {"cheap"},
 	}, AgentRegister{Provider: "dear", Credential: &tee.Envelope{}})
@@ -148,12 +176,13 @@ func TestAgentGatePerProviderKeyBindsTunnel(t *testing.T) {
 		t.Fatalf("dial with cheap's key: %v", err)
 	}
 	defer mux.Close()
-	if waitOnline(t, h, "dear") {
+	expectRefused(t, control)
+	if _, ok := h.agents.conn("dear"); ok {
 		t.Fatal("a key issued for cheap registered as dear")
 	}
 
 	// The same key registering as itself is admitted.
-	good, err := agentSession(t, url, http.Header{
+	good, _, err := agentSession(t, url, http.Header{
 		AgentKeyHeader:      {"cheap-key"},
 		AgentProviderHeader: {"cheap"},
 	}, AgentRegister{Provider: "cheap", Credential: &tee.Envelope{}})
@@ -174,7 +203,7 @@ func TestAgentTunnelSecondOpenIsRefusedWithoutDroppingTheLease(t *testing.T) {
 	h := agentHub(t, Config{AgentKeys: map[string][]byte{"cheap": []byte("k")}})
 	url := gateURL(t, h, "/v1/agent")
 
-	mux, err := agentSession(t, url, http.Header{
+	mux, _, err := agentSession(t, url, http.Header{
 		AgentKeyHeader:      {"k"},
 		AgentProviderHeader: {"cheap"},
 	}, AgentRegister{Provider: "cheap", Credential: &tee.Envelope{}})
@@ -207,7 +236,7 @@ func TestAgentRegisterRejectsInvalidProviderName(t *testing.T) {
 	h := agentHub(t, Config{AgentKeys: map[string][]byte{"cheap": []byte("k")}})
 	url := gateURL(t, h, "/v1/agent")
 
-	mux, err := agentSession(t, url, http.Header{
+	mux, control, err := agentSession(t, url, http.Header{
 		AgentKeyHeader:      {"k"},
 		AgentProviderHeader: {"cheap"},
 	}, AgentRegister{Provider: "../escape", Credential: &tee.Envelope{}})
@@ -215,7 +244,8 @@ func TestAgentRegisterRejectsInvalidProviderName(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	defer mux.Close()
-	if waitOnline(t, h, "../escape") {
+	expectRefused(t, control)
+	if _, ok := h.agents.conn("../escape"); ok {
 		t.Fatal("a provider name that escapes the store directory was registered")
 	}
 }

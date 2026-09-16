@@ -26,7 +26,7 @@ func TestBuildVerifierRequiresAWSSEVSNPAppPin(t *testing.T) {
 		{name: "aws with valid pin", allowed: "aws-sev-snp", expectedApp: "snp-app:" + strings.Repeat("a", 64)},
 		{name: "mixed allowlist with valid pin", allowed: "simulated,aws-sev-snp", expectedApp: "snp-app:" + strings.Repeat("b", 64)},
 		{name: "aws with pin and policy hash", allowed: "aws-sev-snp", expectedApp: "snp-app:" + strings.Repeat("c", 64), policyHash: strings.Repeat("d", 64)},
-		{name: "invalid policy hash still rejected", allowed: "simulated", policyHash: "zz", wantErr: "parse -policy-set-hash"},
+		{name: "invalid policy hash still rejected", allowed: "simulated", policyHash: "zz", wantErr: "parse -policy-hash"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

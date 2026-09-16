@@ -11,12 +11,20 @@
 // stands between the Hub and a credential the Hub is not allowed to see, and
 // the only constraint on the Hub that survives the User trusting it.
 //
-// A policy is a Hub-predefined document that ships with the TEE's deployment
-// config — not a per-provider signature. The TEE loads it at startup
-// (policy.Set.Install), binds its hash into the enclave attestation
-// measurement, and refuses any job that steps outside it.
+// There is exactly one policy, and it is the deployment's: a single document
+// that ships with the TEE's config, names every upstream the deployment is
+// willing to reach, and applies to every provider agent alike. It is not a
+// per-provider document, and no agent may declare or widen one — a seller
+// chooses what it charges and what it serves, never what the enclave will
+// accept. That is what makes the whitelist a constraint on the Hub rather than
+// a claim by the party the constraint is meant to bound.
 //
-// Policies are canonically encoded and hashed like every other TokenHive
+// The TEE loads it at startup, binds its hash into the enclave attestation
+// measurement, and refuses any job that steps outside it. The Hub reads the
+// same file, and uses the same host+path lookup at bring-up to refuse an agent
+// whose upstream the deployment does not reach.
+//
+// A policy is canonically encoded and hashed like every other TokenHive
 // structure, so a policy hash is a stable reference a receipt or an audit log
 // can point at.
 package policy
@@ -46,11 +54,7 @@ const (
 	MaxRules          = 64
 	MaxAllowedHeaders = 64
 	MaxQueryKeys      = 64
-	MaxDisplayName    = 128
 	MaxPlaceholderLen = 32
-
-	MinNonceLength = 8
-	MaxNonceLength = 64
 )
 
 // Policy validation errors.
@@ -64,34 +68,29 @@ var (
 	ErrInvalidLimits      = errors.New("invalid policy limits")
 	ErrInvalidQueryKey    = errors.New("invalid query key in policy")
 	ErrInvalidHeaderName  = errors.New("invalid header name in policy")
-	ErrInvalidNonce       = errors.New("invalid policy nonce")
 	ErrInvalidTimeRange   = errors.New("invalid policy validity window")
 	ErrPolicyExpired      = errors.New("policy has expired")
 	ErrPolicyNotYetValid  = errors.New("policy is not yet valid")
 )
 
-// Policy is the whitelist that bounds what a shared credential may be used for.
+// Policy is the deployment whitelist: every upstream host the enclave may
+// reach, the request families permitted on them, and the bounds a job must
+// stay inside.
 //
 // The field order is not significant — canonical CBOR sorts by integer key —
 // but the keys are part of the wire format and must never be renumbered or
-// reused once a version ships.
+// reused. Keys 2, 3, 6 and 11 are retired gaps: 2 and 3 held per-provider
+// identity that a single deployment policy has no place for, 6 held the
+// credential's injection shape (now sealed inside the per-job envelope, see
+// tee.Secret), and 11 held a rotation nonce.
 type Policy struct {
-	Version     uint32   `cbor:"1,keyasint"`
-	Provider    string   `cbor:"2,keyasint"`
-	DisplayName string   `cbor:"3,keyasint,omitempty"`
-	Hosts       []string `cbor:"4,keyasint"`
-	Rules       []Rule   `cbor:"5,keyasint"`
+	Version uint32   `cbor:"1,keyasint"`
+	Hosts   []string `cbor:"4,keyasint"`
+	Rules   []Rule   `cbor:"5,keyasint"`
+	Limits  Limits   `cbor:"7,keyasint"`
 
-	// Key 6 was Credential, the credential's injection shape. It is retired:
-	// the header/scheme now travels sealed inside the per-job envelope (see
-	// tee.Secret), so it has no place in a distributed whitelist.
-	Limits    Limits `cbor:"7,keyasint"`
-	IssuedAt  int64  `cbor:"8,keyasint"`
-	ExpiresAt int64  `cbor:"9,keyasint"`
-
-	// Nonce lets an operator reissue an otherwise identical policy so that
-	// rotations produce a different policy hash. Optional.
-	Nonce []byte `cbor:"11,keyasint,omitempty"`
+	IssuedAt  int64 `cbor:"8,keyasint"`
+	ExpiresAt int64 `cbor:"9,keyasint"`
 }
 
 // Rule permits one family of requests: a path pattern crossed with the methods
@@ -147,13 +146,6 @@ func (p Policy) Validate() error {
 	if p.Version != VersionV1 {
 		return fmt.Errorf("%w: %d", ErrUnsupportedVersion, p.Version)
 	}
-	if err := jobs.ValidateProviderName(p.Provider); err != nil {
-		return err
-	}
-	if len(p.DisplayName) > MaxDisplayName {
-		return fmt.Errorf("%w: display name length %d exceeds %d",
-			ErrInvalidLimits, len(p.DisplayName), MaxDisplayName)
-	}
 
 	if len(p.Hosts) == 0 {
 		return ErrNoHosts
@@ -191,10 +183,6 @@ func (p Policy) Validate() error {
 
 	if p.IssuedAt <= 0 || p.ExpiresAt <= p.IssuedAt {
 		return fmt.Errorf("%w: issued %d, expires %d", ErrInvalidTimeRange, p.IssuedAt, p.ExpiresAt)
-	}
-	if len(p.Nonce) > 0 && (len(p.Nonce) < MinNonceLength || len(p.Nonce) > MaxNonceLength) {
-		return fmt.Errorf("%w: length %d outside [%d,%d]",
-			ErrInvalidNonce, len(p.Nonce), MinNonceLength, MaxNonceLength)
 	}
 	return nil
 }

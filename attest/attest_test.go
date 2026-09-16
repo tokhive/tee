@@ -72,7 +72,7 @@ func defaultConfig(t *testing.T, fetcher Fetcher, policyHash [32]byte) *Verifier
 		AllowedPlatforms: []string{simulated.Platform},
 		ByPlatform:       map[string]platform.EvidenceVerifier{simulated.Platform: simulated.Verifier{}},
 		Fetcher:          fetcher,
-		PolicySetHash:    policyHash,
+		PolicyHash:    policyHash,
 	}
 	v, err := New(cfg)
 	if err != nil {
@@ -221,7 +221,7 @@ func TestDeploymentBindingEnforced(t *testing.T) {
 	cfg := Config{
 		AllowedPlatforms: []string{simulated.Platform},
 		ByPlatform:       map[string]platform.EvidenceVerifier{simulated.Platform: simulated.Verifier{}},
-		PolicySetHash:    policyHash,
+		PolicyHash:    policyHash,
 	}
 	deployVer, err := New(cfg)
 	if err != nil {

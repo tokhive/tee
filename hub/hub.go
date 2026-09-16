@@ -192,6 +192,16 @@ type Config struct {
 	// deliberate stance for a Hub that only runs against scripted stand-ins.
 	AgentKeys map[string][]byte
 
+	// AdmitAgent, when set, is consulted with a registering agent before it
+	// becomes schedulable. It is where the deployment's whitelist gets to
+	// refuse a seller: a provider agent declares what it charges and which
+	// models it serves, never what the enclave will accept, so admission is a
+	// question the operator's policy answers, not the agent's.
+	//
+	// Nil admits every authenticated agent — the stance for a Hub whose
+	// whitelist lives entirely in the TEE, where a job would be refused instead.
+	AdmitAgent func(AgentRegister) error
+
 	// RelaySecret is the key the TEE must present to dial the TeeRelay
 	// endpoint (RelayKeyHeader). The relay bridges any stream into any online
 	// agent's tunnel, so an unauthenticated one is an open egress proxy
@@ -237,6 +247,7 @@ type Hub struct {
 	sessionIdle         time.Duration
 
 	agents          *agentRegistry
+	admit           func(AgentRegister) error
 	agentKeys       map[string][]byte
 	relaySecret     []byte
 	credentials     CredentialService
@@ -309,6 +320,7 @@ func New(cfg Config) (*Hub, error) {
 
 		agents:          newAgentRegistry(),
 		agentKeys:       cfg.AgentKeys,
+		admit:           cfg.AdmitAgent,
 		relaySecret:     cfg.RelaySecret,
 		credentials:     cfg.Credentials,
 		credentialStore: credentialStore,
