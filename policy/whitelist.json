@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "hosts": [
+    "127.0.0.1:18080",
+    "api.openai.com",
+    "api.anthropic.com",
+    "chatgpt.com"
+  ],
+  "rules": [
+    {
+      "methods": ["POST"],
+      "path": "/v1/chat/completions",
+      "allow_stream": true,
+      "query_keys": ["fault"]
+    },
+    {
+      "methods": ["POST"],
+      "path": "/v1/responses",
+      "allow_stream": true,
+      "query_keys": ["fault"]
+    },
+    {
+      "methods": ["POST"],
+      "path": "/v1/messages",
+      "allow_stream": true,
+      "query_keys": ["fault"]
+    },
+    {
+      "methods": ["POST"],
+      "path": "/backend-api/codex/responses",
+      "allow_stream": true
+    },
+    {
+      "methods": ["GET"],
+      "path": "/v1/realtime",
+      "allow_stream": true,
+      "allow_any_query": true
+    }
+  ],
+  "limits": {
+    "max_response_bytes": 1048576,
+    "max_body_bytes": 1048576,
+    "allowed_headers": ["Content-Type"]
+  }
+}

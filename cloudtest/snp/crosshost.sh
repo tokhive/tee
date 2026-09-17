@@ -41,9 +41,11 @@ CERTS_DIR="${HERE}/.certs"
 # POLICY_DIR is the deployment whitelist baked into the measured bundle. The
 # enclave loads exactly this file at startup and refuses to serve without it, so
 # it is not optional build input: a bundle built without it produces an AMI whose
-# TEE cannot come up. It is generated once and reused, because its bytes are
-# measured — re-emitting it on every build would change SNP_APP_HASH with no
-# code change. Set SNP_POLICY_DIR to ship an operator-authored whitelist.
+# TEE cannot come up. It is regenerated on every build from the document in
+# tokenhive/policy/whitelist.json — the document is deterministic, so re-emitting
+# it is a no-op until the document changes, and a change to the document always
+# reaches the bundle. Set SNP_POLICY_DIR to ship an operator-authored whitelist
+# instead.
 POLICY_DIR="${SNP_POLICY_DIR:-${CERTS_DIR}/policy}"
 REPO_ROOT="${HERE}/../../.."            # reclaim-tee
 DEPLOY_DIR="${REPO_ROOT}/deploy"
@@ -94,10 +96,11 @@ PY
 #
 # When the operator supplied a directory (SNP_POLICY_DIR) that is their
 # document and this script must not touch it. Otherwise the whitelist is the
-# code's own default, and it is regenerated on every build: the default is
-# deterministic, so re-emitting it is a no-op until the document actually
-# changes — and a frozen copy would silently keep shipping the old rules (a new
-# host or path in the default would never reach the bundle).
+# document shipped in tokenhive/policy/whitelist.json, and it is regenerated on
+# every build: the document is deterministic, so re-emitting it is a no-op until
+# the document actually changes — and a frozen copy would silently keep shipping
+# the old rules (a new host or path in the document would never reach the
+# bundle).
 ensure_policy() {
   if [ -n "${SNP_POLICY_DIR:-}" ]; then
     if [ ! -f "${POLICY_DIR}/policy.cbor" ]; then

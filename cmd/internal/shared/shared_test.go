@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 )
 
 // TestWritePolicyDirRoundTrips pins the "bake the whitelist into a policy
@@ -41,7 +43,7 @@ func TestWritePolicyDirRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadPolicy from the policy dir: %v", err)
 	}
-	want := DefaultPolicy()
+	want := defaultPolicy(t)
 	if len(loaded.Hosts) != len(want.Hosts) {
 		t.Fatalf("hosts = %v, want %v", loaded.Hosts, want.Hosts)
 	}
@@ -95,7 +97,7 @@ func TestStalePerProviderPoliciesAreIgnored(t *testing.T) {
 	}
 
 	// A wider whitelist, at the path an older deployment would have used.
-	stale := DefaultPolicy()
+	stale := defaultPolicy(t)
 	stale.Hosts = append(stale.Hosts, "evil.example.com")
 	enc, err := stale.EncodeCanonical()
 	if err != nil {
@@ -130,7 +132,7 @@ func TestStalePerProviderPoliciesAreIgnored(t *testing.T) {
 // onboards against this document, so dropping either API would silently make
 // every seller of that shape unadmittable.
 func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
-	p := DefaultPolicy()
+	p := defaultPolicy(t)
 
 	for _, r := range []struct{ host, path, method string }{
 		{"api.openai.com", "/v1/chat/completions", "POST"},
@@ -229,7 +231,7 @@ func TestEnsureDefaultsLeavesAConfiguredPolicyAlone(t *testing.T) {
 // artifact irreproducible — which is also what lets a build re-emit the policy
 // on every run instead of freezing a copy that silently goes stale.
 func TestDefaultPolicyIsReproducible(t *testing.T) {
-	first, err := DefaultPolicy().Hash()
+	first, err := defaultPolicy(t).Hash()
 	if err != nil {
 		t.Fatalf("hash: %v", err)
 	}
@@ -265,11 +267,25 @@ func TestDefaultPolicyDoesNotLapse(t *testing.T) {
 	// timestamp, so an open-ended policy passes and a term of years fails.
 	far := time.Unix(1<<40, 0)
 
-	p := DefaultPolicy()
+	p := defaultPolicy(t)
 	if err := p.Validate(); err != nil {
-		t.Fatalf("DefaultPolicy().Validate: %v", err)
+		t.Fatalf("policy.Default().Validate: %v", err)
 	}
 	if err := p.ValidateAt(far); err != nil {
 		t.Fatalf("default policy lapsed before t=%d: %v", far.Unix(), err)
 	}
+}
+
+// defaultPolicy is the shipped deployment whitelist, for the tests that need to
+// compare a loaded policy against it. It is policy.Default — the document in
+// tokenhive/policy/whitelist.json — reached through the same call the runtime
+// makes, so a document that stopped parsing fails here rather than in a test
+// fixture that had its own copy.
+func defaultPolicy(t *testing.T) policy.Policy {
+	t.Helper()
+	p, err := policy.Default()
+	if err != nil {
+		t.Fatalf("policy.Default: %v", err)
+	}
+	return p
 }

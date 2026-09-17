@@ -23,7 +23,6 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"math"
 	"math/big"
 	"net"
 	"os"
@@ -46,34 +45,11 @@ import (
 // they are device identities, keyed by each agent's dial-in key and by the Hub's
 // rate table. They are deliberately NOT upstreams — what a seller charges and
 // which agent it is have nothing to do with which AI endpoint the deployment
-// reaches, which is the whitelist's business (see DefaultPolicy).
+// reaches, which is the whitelist's business (see policy.Default).
 const (
 	providerName  = "openai-sim"
 	providerCheap = "cheap-sim"
-	providerHost  = "127.0.0.1:18080"
-	providerPath  = "/v1/chat/completions"
 )
-
-// policyNoExpiry is the ExpiresAt stamped on the Hub-predefined public
-// whitelist. That policy is deployment scaffolding every seller onboards
-// against, not a rotating per-seller grant, so its window is deliberately left
-// effectively open: a lapsed default policy would turn every seller
-// unserviceable the moment the clock crossed it, and nothing would say so until
-// a job was refused. Replacing it is a redeploy, not a runtime event; the
-// calendar simply never forces one. math.MaxInt64 seconds since the epoch is
-// ~292 billion years, and policy.ValidateAt only requires ExpiresAt > IssuedAt,
-// so this never trips ErrPolicyExpired.
-const policyNoExpiry = int64(math.MaxInt64)
-
-// policyNoIssueDate is the IssuedAt stamped on the shipped whitelist. A
-// constant rather than "now", because these bytes are measured: a generated
-// policy that changed on every build would move SNP_APP_HASH with no code
-// change and leave the artifact irreproducible. The field only needs to be a
-// positive instant before the (open) expiry, and the epoch says exactly what is
-// true — no issue date applies. Regenerating the policy is therefore a no-op
-// until the document itself changes, which is what lets the build re-emit it
-// every time instead of freezing a stale copy.
-const policyNoIssueDate = 1
 
 // ConfigDir returns the simulation working directory. Override with
 // TOKENHIVE_SIM_DIR to keep runs isolated.
@@ -150,7 +126,11 @@ func EnsureDefaults() error {
 	// is already in force and writing a second, generated copy into the state
 	// directory would only leave a file that looks authoritative and is not.
 	if policyDirOverride == "" {
-		if err := writePolicy(dir, DefaultPolicy()); err != nil {
+		p, err := policy.Default()
+		if err != nil {
+			return err
+		}
+		if err := writePolicy(dir, p); err != nil {
 			return err
 		}
 	}
@@ -227,60 +207,20 @@ func writePolicy(dir string, p policy.Policy) error {
 // the loaders expect, without booting a TEE. pack.sh uses it so the whitelist
 // travels inside the measured SNP bundle (covered by SNP_APP_HASH), and tests
 // use it to produce a policy directory to point -policy-dir at.
+//
+// It writes policy.Default — the document in tokenhive/policy/whitelist.json.
+// Nothing here defines the whitelist: this only puts it on disk in the layout a
+// policy directory needs.
 func WritePolicyDir(dir string) error {
-	return writePolicy(dir, DefaultPolicy())
+	p, err := policy.Default()
+	if err != nil {
+		return err
+	}
+	return writePolicy(dir, p)
 }
 
 func policyPath() string             { return policyPathIn(PolicyDir()) }
 func policyPathIn(dir string) string { return filepath.Join(dir, "policy.cbor") }
-
-// DefaultPolicy is the deployment whitelist the simulation ships. It is the
-// real policy.Policy type — the simulation loads it through the genuine policy
-// engine, not a parallel hand-rolled structure.
-//
-// One document covers the whole deployment: every provider agent egresses under
-// it and none of them can widen it. Hosts name the upstreams the deployment is
-// willing to reach — the two AI vendors' API endpoints, the ChatGPT
-// subscription endpoint a logged-in account speaks to, and the mock host the
-// simulation runs every shape behind.
-//
-// The whitelisted paths mirror the Hub's user-facing routes: the OpenAI chat
-// completions endpoint, the OpenAI Responses endpoint, the Anthropic messages
-// endpoint, and the streaming-session endpoint, plus the ChatGPT subscription
-// endpoint. In a real deployment the first two live on api.openai.com, the
-// third on api.anthropic.com and the fourth on chatgpt.com; the simulation
-// serves every shape from one mock host so a single whitelist covers them all.
-func DefaultPolicy() policy.Policy {
-	return policy.Policy{
-		Version: policy.VersionV1,
-		Hosts: []string{
-			providerHost,
-			"api.openai.com",
-			"api.anthropic.com",
-			"chatgpt.com",
-		},
-		Rules: []policy.Rule{
-			{Methods: []string{"POST"}, Path: providerPath, AllowStream: true, QueryKeys: []string{"fault"}},
-			{Methods: []string{"POST"}, Path: "/v1/responses", AllowStream: true, QueryKeys: []string{"fault"}},
-			{Methods: []string{"POST"}, Path: "/v1/messages", AllowStream: true, QueryKeys: []string{"fault"}},
-			// A ChatGPT subscription account does not speak the API endpoints; its
-			// responses travel to this path on chatgpt.com. A seller contributing
-			// such an account is only onboardable if the whitelist names it.
-			{Methods: []string{"POST"}, Path: "/backend-api/codex/responses", AllowStream: true},
-			// The streaming-session endpoint: a WebSocket upgrade, so it is a GET
-			// with no body whose whole framing is the Hub's business. AllowStream
-			// is set because the tunnel is unbounded by definition.
-			{Methods: []string{"GET"}, Path: "/v1/realtime", AllowStream: true, AllowAnyQuery: true},
-		},
-		Limits: policy.Limits{
-			MaxResponseBytes: 1 << 20,
-			MaxBodyBytes:     1 << 20,
-			AllowedHeaders:   []string{"Content-Type"},
-		},
-		IssuedAt:  policyNoIssueDate,
-		ExpiresAt: policyNoExpiry,
-	}
-}
 
 // LoadPolicy reads the deployment whitelist. There is exactly one, so the TEE
 // that enforces it and the Hub that advertises and admits against it read the

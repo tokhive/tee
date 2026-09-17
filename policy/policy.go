@@ -83,35 +83,41 @@ var (
 // identity that a single deployment policy has no place for, 6 held the
 // credential's injection shape (now sealed inside the per-job envelope, see
 // tee.Secret), and 11 held a rotation nonce.
+//
+// The same fields are the shape of the deployment's configuration document
+// (whitelist.json), so the json tags are configuration keys and the two sets
+// must be kept in step: a field with no json tag is a field the document can
+// never set. Only the validity window is left out of the document and stamped
+// by the loader (see Default).
 type Policy struct {
-	Version uint32   `cbor:"1,keyasint"`
-	Hosts   []string `cbor:"4,keyasint"`
-	Rules   []Rule   `cbor:"5,keyasint"`
-	Limits  Limits   `cbor:"7,keyasint"`
+	Version uint32   `cbor:"1,keyasint" json:"version"`
+	Hosts   []string `cbor:"4,keyasint" json:"hosts"`
+	Rules   []Rule   `cbor:"5,keyasint" json:"rules"`
+	Limits  Limits   `cbor:"7,keyasint" json:"limits"`
 
-	IssuedAt  int64 `cbor:"8,keyasint"`
-	ExpiresAt int64 `cbor:"9,keyasint"`
+	IssuedAt  int64 `cbor:"8,keyasint" json:"issued_at"`
+	ExpiresAt int64 `cbor:"9,keyasint" json:"expires_at"`
 }
 
 // Rule permits one family of requests: a path pattern crossed with the methods
 // allowed on it.
 type Rule struct {
-	Methods       []string `cbor:"1,keyasint"`
-	Path          string   `cbor:"2,keyasint"`
-	AllowStream   bool     `cbor:"3,keyasint,omitempty"`
-	QueryKeys     []string `cbor:"4,keyasint,omitempty"`
-	AllowAnyQuery bool     `cbor:"5,keyasint,omitempty"`
+	Methods       []string `cbor:"1,keyasint" json:"methods"`
+	Path          string   `cbor:"2,keyasint" json:"path"`
+	AllowStream   bool     `cbor:"3,keyasint,omitempty" json:"allow_stream,omitempty"`
+	QueryKeys     []string `cbor:"4,keyasint,omitempty" json:"query_keys,omitempty"`
+	AllowAnyQuery bool     `cbor:"5,keyasint,omitempty" json:"allow_any_query,omitempty"`
 }
 
 // Limits are the bounds a job must stay inside. The TEE applies the stricter
 // of the job's own limit and the policy's.
 type Limits struct {
 	// MaxResponseBytes caps the attested response size.
-	MaxResponseBytes uint64 `cbor:"1,keyasint"`
+	MaxResponseBytes uint64 `cbor:"1,keyasint" json:"max_response_bytes"`
 	// MaxBodyBytes caps the request body size. Zero forbids a request body.
-	MaxBodyBytes uint64 `cbor:"2,keyasint"`
+	MaxBodyBytes uint64 `cbor:"2,keyasint" json:"max_body_bytes"`
 	// AllowedHeaders is the whitelist of caller-settable header names.
-	AllowedHeaders []string `cbor:"3,keyasint"`
+	AllowedHeaders []string `cbor:"3,keyasint" json:"allowed_headers"`
 }
 
 // EncodeCanonical returns the deterministic CBOR encoding of the policy.
