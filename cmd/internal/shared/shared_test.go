@@ -136,6 +136,7 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 		{"api.openai.com", "/v1/chat/completions", "POST"},
 		{"api.openai.com", "/v1/responses", "POST"},
 		{"api.anthropic.com", "/v1/messages", "POST"},
+		{"chatgpt.com", "/backend-api/codex/responses", "POST"},
 	} {
 		if err := p.AllowsRoute(r.host, r.path, r.method); err != nil {
 			t.Errorf("%s %s%s not admitted by the default policy: %v", r.method, r.host, r.path, err)
@@ -146,6 +147,111 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 	// real APIs did not turn the whitelist into a wildcard.
 	if err := p.AllowsRoute("evil.example.com", "/v1/chat/completions", "POST"); err == nil {
 		t.Error("the default policy admitted a host it does not name")
+	}
+}
+
+// TestResolvePolicyDir pins the one rule for where a whitelist comes from. The
+// measured bundle wins over the state directory, because rules read from
+// outside the measurement are rules the attestation says nothing about; an
+// explicit setting wins over both.
+func TestResolvePolicyDir(t *testing.T) {
+	root := t.TempDir()
+	old := bundleRoot
+	bundleRoot = root
+	t.Cleanup(func() { bundleRoot = old })
+
+	measured := filepath.Join(root, "policy")
+	if err := WritePolicyDir(measured); err != nil {
+		t.Fatalf("WritePolicyDir: %v", err)
+	}
+
+	cases := []struct {
+		name       string
+		configured string
+		want       string
+	}{
+		{"nothing configured, measured bundle present", "", measured},
+		{"explicit setting wins", "/operator/policy", "/operator/policy"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ResolvePolicyDir(tc.configured); got != tc.want {
+				t.Fatalf("ResolvePolicyDir(%q) = %q, want %q", tc.configured, got, tc.want)
+			}
+		})
+	}
+
+	// A bundle that carries no whitelist resolves to nothing rather than to
+	// some other directory: the caller decides the fallback, so a missing
+	// measured policy can never be quietly satisfied by an unrelated file.
+	empty := t.TempDir()
+	bundleRoot = empty
+	if got := ResolvePolicyDir(""); got != "" {
+		t.Fatalf("ResolvePolicyDir() = %q with no policy in the bundle, want empty", got)
+	}
+}
+
+// TestEnsureDefaultsLeavesAConfiguredPolicyAlone pins that the fixture writer
+// does not drop a second, generated whitelist beside a directory the operator
+// configured. Two policy files, one enforced and one merely present, is exactly
+// how the policy a deployment runs drifts from the policy it measures.
+func TestEnsureDefaultsLeavesAConfiguredPolicyAlone(t *testing.T) {
+	simDir := t.TempDir()
+	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
+	t.Cleanup(func() { SetPolicyDir("") })
+
+	SetPolicyDir(t.TempDir())
+	if err := EnsureDefaults(); err != nil {
+		t.Fatalf("EnsureDefaults: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(simDir, "policy.cbor")); err == nil {
+		t.Fatal("EnsureDefaults wrote a whitelist beside a configured policy directory")
+	}
+	// The rate table is not policy: the Hub still needs it.
+	if _, err := os.Stat(filepath.Join(simDir, "rates.json")); err != nil {
+		t.Fatalf("EnsureDefaults must still write the rate table: %v", err)
+	}
+
+	// With nothing configured, the simulation's own whitelist is materialized
+	// and loadable.
+	SetPolicyDir("")
+	if err := EnsureDefaults(); err != nil {
+		t.Fatalf("EnsureDefaults: %v", err)
+	}
+	if _, err := LoadPolicy(); err != nil {
+		t.Fatalf("the simulation whitelist should be loadable: %v", err)
+	}
+}
+
+// TestDefaultPolicyIsReproducible pins that the shipped whitelist is a function
+// of the code alone. Its bytes are measured, so a document that changed on
+// every generation would move SNP_APP_HASH with no code change and leave the
+// artifact irreproducible — which is also what lets a build re-emit the policy
+// on every run instead of freezing a copy that silently goes stale.
+func TestDefaultPolicyIsReproducible(t *testing.T) {
+	first, err := DefaultPolicy().Hash()
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+
+	// Round-trip through the filesystem as well, so the encoder and the loader
+	// are in the loop and not just the in-memory document.
+	dir := t.TempDir()
+	if err := WritePolicyDir(dir); err != nil {
+		t.Fatalf("WritePolicyDir: %v", err)
+	}
+	t.Cleanup(func() { SetPolicyDir("") })
+	SetPolicyDir(dir)
+	loaded, err := LoadPolicy()
+	if err != nil {
+		t.Fatalf("LoadPolicy: %v", err)
+	}
+	again, err := loaded.Hash()
+	if err != nil {
+		t.Fatalf("hash loaded: %v", err)
+	}
+	if first != again {
+		t.Fatal("the default whitelist is not reproducible across generations")
 	}
 }
 

@@ -104,7 +104,7 @@ func main() {
 	// On an SNP bundle the deployment whitelist lives inside the measured tar at
 	// ./policy; point this there so the /v1/policies view (what buyers and sellers
 	// are told the enclave will accept) is the same bytes the enclave enforces.
-	policyDir := flag.String("policy-dir", "", "directory the deployed whitelist policy is baked into (the measured bundle's policy/ on SNP); empty = load from TOKENHIVE_SIM_DIR")
+	policyDir := flag.String("policy-dir", "", "directory holding the deployment whitelist (policy.cbor); empty = the measured bundle's policy/ when it has one, else TOKENHIVE_SIM_DIR")
 	evFetchURL := flag.String("evidence-fetch", "", "base URL for remote evidence retrieval (e.g. https://tee:18090); empty = resolve EvidenceHash from the local evidence store only")
 	mtlsCA := flag.String("mtls-ca", "", "PEM file pinning the TEE's RA-TLS certificate (or the CA that signs it); the RA-TLS verification half of Hub↔TEE mTLS. Implies -tee is https://")
 	mtlsCert := flag.String("mtls-cert", "", "client certificate the Hub presents to the TEE under mTLS; empty defaults to <simdir>/hub-client.pem")
@@ -179,8 +179,13 @@ func main() {
 	// up before any TEE materialized the fixtures still starts, but it reports
 	// the whitelist unavailable and admits nobody, rather than admitting sellers
 	// the enclave would then refuse job by job.
-	if *policyDir != "" {
-		shared.SetPolicyDir(*policyDir)
+	//
+	// It resolves through the same rule the TEE uses: an explicit -policy-dir
+	// wins, then the measured bundle's copy, then the state directory. A Hub
+	// inside a bundle has to enforce what that bundle carries, or it would
+	// admit and price against rules the attestation says nothing about.
+	if resolved := shared.ResolvePolicyDir(*policyDir); resolved != "" {
+		shared.SetPolicyDir(resolved)
 	}
 	var policyDoc *policy.Policy
 	if policyDoc, err = shared.LoadPolicy(); err != nil {

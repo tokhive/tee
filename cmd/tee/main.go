@@ -101,7 +101,7 @@ func main() {
 	// enclave enforces IS the measured copy in the bundle tar, whose digest the
 	// loader exports as SNP_APP_HASH — so a rotated whitelist changes the attestation
 	// fingerprint instead of silently widening what the enclave will accept.
-	policyDir := flag.String("policy-dir", envOr("TEE_POLICY_DIR", ""), "directory the deployed whitelist policy is baked into (the measured bundle's policy/ on SNP); empty = load from TOKENHIVE_SIM_DIR")
+	policyDir := flag.String("policy-dir", envOr("TEE_POLICY_DIR", ""), "directory holding the deployment whitelist (policy.cbor); empty = the measured bundle's policy/ when it has one, else TOKENHIVE_SIM_DIR")
 	emitPolicyDir := flag.String("emit-policy-dir", "", "write the deployment whitelist policy to this directory and exit (used by pack.sh to bake the policy into the measured bundle)")
 	flag.Parse()
 
@@ -115,8 +115,9 @@ func main() {
 		}
 		return
 	}
-	if *policyDir != "" {
-		shared.SetPolicyDir(*policyDir)
+	if resolved := shared.ResolvePolicyDir(*policyDir); resolved != "" {
+		shared.SetPolicyDir(resolved)
+		log.Printf("whitelist policy directory: %s", resolved)
 	}
 
 	// Fixtures are idempotent and live under TOKENHIVE_SIM_DIR (default .sim):

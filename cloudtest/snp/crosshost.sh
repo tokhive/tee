@@ -90,10 +90,21 @@ print(img[-1]["ImageId"])
 PY
 }
 
-# ensure_policy materializes the deployment whitelist ONCE and reuses it.
+# ensure_policy materializes the deployment whitelist the bundle carries.
+#
+# When the operator supplied a directory (SNP_POLICY_DIR) that is their
+# document and this script must not touch it. Otherwise the whitelist is the
+# code's own default, and it is regenerated on every build: the default is
+# deterministic, so re-emitting it is a no-op until the document actually
+# changes — and a frozen copy would silently keep shipping the old rules (a new
+# host or path in the default would never reach the bundle).
 ensure_policy() {
-  if [ -f "${POLICY_DIR}/policy.cbor" ]; then
-    log "reusing deployment whitelist ${POLICY_DIR}/policy.cbor"
+  if [ -n "${SNP_POLICY_DIR:-}" ]; then
+    if [ ! -f "${POLICY_DIR}/policy.cbor" ]; then
+      log "SNP_POLICY_DIR=${SNP_POLICY_DIR} has no policy.cbor"
+      exit 1
+    fi
+    log "using operator whitelist ${POLICY_DIR}/policy.cbor"
     return
   fi
   mkdir -p "${POLICY_DIR}"
@@ -211,8 +222,19 @@ cmd_deploy() {
   local hip tip cert app_hash
   hip="$(host_field public_ip)"; tip="$(tee_field private_ip)"  # cross-host plane over private ips
   app_hash="$(tee_field app_hash)"
+  # The Hub admits agents and advertises /v1/policies from the same whitelist
+  # the enclave enforces, so it has to read the very bytes the AMI measures.
+  # Only the build's copy is that file: the whitelist is generated once because
+  # its bytes sit inside SNP_APP_HASH, and re-emitting it here would produce a
+  # different document — different IssuedAt, different hash — that no longer
+  # describes what the TEE runs.
+  if [ ! -f "${POLICY_DIR}/policy.cbor" ]; then
+    log "no whitelist at ${POLICY_DIR}/policy.cbor; run './crosshost.sh build' first"
+    exit 1
+  fi
+
   log "step: deploy runtime to host ${hip} (tee ${tip}, app ${app_hash})"
-  remote_exec "$hip" 'mkdir -p tee mtls' >/dev/null
+  remote_exec "$hip" 'mkdir -p tee mtls policy' >/dev/null
   remote_push "$hip" "${CLOUDTEST}/bin/hub" "tee/hub" >/dev/null
   remote_push "$hip" "${CLOUDTEST}/bin/agent" "tee/agent" >/dev/null
   remote_push "$hip" "${CLOUDTEST}/bin/mockprovider" "tee/mockprovider" >/dev/null
@@ -223,6 +245,7 @@ cmd_deploy() {
   remote_push "$hip" "${CERTS_DIR}/mp-key.pem" "mtls/mp-key.pem" >/dev/null
   # tee-cert.pem (pinned) lives in CERTS_DIR after fetch
   remote_push "$hip" "${CERTS_DIR}/tee-cert.pem" "mtls/tee-cert.pem" >/dev/null
+  remote_push "$hip" "${POLICY_DIR}/policy.cbor" "policy/policy.cbor" >/dev/null
 
   # Per-provider agent key and the tee relay key. The Hub now requires both
   # (-agent-keys and -relay-key); the tee must present the same relay key, which
@@ -242,6 +265,7 @@ chmod 755 ./tee/hub ./tee/agent ./tee/mockprovider
   -ca mtls/mp-ca.pem -cert mtls/mp-cert.pem -key mtls/mp-key.pem >tee/mp.log 2>&1 &
 sleep 1
 ./tee/hub -serve 0.0.0.0:18085 -agent-keys 'openai-sim=${agent_key}' -relay-key '${relay_key}' \
+  -policy-dir "\$HOME/tee/policy" \
   -host 127.0.0.1:18080 \
   -model sim-mock-0.5b -tee https://${tip}:18090 -mtls-ca mtls/tee-cert.pem \
   -mtls-cert mtls/hub-cert.pem -mtls-key mtls/hub-key.pem \
