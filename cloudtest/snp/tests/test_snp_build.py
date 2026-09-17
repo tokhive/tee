@@ -71,12 +71,13 @@ if service == "sts":
     print("123456789012")
 elif service == "s3" and args[1] == "mb":
     sys.exit(0)
-elif service == "s3" and args[1] == "cp":
-    src, dst = args[2], args[3].split("/", 3)[3]
+elif service == "s3api" and args[1] == "put-object":
+    key = args[args.index("--key") + 1]
+    body = args[args.index("--body") + 1]
     if os.environ.get("AWS_STUB_NOOP") == "1":
         pass                      # the bug under test: the upload does nothing
     else:
-        store[dst] = checksum(src)
+        store[key] = checksum(body)
         save()
 elif service == "s3" and args[1] == "rm":
     store.pop(args[2].split("/", 3)[3], None)
@@ -185,9 +186,9 @@ class PackageAwsTest(unittest.TestCase):
 
     @classmethod
     def _uploaded_key(cls, calls):
-        ups = cls._calls(calls, "s3", "cp")
+        ups = cls._calls(calls, "s3api", "put-object")
         assert len(ups) == 1, calls
-        return ups[0][3].split("/", 3)[3]
+        return ups[0][ups[0].index("--key") + 1]
 
     def test_staging_key_names_the_app(self):
         # A fixed key is what made a stale object look like this build's.
