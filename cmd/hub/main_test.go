@@ -70,3 +70,42 @@ func TestRequireServeKeys(t *testing.T) {
 		})
 	}
 }
+
+// parseProviderHosts is fail-fast startup parsing: a typo must refuse to boot
+// rather than leave a provider routed at a host it can never be admitted on.
+func TestParseProviderHosts(t *testing.T) {
+	t.Run("empty means no overrides", func(t *testing.T) {
+		m, err := parseProviderHosts("")
+		if err != nil {
+			t.Fatalf("parseProviderHosts(\"\") = %v, want nil", err)
+		}
+		if m != nil {
+			t.Fatalf("parseProviderHosts(\"\") = %v, want nil", m)
+		}
+	})
+
+	t.Run("valid entries", func(t *testing.T) {
+		m, err := parseProviderHosts("anthropic-seller=api.anthropic.com,openai-seller=api.openai.com:443")
+		if err != nil {
+			t.Fatalf("parseProviderHosts = %v, want nil", err)
+		}
+		if m["anthropic-seller"] != "api.anthropic.com" || m["openai-seller"] != "api.openai.com:443" {
+			t.Fatalf("parseProviderHosts = %v, want both overrides", m)
+		}
+	})
+
+	for _, spec := range []string{
+		"not-a-pair",
+		"anthropic-seller=https://api.anthropic.com",
+		"anthropic-seller=api.anthropic.com/v1",
+		"anthropic-seller=",
+		"=api.anthropic.com",
+		"BAD-NAME=api.anthropic.com",
+	} {
+		t.Run("reject "+spec, func(t *testing.T) {
+			if _, err := parseProviderHosts(spec); err == nil {
+				t.Fatalf("parseProviderHosts(%q) succeeded, want error", spec)
+			}
+		})
+	}
+}

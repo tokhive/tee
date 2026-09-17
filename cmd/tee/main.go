@@ -101,7 +101,7 @@ func main() {
 	// enclave enforces IS the measured copy in the bundle tar, whose digest the
 	// loader exports as SNP_APP_HASH — so a rotated whitelist changes the attestation
 	// fingerprint instead of silently widening what the enclave will accept.
-	policyDir := flag.String("policy-dir", envOr("TEE_POLICY_DIR", ""), "directory holding the deployment whitelist (policy.cbor); empty = the measured bundle's policy/ when it has one, else TOKENHIVE_SIM_DIR")
+	policyDir := flag.String("policy-dir", envOr("TEE_POLICY_DIR", ""), "directory holding the deployment whitelist (policy.cbor); empty = the measured bundle's policy/ when it has one, else TOKENHIVE_SIM_DIR. A configured directory without a policy.cbor is always an error; on the sevsnp platform the measured bundle's copy additionally wins — an explicit dir may only restate its exact bytes, never replace them")
 	emitPolicyDir := flag.String("emit-policy-dir", "", "write the deployment whitelist policy to this directory and exit (used by pack.sh to bake the policy into the measured bundle)")
 	flag.Parse()
 
@@ -115,7 +115,12 @@ func main() {
 		}
 		return
 	}
-	if resolved := shared.ResolvePolicyDir(*policyDir); resolved != "" {
+	if resolved, err := shared.ResolvePolicyDir(*policyDir, *platformName == "sevsnp"); err != nil {
+		// On the SNP path the whitelist is part of the measured bundle and its
+		// absence is an operator error: the attestation covers its exact bytes,
+		// so the TEE must not invent a default for itself.
+		log.Fatalf("resolve policy dir: %v", err)
+	} else if resolved != "" {
 		shared.SetPolicyDir(resolved)
 		log.Printf("whitelist policy directory: %s", resolved)
 	}

@@ -45,11 +45,17 @@ const defaultRequestReadTimeout = 30 * time.Second
 // serveConfig is the routing the resident service hands to the scheduler: the
 // upstream it asks the TEE to reach.
 type serveConfig struct {
-	Addr    string // where the Hub listens for its users
-	Host    string // the AI service host:port (must be admitted by the deployment policy)
-	Query   string // extra upstream query (fault injection, for the harness)
-	Max     uint64 // MaxResponseBytes cap passed to the TEE. For a request it caps the body; for a session it caps the downlink, so the session settles for what it delivered instead of being cut un-reconcilably by the Hub
-	Tenants tenantResolver
+	Addr string // where the Hub listens for its users
+	Host string // the default AI service host:port (must be admitted by the deployment policy)
+	// ProviderHosts overrides Host for the named providers. A deployment serves
+	// every model from one host in the simulation, but a real deployment fronts
+	// several vendors' endpoints, and one seller's token is only good at its
+	// own vendor: HostFor (below) is what every spec-framing site uses, so a
+	// provider absent from the map is served at Host and nothing else changes.
+	ProviderHosts map[string]string
+	Query         string // extra upstream query (fault injection, for the harness)
+	Max           uint64 // MaxResponseBytes cap passed to the TEE. For a request it caps the body; for a session it caps the downlink, so the session settles for what it delivered instead of being cut un-reconcilably by the Hub
+	Tenants       tenantResolver
 	// Policy is the deployment whitelist. The Hub advertises it on /v1/policies
 	// and admits every dialing agent against it, so buyers and sellers see
 	// exactly the whitelist the enclave enforces (the same bundle bytes on an
@@ -57,6 +63,17 @@ type serveConfig struct {
 	// checked up front. Nil means the whitelist was unavailable at startup:
 	// the endpoint says so, and no agent is admitted.
 	Policy *policy.Policy
+}
+
+// HostFor returns the upstream host:port jobs for provider are framed with:
+// the per-provider override when one is configured, otherwise the Hub-wide
+// default. A zero ProviderHosts map keeps the old behavior (everything to
+// Host), so single-upstream deployments and existing tests need no changes.
+func (c serveConfig) HostFor(provider string) string {
+	if h, ok := c.ProviderHosts[provider]; ok {
+		return h
+	}
+	return c.Host
 }
 
 // tenantKeyHeader is the header a user presents to identify itself. It is the
@@ -302,12 +319,12 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if req.Provider != "" {
 		outcome, err = c.h.ExecuteForProvider(r.Context(), tenant, req.Model, req.Provider, body,
 			func(provider string) (jobs.Spec, error) {
-				return buildSpec(provider, c.cfg.Host, c.route.Path, c.cfg.Query, body, c.cfg.Max)
+				return buildSpec(provider, c.cfg.HostFor(provider), c.route.Path, c.cfg.Query, body, c.cfg.Max)
 			}, onChunk, commit)
 	} else {
 		outcome, err = c.h.ExecuteForModel(r.Context(), tenant, req.Model, body,
 			func(provider string) (jobs.Spec, error) {
-				return buildSpec(provider, c.cfg.Host, c.route.Path, c.cfg.Query, body, c.cfg.Max)
+				return buildSpec(provider, c.cfg.HostFor(provider), c.route.Path, c.cfg.Query, body, c.cfg.Max)
 			}, onChunk, commit)
 	}
 	if !started {
@@ -483,20 +500,24 @@ func policiesHandler(p *policy.Policy) http.HandlerFunc {
 // A seller chooses what it charges and which models it declares; it does not get
 // to choose what the enclave will accept. So before an agent becomes
 // schedulable the Hub looks up, by host and path, whether the deployment is
-// willing to reach the upstreams this agent's models travel on. An agent whose
-// models could only be served on a path the whitelist does not cover would
-// otherwise be scheduled and then refused inside the TEE — a refusal the seller
-// never sees the reason for. Refusing at bring-up says so where the seller is
-// standing.
+// willing to reach the upstream this agent's jobs will egress to. That upstream
+// is per-provider — the agent's own host from the Hub's routing (a
+// -provider-hosts override when one is configured, otherwise the Hub-wide
+// -host) — because one seller's token is only good at its own vendor. An agent
+// whose models could only be served on a path the whitelist does not cover
+// would otherwise be scheduled and then refused inside the TEE — a refusal the
+// seller never sees the reason for. Refusing at bring-up says so where the
+// seller is standing.
 //
 // The whole route surface is checked, because a buyer picks the route and the
 // Hub picks the seller: a model is only really admitted if the deployment admits
 // every surface it could be asked for on.
-func admitAgainstPolicy(p *policy.Policy, host string) func(hub.AgentRegister) error {
+func admitAgainstPolicy(p *policy.Policy, hostFor func(string) string) func(hub.AgentRegister) error {
 	return func(reg hub.AgentRegister) error {
 		if p == nil {
 			return fmt.Errorf("no deployment policy loaded: refusing agent %q", reg.Provider)
 		}
+		host := hostFor(reg.Provider)
 		type route struct{ path, method string }
 		routes := []route{{realtimePath, http.MethodGet}}
 		for _, r := range userRoutes {
@@ -638,7 +659,7 @@ func (c *sessionHandler) buildSession(provider string) (jobs.Spec, error) {
 		JobID:            jobID,
 		Provider:         provider,
 		Method:           "GET",
-		Host:             c.cfg.Host,
+		Host:             c.cfg.HostFor(provider),
 		Path:             realtimePath,
 		Query:            c.cfg.Query,
 		Headers:          map[string]string{},

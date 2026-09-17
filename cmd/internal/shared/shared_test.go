@@ -152,10 +152,13 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 	}
 }
 
-// TestResolvePolicyDir pins the one rule for where a whitelist comes from. The
-// measured bundle wins over the state directory, because rules read from
-// outside the measurement are rules the attestation says nothing about; an
-// explicit setting wins over both.
+// TestResolvePolicyDir pins the one rule for where a whitelist comes from: an
+// explicit setting must hold a policy.cbor in every mode (a configured
+// directory without one is an operator error, never a cue to fall back); the
+// measured bundle wins over the state directory; and on a real deployment
+// (require) a missing whitelist is an error, while the simulation stays
+// lenient. On top of that, require lets an explicit setting only restate the
+// measured bytes, never replace them.
 func TestResolvePolicyDir(t *testing.T) {
 	root := t.TempDir()
 	old := bundleRoot
@@ -166,30 +169,81 @@ func TestResolvePolicyDir(t *testing.T) {
 	if err := WritePolicyDir(measured); err != nil {
 		t.Fatalf("WritePolicyDir: %v", err)
 	}
+	opDir := t.TempDir()
+	if err := WritePolicyDir(opDir); err != nil {
+		t.Fatalf("WritePolicyDir(operator): %v", err)
+	}
+	// A valid whitelist that is NOT the measured one: same shape, one extra
+	// host, so resolving against it exercises the override refusal rather
+	// than a parse failure.
+	otherDir := t.TempDir()
+	other := defaultPolicy(t)
+	other.Hosts = append(append([]string{}, other.Hosts...), "extra.example.com")
+	if err := writePolicy(otherDir, other); err != nil {
+		t.Fatalf("writePolicy(other): %v", err)
+	}
 
 	cases := []struct {
 		name       string
 		configured string
+		require    bool
 		want       string
+		wantErr    bool
 	}{
-		{"nothing configured, measured bundle present", "", measured},
-		{"explicit setting wins", "/operator/policy", "/operator/policy"},
+		{"bundle present, lenient", "", false, measured, false},
+		{"bundle present, required", "", true, measured, false},
+		{"explicit setting wins", opDir, false, opDir, false},
+		// A deployed TEE must not invent a default for itself.
+		{"explicit setting missing, required", "/operator/policy", true, "", true},
+		// A configured directory without a whitelist is an operator error even
+		// where the simulation is otherwise lenient: falling back would
+		// silently enforce rules nobody chose.
+		{"explicit setting missing, lenient", "/operator/policy", false, "", true},
+		// A byte-identical restatement of the measured whitelist is allowed on
+		// a deployment: it enforces exactly what the attestation covers.
+		// (WritePolicyDir is deterministic, so opDir carries the same bytes.)
+		{"explicit restatement wins, required", opDir, true, opDir, false},
+		// A differing whitelist smuggled in through configuration is refused
+		// on a deployment, even though it is perfectly valid on its own.
+		{"explicit override refused, required", otherDir, true, "", true},
+		// ... while the simulation still lets an operator point at any valid
+		// whitelist, which is what makes local policy experiments cheap.
+		{"explicit override wins, lenient", otherDir, false, otherDir, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ResolvePolicyDir(tc.configured); got != tc.want {
-				t.Fatalf("ResolvePolicyDir(%q) = %q, want %q", tc.configured, got, tc.want)
+			got, err := ResolvePolicyDir(tc.configured, tc.require)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ResolvePolicyDir(%q, %v) = %q, want error", tc.configured, tc.require, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolvePolicyDir(%q, %v): %v", tc.configured, tc.require, err)
+			}
+			if got != tc.want {
+				t.Fatalf("ResolvePolicyDir(%q, %v) = %q, want %q", tc.configured, tc.require, got, tc.want)
 			}
 		})
 	}
 
-	// A bundle that carries no whitelist resolves to nothing rather than to
-	// some other directory: the caller decides the fallback, so a missing
-	// measured policy can never be quietly satisfied by an unrelated file.
+	// A bundle that carries no whitelist is satisfied leniently (the caller
+	// decides the fallback, so a missing measured policy is never quietly
+	// replaced by an unrelated file) but is an error for a deployment that
+	// requires one — including when an explicit whitelist was configured:
+	// without measured bytes there is nothing the attestation covers, so there
+	// is nothing a deployment may enforce.
 	empty := t.TempDir()
 	bundleRoot = empty
-	if got := ResolvePolicyDir(""); got != "" {
-		t.Fatalf("ResolvePolicyDir() = %q with no policy in the bundle, want empty", got)
+	if got, err := ResolvePolicyDir("", false); err != nil || got != "" {
+		t.Fatalf("ResolvePolicyDir(lenient, no policy) = %q, %v; want empty, nil", got, err)
+	}
+	if _, err := ResolvePolicyDir("", true); err == nil {
+		t.Fatal("ResolvePolicyDir(required, no policy) must fail, got nil")
+	}
+	if _, err := ResolvePolicyDir(opDir, true); err == nil {
+		t.Fatal("ResolvePolicyDir(required, explicit policy, no measured copy) must fail, got nil")
 	}
 }
 

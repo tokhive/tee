@@ -13,6 +13,7 @@
 package shared
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -84,28 +85,86 @@ func PolicyDir() string {
 // so a test can point it at a fixture instead of /run/bundle.
 var bundleRoot = "/run/bundle"
 
-// ResolvePolicyDir is the one rule for where a whitelist comes from: whatever
-// the operator configured (a flag or an environment variable) wins; otherwise
-// the measured bundle's copy, when it carries one; otherwise the state
-// directory, which is the simulation's.
+// ResolvePolicyDir is the one rule for where a whitelist comes from:
+//
+//  1. An explicitly configured directory (a flag or an environment variable),
+//     when used, must hold a policy.cbor — in every mode. A configured
+//     directory without one is an operator error, never a cue to fall back to
+//     something else: silently enforcing a whitelist nobody chose is exactly
+//     how the policy a deployment runs drifts from the policy it measures.
+//  2. Otherwise the measured bundle's copy, when it carries one.
+//  3. Otherwise the state directory, which is the simulation's: the caller
+//     materializes the shipped default there.
+//
+// require selects the TEE's policy on a real deployment (the sevsnp platform):
+// there the whitelist is mandatory, because its bytes are exactly what the
+// attestation covers, so a missing policy is an operator error — the TEE must
+// refuse to serve on a default it materialized for itself, not quietly start
+// enforcing rules the fingerprint says nothing about. On top of that, an
+// explicit setting may only restate the measured copy, never replace it: when
+// the bundle carries a whitelist whose bytes differ from the configured one,
+// resolving fails. Enforcing anything but the measured bytes would run rules
+// the attestation describes nothing about, while every receipt kept carrying
+// the bundle's identity.
 //
 // The deployment's binaries resolve through here — the TEE, the Hub, and the
 // single-instance supervisor for the children it spawns — because a process
-// that has a measured copy must use it. The whole point of baking the policy
-// into the bundle is that its bytes are covered by the attestation; a process
-// that reads a directory outside the measurement instead enforces rules the
-// fingerprint says nothing about, and an operator's own whitelist silently
-// stops applying. (faketee, the simulation stand-in, has no measured bundle to
-// prefer and keeps reading the state directory.)
-func ResolvePolicyDir(configured string) string {
+// that has a measured copy must use it. (faketee, the simulation stand-in, has
+// no measured bundle to prefer and keeps reading the state directory.)
+func ResolvePolicyDir(configured string, require bool) (string, error) {
+	measured := filepath.Join(bundleRoot, "policy")
+	measuredFile := filepath.Join(measured, "policy.cbor")
+	_, measuredErr := os.Stat(measuredFile)
+
 	if configured != "" {
-		return configured
+		configuredFile := filepath.Join(configured, "policy.cbor")
+		if _, err := os.Stat(configuredFile); err != nil {
+			return "", fmt.Errorf("configured policy dir %s holds no whitelist at %s: %v", configured, configuredFile, err)
+		}
+		if require {
+			if measuredErr != nil {
+				return "", fmt.Errorf("no deployment whitelist at %s (a sevsnp bundle ships ./policy/policy.cbor; rebuild it): refusing to enforce the explicitly configured %s instead", measuredFile, configured)
+			}
+			same, err := samePolicyBytes(configuredFile, measuredFile)
+			if err != nil {
+				return "", fmt.Errorf("compare configured policy %s against measured %s: %v", configuredFile, measuredFile, err)
+			}
+			if !same {
+				return "", fmt.Errorf("configured policy dir %s differs from the measured bundle's %s: on sevsnp the enclave must enforce the measured bytes, or the attestation describes rules it does not run", configured, measured)
+			}
+		}
+		return configured, nil
 	}
-	dir := filepath.Join(bundleRoot, "policy")
-	if _, err := os.Stat(dir); err == nil {
-		return dir
+
+	if measuredErr == nil {
+		return measured, nil
 	}
-	return ""
+	if require {
+		return "", fmt.Errorf("no deployment whitelist at %s (a sevsnp bundle ships ./policy/policy.cbor; rebuild it)", measuredFile)
+	}
+	return "", nil
+}
+
+// samePolicyBytes reports whether two policy.cbor files carry identical bytes.
+// A configured directory holding a byte-identical copy of the measured bundle's
+// whitelist enforces exactly what the attestation covers, so it is a restatement,
+// not an override. Read failures are errors, not "different": the caller is
+// about to trust one of these files on the strength of the comparison.
+func samePolicyBytes(a, b string) (bool, error) {
+	if ae, err := filepath.Abs(a); err == nil {
+		if be, err := filepath.Abs(b); err == nil && ae == be {
+			return true, nil
+		}
+	}
+	ab, err := os.ReadFile(a)
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", a, err)
+	}
+	bb, err := os.ReadFile(b)
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", b, err)
+	}
+	return bytes.Equal(ab, bb), nil
 }
 
 // EnsureDefaults writes the fixture files if they are missing: the default
