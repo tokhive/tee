@@ -47,6 +47,18 @@ CERTS_DIR="${HERE}/.certs"
 # reaches the bundle. Set SNP_POLICY_DIR to ship an operator-authored whitelist
 # instead.
 POLICY_DIR="${SNP_POLICY_DIR:-${CERTS_DIR}/policy}"
+# BUNDLES_DIR keeps every built bundle under the digest it measures
+# (<sha256>.tar). A bundle carries the whitelist its enclave enforces, and its
+# sha256 IS the app identity the Hub pins, so the digest is the only name under
+# which "the whitelist version A runs" can be recovered after a later build has
+# overwritten everything else. A single mutable policy directory cannot answer
+# that question (see cmd_deploy).
+BUNDLES_DIR="${CLOUDTEST}/bin/bundles"
+# The layout `deploy` creates on the ordinary host: ./tee (binaries + logs),
+# ./mtls (certs) and ./policy (the whitelist). This is the only place the
+# whitelist's remote location is written down — the upload and the Hub's
+# -policy-dir both derive from it, so the two cannot disagree again.
+REMOTE_POLICY_REL="policy"
 REPO_ROOT="${HERE}/../../.."            # reclaim-tee
 DEPLOY_DIR="${REPO_ROOT}/deploy"
 HOSTS="${CLOUDTEST}/crosshost.json"
@@ -92,6 +104,30 @@ print(img[-1]["ImageId"])
 PY
 }
 
+# ami_app_digest <ami-id> prints the app digest the image was registered with:
+# snp-build.sh tags every image it registers with the sha256 of the bundle it
+# embedded, so the tag is the one statement about what an image measures that
+# travels with the image itself.
+ami_app_digest() {
+  py_cd - "$1" <<'PYDIG'
+import boto3, sys
+from botocore.exceptions import ClientError
+from config import load
+cfg = load()
+try:
+    imgs = boto3.client("ec2", region_name=cfg.region).describe_images(ImageIds=[sys.argv[1]])["Images"]
+except ClientError as e:
+    # DescribeImages raises for an unknown id instead of returning nothing, and
+    # a botocore traceback is not a refusal an operator can act on.
+    sys.exit(f"cannot describe AMI {sys.argv[1]}: {e.response['Error']['Message']}")
+tags = {t["Key"]: t["Value"] for t in imgs[0].get("Tags", [])}
+digest = tags.get("snp-app")
+if not digest:
+    sys.exit(f"AMI {sys.argv[1]} carries no snp-app tag; rebuild it with './crosshost.sh build'")
+print(digest)
+PYDIG
+}
+
 # ensure_policy materializes the deployment whitelist the bundle carries.
 #
 # When the operator supplied a directory (SNP_POLICY_DIR) that is their
@@ -130,6 +166,29 @@ ensure_certs() {
   log "TLS fixtures -> ${CERTS_DIR}"
 }
 
+# archive_bundle <bundle-file> <snp-app:hash> files the freshly built bundle
+# under the digest it measures. Every build does this, so that a deploy of an
+# instance launched earlier can still recover that instance's whitelist.
+archive_bundle() {
+  local bundle="$1" digest="${2#snp-app:}"
+  mkdir -p "${BUNDLES_DIR}"
+  cp "${bundle}" "${BUNDLES_DIR}/${digest}.tar"
+  log "bundle archived -> ${BUNDLES_DIR}/${digest}.tar"
+}
+
+# archived_bundle <app-hash> prints the path of the archived bundle measuring
+# that app identity, or fails if there is none. The digest is recomputed rather
+# than trusted from the filename: the caller is about to hand the Hub a
+# whitelist on the strength of it being the one inside the attested app, so
+# "this file still hashes to what it claims" is the whole point.
+archived_bundle() {
+  local want="$1" path="${BUNDLES_DIR}/${1}.tar" got
+  [ -f "${path}" ] || return 1
+  got="$(sha256sum "${path}" | cut -d' ' -f1)"
+  [ "${got}" = "${want}" ] || return 1
+  printf '%s\n' "${path}"
+}
+
 cmd_build() {
   log "step: build (certs + policy + real-tee bundle + AMI + linux binaries)"
   ensure_certs
@@ -138,8 +197,10 @@ cmd_build() {
       SNP_HUB_CA="${CERTS_DIR}/hub-ca.pem" \
       SNP_MP_CA="${CERTS_DIR}/mp-ca.pem" SNP_MP_CERT="${CERTS_DIR}/mp-cert.pem" SNP_MP_KEY="${CERTS_DIR}/mp-key.pem" \
       ./pack.sh build )
-  local bundle; bundle="${TOKENHIVE_OUT_BUNDLE:-${CLOUDTEST}/bin/tokenhive-app-bundle.tar}"
-  log "bundle digest: $(cd "${HERE}" && ./pack.sh digest "${bundle}")"
+  local bundle digest; bundle="${TOKENHIVE_OUT_BUNDLE:-${CLOUDTEST}/bin/tokenhive-app-bundle.tar}"
+  digest="$(cd "${HERE}" && ./pack.sh digest "${bundle}")"
+  log "bundle digest: ${digest}"
+  archive_bundle "${bundle}" "${digest}"
   ( cd "${DEPLOY_DIR}" && SNP_EXTERNAL_BUNDLE="${bundle}" SNP_ALLOW_DIRTY=1 ./snp-build.sh t aws tokenhive )
   log "AMI registered"
   ( cd "${CLOUDTEST}" && ./run.sh build )
@@ -162,21 +223,38 @@ cmd_build_single() {
       SNP_MP_CERT="${CERTS_DIR}/mp-cert.pem" \
       SNP_MP_KEY="${CERTS_DIR}/mp-key.pem" \
       ./pack.sh build )
-  local bundle; bundle="${TOKENHIVE_OUT_BUNDLE:-${CLOUDTEST}/bin/tokenhive-app-bundle.tar}"
-  log "bundle digest: $(cd "${HERE}" && ./pack.sh digest "${bundle}")"
+  local bundle digest; bundle="${TOKENHIVE_OUT_BUNDLE:-${CLOUDTEST}/bin/tokenhive-app-bundle.tar}"
+  digest="$(cd "${HERE}" && ./pack.sh digest "${bundle}")"
+  log "bundle digest: ${digest}"
+  archive_bundle "${bundle}" "${digest}"
   ( cd "${DEPLOY_DIR}" && SNP_EXTERNAL_BUNDLE="${bundle}" SNP_ALLOW_DIRTY=1 ./snp-build.sh t aws tokenhive-single )
   log "AMI snp-tokenhive-single registered"
 }
 
 cmd_up() {
   [ -f "${CERTS_DIR}/hub-ca.pem" ] || { echo "run ./crosshost.sh build first (certs)"; exit 1; }
-  local a token mode="" name="snp-tokenhive"
+  local a token mode="" name="snp-tokenhive" digest
   case "${2:-}" in
     --single)   mode="--single";   name="snp-tokenhive-single" ;;
     --tee-only) mode="--tee-only" ;;
   esac
   a="$(ami_id "${name}")"
   log "AMI ${a}"
+  # Pin the attested app identity for the Hub: the AMI embeds the app bundle
+  # whose sha256 the loader exports as SNP_APP_HASH, so read it off the image
+  # and record it in state for the later deploy to pass as -expected-app
+  # (single mode reads the env instead).
+  #
+  # Read it from the image rather than by re-hashing a local file. bin/ is
+  # overwritten by every build — build-single shares that path, and a build that
+  # packed and then failed before registering an AMI leaves it describing an app
+  # no image contains — so a locally computed digest can disagree with the TEE
+  # actually running. The image's own tag cannot.
+  #
+  # And read it, refusing an image that carries none, BEFORE the launch below:
+  # an unlabelled image can never be pinned, and discovering that afterwards
+  # would have bought a confidential instance for a run that cannot finish.
+  digest="snp-app:$(ami_app_digest "${a}")"
   # Read or mint the one-shot bootstrap token (stick to one so a re-up reuses).
   if [ -f "${CERTS_DIR}/init-token" ]; then
     token="$(cat "${CERTS_DIR}/init-token")"
@@ -185,11 +263,10 @@ cmd_up() {
     printf '%s\n' "${token}" > "${CERTS_DIR}/init-token"
   fi
   ( cd "${HERE}" && "${PY}" crosshost.py "${a}" --token "${token}" ${mode} ) | tee -a "${LOG_DIR}/run.log"
-  # Pin the attested app identity for the Hub: the AMI embeds the very tar file
-  # whose sha256 the loader exports as SNP_APP_HASH, so record it in state for
-  # the later deploy to pass as -expected-app (single mode reads the env instead).
-  local digest
-  digest="$(cd "${HERE}" && ./pack.sh digest "${CLOUDTEST}/bin/tokenhive-app-bundle.tar")"
+  # Record it only now that the instance exists: crosshost.py owns the state
+  # file (it creates the tee record merged into below), and an identity recorded
+  # for an instance that never came up would pin the next deploy to an app that
+  # nothing is running.
   printf '%s\n' "${digest#snp-app:}" | "${PY}" -c "
 import json, sys
 p = json.load(open('${HOSTS}'))
@@ -222,22 +299,31 @@ EOF
 }
 
 cmd_deploy() {
-  local hip tip cert app_hash
+  local hip tip app_hash bundle policy_file
   hip="$(host_field public_ip)"; tip="$(tee_field private_ip)"  # cross-host plane over private ips
   app_hash="$(tee_field app_hash)"
   # The Hub admits agents and advertises /v1/policies from the same whitelist
-  # the enclave enforces, so it has to read the very bytes the AMI measures.
-  # Only the build's copy is that file: the whitelist is generated once because
-  # its bytes sit inside SNP_APP_HASH, and re-emitting it here would produce a
-  # different document — different IssuedAt, different hash — that no longer
-  # describes what the TEE runs.
-  if [ ! -f "${POLICY_DIR}/policy.cbor" ]; then
-    log "no whitelist at ${POLICY_DIR}/policy.cbor; run './crosshost.sh build' first"
+  # the enclave enforces, so it has to read the very bytes the running TEE was
+  # measured with. Those bytes come from exactly one place: the archived bundle
+  # whose sha256 is the app identity in state. Taking the current build's policy
+  # instead would mean that rebuilding for a newer whitelist and then deploying
+  # an instance launched earlier hands the Hub rules the enclave does not run —
+  # so the Hub admits agents the enclave refuses job by job, and advertises a
+  # policy hash no receipt carries.
+  if ! bundle="$(archived_bundle "${app_hash}")"; then
+    log "no archived bundle measuring snp-app:${app_hash} — the app the running TEE attested"
+    log "rebuild the AMI that instance runs (or run './crosshost.sh up' again), then deploy"
+    exit 1
+  fi
+  policy_file="${BUNDLES_DIR}/${app_hash}.policy.cbor"
+  if ! tar -xOf "${bundle}" ./policy/policy.cbor >"${policy_file}" 2>/dev/null || [ ! -s "${policy_file}" ]; then
+    log "${bundle} carries no ./policy/policy.cbor; it was built without a whitelist"
     exit 1
   fi
 
   log "step: deploy runtime to host ${hip} (tee ${tip}, app ${app_hash})"
-  remote_exec "$hip" 'mkdir -p tee mtls policy' >/dev/null
+  log "whitelist from ${bundle} -> ~/${REMOTE_POLICY_REL}/policy.cbor"
+  remote_exec "$hip" "mkdir -p tee mtls ${REMOTE_POLICY_REL}" >/dev/null
   remote_push "$hip" "${CLOUDTEST}/bin/hub" "tee/hub" >/dev/null
   remote_push "$hip" "${CLOUDTEST}/bin/agent" "tee/agent" >/dev/null
   remote_push "$hip" "${CLOUDTEST}/bin/mockprovider" "tee/mockprovider" >/dev/null
@@ -248,7 +334,7 @@ cmd_deploy() {
   remote_push "$hip" "${CERTS_DIR}/mp-key.pem" "mtls/mp-key.pem" >/dev/null
   # tee-cert.pem (pinned) lives in CERTS_DIR after fetch
   remote_push "$hip" "${CERTS_DIR}/tee-cert.pem" "mtls/tee-cert.pem" >/dev/null
-  remote_push "$hip" "${POLICY_DIR}/policy.cbor" "policy/policy.cbor" >/dev/null
+  remote_push "$hip" "${policy_file}" "${REMOTE_POLICY_REL}/policy.cbor" >/dev/null
 
   # Per-provider agent key and the tee relay key. The Hub now requires both
   # (-agent-keys and -relay-key); the tee must present the same relay key, which
@@ -268,7 +354,7 @@ chmod 755 ./tee/hub ./tee/agent ./tee/mockprovider
   -ca mtls/mp-ca.pem -cert mtls/mp-cert.pem -key mtls/mp-key.pem >tee/mp.log 2>&1 &
 sleep 1
 ./tee/hub -serve 0.0.0.0:18085 -agent-keys 'openai-sim=${agent_key}' -relay-key '${relay_key}' \
-  -policy-dir "\$HOME/tee/policy" \
+  -policy-dir "\$HOME/${REMOTE_POLICY_REL}" \
   -host 127.0.0.1:18080 \
   -model sim-mock-0.5b -tee https://${tip}:18090 -mtls-ca mtls/tee-cert.pem \
   -mtls-cert mtls/hub-cert.pem -mtls-key mtls/hub-key.pem \
