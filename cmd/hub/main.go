@@ -135,9 +135,10 @@ func main() {
 		return
 	}
 
-	// The Hub's market table: seller-reported prices. The whitelist policy is
-	// a TEE concern and never reaches the Hub — the Hub prices from its own
-	// rates, not from what the TEE will authorise.
+	// The Hub's market table: seller-reported prices. Pricing never consults the
+	// whitelist — the Hub prices from its own rates, not from what the TEE will
+	// authorise. (The whitelist does reach the Hub, for admission and
+	// /v1/policies; see below. It just has nothing to say about the price.)
 	rates, err := shared.LoadRates()
 	if err != nil {
 		log.Fatalf("load rates: %v", err)

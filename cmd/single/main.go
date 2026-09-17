@@ -41,9 +41,11 @@ const bundleDir = "/run/bundle"
 //
 // The children resolve this themselves too (see shared.ResolvePolicyDir); the
 // supervisor passes it explicitly so a failure to resolve shows up in the
-// spawned command line rather than only in the child's log.
+// spawned command line rather than only in the child's log. It does not require
+// the whitelist here: when the bundle lacks one, the sevsnp TEE child refuses
+// to serve on its own, which is where the rule belongs.
 func bundlePolicyArgs() []string {
-	if d := shared.ResolvePolicyDir(""); d != "" {
+	if d, err := shared.ResolvePolicyDir("", false); err == nil && d != "" {
 		return []string{"-policy-dir", d}
 	}
 	return nil

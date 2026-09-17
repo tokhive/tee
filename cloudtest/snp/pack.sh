@@ -106,7 +106,7 @@ bundle_policy() {
         chmod -R u+rX,go+rX "${stage}/policy"
         echo "[pack] bundled whitelist policy -> ./policy/ (${SNP_POLICY_DIR})"
     else
-        echo "[pack] warning: no SNP_POLICY_DIR; whitelist policy NOT baked into the measured bundle"
+        echo "[pack] warning: no SNP_POLICY_DIR; whitelist NOT baked into the measured bundle — a sevsnp TEE from this image will refuse to serve"
     fi
 }
 
