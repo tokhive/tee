@@ -148,11 +148,11 @@ func main() {
 
 	policyDoc, err := shared.LoadPolicy()
 	if err != nil {
-		log.Fatalf("load policy set: %v", err)
+		log.Fatalf("load policy: %v", err)
 	}
 	policyHash, err := policyDoc.Hash()
 	if err != nil {
-		log.Fatalf("hash policy set: %v", err)
+		log.Fatalf("hash policy: %v", err)
 	}
 
 	// Like the real TEE, the A-layer fake binds its loaded whitelist into the

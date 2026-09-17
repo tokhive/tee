@@ -113,12 +113,14 @@ var bundleRoot = "/run/bundle"
 // the measured bundle's copy, when it carries one; otherwise the state
 // directory, which is the simulation's.
 //
-// Every binary that enforces the whitelist resolves it here, because a process
+// The deployment's binaries resolve through here — the TEE, the Hub, and the
+// single-instance supervisor for the children it spawns — because a process
 // that has a measured copy must use it. The whole point of baking the policy
 // into the bundle is that its bytes are covered by the attestation; a process
 // that reads a directory outside the measurement instead enforces rules the
 // fingerprint says nothing about, and an operator's own whitelist silently
-// stops applying.
+// stops applying. (faketee, the simulation stand-in, has no measured bundle to
+// prefer and keeps reading the state directory.)
 func ResolvePolicyDir(configured string) string {
 	if configured != "" {
 		return configured
