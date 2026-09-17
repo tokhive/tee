@@ -145,6 +145,29 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 		}
 	}
 
+	// The bounds a market request must fit: 8 MiB each way, the request headers
+	// the market's Codex and Claude adapters send, and the Messages beta query.
+	if p.Limits.MaxBodyBytes != 8<<20 || p.Limits.MaxResponseBytes != 8<<20 {
+		t.Errorf("limits = body %d, response %d; want 8 MiB each", p.Limits.MaxBodyBytes, p.Limits.MaxResponseBytes)
+	}
+	for _, header := range []string{"content-type", "chatgpt-account-id", "originator", "session-id", "anthropic-version", "anthropic-beta", "x-claude-code-session-id", "x-stainless-helper-method"} {
+		if !p.Limits.HeaderAllowed(header) {
+			t.Errorf("header %q is not allowed", header)
+		}
+	}
+	// Claude requests always carry the beta query.
+	beta := false
+	for _, rule := range p.Rules {
+		if rule.Path == "/v1/messages" {
+			for _, key := range rule.QueryKeys {
+				beta = beta || key == "beta"
+			}
+		}
+	}
+	if !beta {
+		t.Error("the Messages rule does not admit the beta query")
+	}
+
 	// A host the deployment does not reach is still refused, so admitting the
 	// real APIs did not turn the whitelist into a wildcard.
 	if err := p.AllowsRoute("evil.example.com", "/v1/chat/completions", "POST"); err == nil {
