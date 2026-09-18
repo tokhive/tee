@@ -167,14 +167,29 @@ func main() {
 		log.Fatalf("build platform epoch: %v", err)
 	}
 	epoch, serverTLS := assembly.Epoch, assembly.ServerTLS
-	if err := shared.WriteTEEIdentity(epoch.Identity()); err != nil {
-		log.Fatalf("write tee identity: %v", err)
+	// A logger failure is not worth refusing to start an enclave over: nothing
+	// below depends on the sink, and the console fallback is fine.
+	logger, err := rootShared.NewLoggerFromEnv("tokenhive-tee")
+	if err != nil {
+		log.Printf("structured logger unavailable (%v); publications and rotations will go unlogged", err)
+		logger = rootShared.NewNopLogger()
 	}
-	// Record this epoch's evidence in the restart-surviving store so a hash-only
-	// receipt (IncludeEvidence=false) resolves against what the verifier saw, and
-	// the /v1/evidence endpoint below can serve it to a Hub on another host.
-	if err := shared.RecordTEEEvidence(epoch.Identity()); err != nil {
-		log.Fatalf("record tee evidence: %v", err)
+	// The certificate the Hub-facing listener presents, when it is mTLS: the
+	// platform's RA-TLS config plus the Hub client CA. It is assembled before the
+	// service runtime because publishing it is part of what the runtime does.
+	var leafTLS *tls.Config
+	if *serveMTLS {
+		if serverTLS == nil {
+			log.Fatalf("platform %q provides no RA-TLS server certificate; cannot serve -mtls", *platformName)
+		}
+		clientCAPath := *mtlsClientCA
+		if clientCAPath == "" {
+			clientCAPath = filepath.Join(shared.ConfigDir(), shared.MTLSClientCAPath)
+		}
+		leafTLS, err = mtls.ServerMTLSConfig(serverTLS, clientCAPath)
+		if err != nil {
+			log.Fatalf("mtls server config: %v", err)
+		}
 	}
 	log.Printf("policy hash bound into attestation evidence: %x", policyHash)
 
@@ -226,7 +241,6 @@ func main() {
 	// here (see adopt); a stale cell only ever means the pipeline is down past
 	// its margin, which the service refuses loudly instead of signing.
 	liveSigner := &atomic.Pointer[proof.Signer]{}
-	liveSigner.Store(signer)
 
 	svcConfig := tee.Config{
 		Policy:         policyDoc,
@@ -237,17 +251,18 @@ func main() {
 		InboxKey:       inbox,
 		RequestTimeout: *requestTimeout,
 	}
-	svc, err := tee.NewService(svcConfig)
-	if err != nil {
-		log.Fatalf("build service: %v", err)
-	}
 	// svcRuntime holds the receipt signer, which is bound to the attested epoch
 	// key and is replaced whenever the platform rotates that key. The inbox key
 	// above is the other, deliberately independent half: it is generated once
 	// and never persisted, so a restart — not a rotation — is what makes agents
 	// re-register. Handlers reach the current service through it, so a rotation
-	// takes effect on the next request without dropping the listener.
-	svcRuntime := newServiceRuntime(svcConfig, svc)
+	// takes effect on the next request without dropping the listener. Building
+	// the runtime publishes the startup epoch — identity, evidence, leaf — the
+	// same way a rotation publishes the ones after it (see publish).
+	svcRuntime, err := newServiceRuntime(svcConfig, epoch, leafTLS, logger)
+	if err != nil {
+		log.Fatalf("publish startup epoch: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/execute", func(w http.ResponseWriter, r *http.Request) {
@@ -276,10 +291,7 @@ func main() {
 
 	// Keep the attested epoch inside its evidence's validity for as long as this
 	// process serves. The buildEpoch comment explains why the assembly carries a
-	// refresher here and not on the simulated platform; the logger is the
-	// deployment's structured one (CloudWatch on an AWS guest, console JSON
-	// elsewhere), and a logger failure is not worth refusing to start an enclave
-	// over — the rotation does not depend on it.
+	// refresher here and not on the simulated platform.
 	//
 	// The context is intentionally the process's, with no cancellation: the
 	// refresher must run for exactly as long as the listener serves, and there is
@@ -291,39 +303,16 @@ func main() {
 	// default "die on signal" with "ignore signal" — a deployment hazard well
 	// beyond the tidiness it would buy.
 	if assembly.Refresher != nil {
-		logger, err := rootShared.NewLoggerFromEnv("tokenhive-tee")
-		if err != nil {
-			log.Printf("ratls: structured logger unavailable (%v); rotations will not be logged", err)
-			logger = rootShared.NewNopLogger()
-		}
 		go runEpochRefresh(context.Background(), assembly.Refresher, svcRuntime, logger)
 	}
 
 	if *serveMTLS {
-		clientCAPath := *mtlsClientCA
-		if clientCAPath == "" {
-			clientCAPath = filepath.Join(shared.ConfigDir(), shared.MTLSClientCAPath)
-		}
-		if serverTLS == nil {
-			log.Fatalf("platform %q provides no RA-TLS server certificate; cannot serve -mtls", *platformName)
-		}
-		cfg, err := mtls.ServerMTLSConfig(serverTLS, clientCAPath)
-		if err != nil {
-			log.Fatalf("mtls server config: %v", err)
-		}
-		if err := shared.WriteTEECert(cfg); err != nil {
-			log.Fatalf("publish tee certificate: %v", err)
-		}
-		// Trust-on-first-use bootstrap: hand the exact RA-TLS leaf we serve on the
-		// mTLS plane to any caller that knows the token, so a Hub with no prior pin
-		// can fetch and pin it. The listener is deliberately plain HTTP and serves
-		// this single leaf-only endpoint — nothing else crosses it.
 		if *initAddr != "" {
-			go serveInitCert(*initAddr, *initToken, cfg)
+			go serveInitCert(*initAddr, *initToken, leafTLS)
 		}
 		log.Printf("tee (platform=%s, includeEvidence=%t, mtls) listening on https://%s",
 			*platformName, *includeEvidence, *addr)
-		server := &http.Server{Addr: *addr, Handler: mux, TLSConfig: cfg}
+		server := &http.Server{Addr: *addr, Handler: mux, TLSConfig: leafTLS}
 		log.Fatal(server.ListenAndServeTLS("", ""))
 	}
 

@@ -7,8 +7,9 @@
 // ships the small hash-only receipt form needs somewhere durable to look the
 // bytes up.
 //
-// This package is that somewhere. The TEE writes its current epoch's evidence
-// here (by evidence hash) on every sign/key rotation; a verifier — an offline
+// This package is that somewhere. A TEE that signs hash-only receipts writes
+// its current epoch's evidence here (by evidence hash) on every key rotation; a
+// verifier — an offline
 // auditor, a Hub, a provider — points a Fetcher at the same store and resolves
 // the hash. Because the store is keyed by the SHA-256 of the evidence itself,
 // and a verifier refuses bytes whose hash does not match, an old or rotated

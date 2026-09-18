@@ -311,7 +311,9 @@ func EvidenceDir() string { return filepath.Join(ConfigDir(), "evidence") }
 
 // RecordTEEEvidence appends the given identity's full evidence to the local
 // store so a verifier pointed at the same directory can resolve its
-// EvidenceHash later. It is idempotent and cheap to call on every epoch build.
+// EvidenceHash later. It is idempotent and cheap to call on every epoch build,
+// and only a deployment that ships hash-only receipts needs it: an inline
+// receipt carries its evidence, so nothing ever resolves the hash.
 func RecordTEEEvidence(id platform.Identity) error {
 	store, err := evidence.NewStore(EvidenceDir())
 	if err != nil {

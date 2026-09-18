@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"sync"
 	"time"
 
@@ -38,8 +37,8 @@ type epochRefresher interface {
 	Refresh(context.Context) error
 	Snapshot(context.Context) (platform.Epoch, error)
 	// ServerTLSConfig is the listener's live view of the current epoch, which is
-	// how the published leaf follows a rotation. It is the same accessor the
-	// startup path publishes from, so the file and the listener cannot drift.
+	// where the published leaf comes from: it resolves the certificate per
+	// handshake, so a rotation reaches the file without touching the listener.
 	ServerTLSConfig() *tls.Config
 }
 
@@ -70,15 +69,55 @@ const minRefreshFloor = 10 * time.Minute
 // is what makes publishing the new one a pointer assignment.
 type serviceRuntime struct {
 	template tee.Config
+	logger   *rootShared.Logger
 
 	mu      sync.RWMutex
 	current *tee.Service
 }
 
-// newServiceRuntime keeps the template every rotation rebuilds from, plus the
-// service built for the startup epoch.
-func newServiceRuntime(template tee.Config, current *tee.Service) *serviceRuntime {
-	return &serviceRuntime{template: template, current: current}
+// newServiceRuntime builds the runtime for the epoch the process boots on. That
+// epoch is published and adopted exactly the way every later rotation publishes
+// and adopts, so startup is the first epoch rather than a second code path: the
+// files a rotation maintains are maintained from boot on.
+func newServiceRuntime(template tee.Config, epoch platform.Epoch, leafTLS *tls.Config, logger *rootShared.Logger) (*serviceRuntime, error) {
+	r := &serviceRuntime{template: template, logger: logger}
+	if err := r.publish(epoch, leafTLS); err != nil {
+		return nil, err
+	}
+	return r, r.adopt(epoch)
+}
+
+// publish makes an epoch observable outside this process: the evidence a
+// hash-only receipt resolves, the leaf the listener presents, then the identity
+// an auditor reads. These writes cannot be one atomic step, so they go in the
+// order that leaves the least harmful state behind when one of them fails — and
+// only the evidence is fatal. A hash-only receipt whose evidence cannot be
+// resolved verifies nowhere, while the leaf and the identity are read by
+// operators and tooling: refusing the rotation over one of those would wedge
+// the signer behind a stale diagnostic file, while the listener has already
+// rotated and the Hub has no way back to the epoch being signed with.
+func (r *serviceRuntime) publish(epoch platform.Epoch, leafTLS *tls.Config) error {
+	identity := epoch.Identity()
+	// Only the hash-only receipt form needs the store: an inline receipt carries
+	// its evidence, so a stored copy is a file nothing resolves.
+	if !r.template.Signer.IncludeEvidence {
+		if err := shared.RecordTEEEvidence(identity); err != nil {
+			return err
+		}
+	}
+	// The leaf describes the listener, which has already rotated by the time a
+	// refresh returns — the same bytes the next handshake will serve.
+	if leafTLS != nil {
+		if err := shared.WriteTEECert(leafTLS); err != nil {
+			r.logger.Warn("ratls: publish RA-TLS certificate: " + err.Error())
+		}
+	}
+	// The identity is the file that describes the *signer*, so it goes last:
+	// written any earlier it would name a key the receipts do not yet carry.
+	if err := shared.WriteTEEIdentity(identity); err != nil {
+		r.logger.Warn("ratls: publish tee identity: " + err.Error())
+	}
+	return nil
 }
 
 // get returns the service signing receipts right now. Handlers go through it on
@@ -158,54 +197,27 @@ func runEpochRefresh(ctx context.Context, refresher epochRefresher, runtime *ser
 	rootShared.RunRATLSRefresh(ctx, refresher, publish, next, nil, logger, true)
 }
 
-// publishEpoch makes one rotated epoch the epoch this process serves: the
-// evidence a hash-only receipt resolves, the published leaf, the identity an
-// auditor reads, then the signer. Everything the process shows the outside
-// world is updated before it is allowed to sign with the new key — a rotated
-// epoch that never lands in the store signs receipts nobody can verify.
-// Whichever half fails, the previous service keeps signing while its evidence
-// is still inside the margin, so the failure reads as a rotation that did not
-// happen; past the margin the service refuses new work outright
-// (ErrAttestationStale) rather than signing receipts no verifier would accept.
-//
-// These writes cannot be one atomic step, so they go in the order that leaves
-// the least harmful state behind when one of them fails. The evidence store is
-// append-only and keyed by hash: an entry a later failure orphans is harmless,
-// and it is what a hash-only receipt needs, so it goes first. The leaf already
-// describes the listener — the refresh adopted the rotated epoch before
-// returning — so writing it next keeps the file true. The identity goes last of
-// the three because it is the one file that describes the *signer*: written any
-// earlier it would name a key the receipts do not yet carry.
+// publishEpoch makes one rotated epoch the epoch this process serves: what the
+// outside world can see about it, then the signer. Publishing precedes signing,
+// so the process never signs with an epoch whose evidence never landed — the
+// one half a verifier cannot work around. Whichever half fails, the previous
+// service keeps signing while its evidence is still inside the margin, so the
+// failure reads as a rotation that did not happen; past the margin the service
+// refuses new work outright (ErrAttestationStale) rather than signing receipts
+// no verifier would accept.
 func publishEpoch(ctx context.Context, refresher epochRefresher, runtime *serviceRuntime) error {
 	snapshot, err := refresher.Snapshot(ctx)
 	if err != nil {
 		return err
 	}
-	identity := snapshot.Identity()
-	// The evidence store is how a hash-only receipt's EvidenceHash resolves
-	// — locally, and over /v1/evidence for a Hub on another host.
-	if err := shared.RecordTEEEvidence(identity); err != nil {
-		return err
+	leafTLS := refresher.ServerTLSConfig()
+	// The adapter always exposes one on a platform that rotates, so nothing to
+	// publish a leaf from is a wiring problem worth saying out loud rather than
+	// failing the rotation over.
+	if leafTLS == nil {
+		runtime.logger.Warn("ratls: rotated epoch exposes no RA-TLS certificate to publish")
 	}
-	// The leaf the listener now presents, for the same reason: the file
-	// exists so something outside this process can learn which certificate to
-	// expect, and a stale one answers that question wrongly. It is written
-	// after the refresh has adopted the new epoch (Refresh publishes before
-	// returning), so the config reports the rotated certificate — the same
-	// bytes the next handshake will serve. A rotation whose new leaf cannot be
-	// published is refused like any other half-failure, rather than left to
-	// serve a certificate the file denies.
-	cfg := refresher.ServerTLSConfig()
-	if cfg == nil {
-		return errors.New("rotated epoch provides no RA-TLS server config to publish")
-	}
-	if err := shared.WriteTEECert(cfg); err != nil {
-		return err
-	}
-	// Publish the rotated identity before it starts signing: the
-	// tee_identity.json an auditor reads has to describe the key the
-	// receipts carry.
-	if err := shared.WriteTEEIdentity(identity); err != nil {
+	if err := runtime.publish(snapshot, leafTLS); err != nil {
 		return err
 	}
 	return runtime.adopt(snapshot)

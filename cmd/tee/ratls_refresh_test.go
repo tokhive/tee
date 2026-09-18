@@ -116,7 +116,7 @@ func TestPublishEpochAdoptsAndPublishesRotatedEpoch(t *testing.T) {
 	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
 
 	startup := fakeEpoch([]byte("startup-evidence"))
-	runtime := newTestRuntime(t, startup)
+	runtime := newTestRuntime(t, startup, false)
 	before := runtime.get()
 
 	rotated := fakeEpoch(nitroAttestation(t, time.Now().Add(3*time.Hour)))
@@ -134,15 +134,7 @@ func TestPublishEpochAdoptsAndPublishesRotatedEpoch(t *testing.T) {
 
 	// The identity file is what an auditor reads off the instance; it has to
 	// describe the key the receipts now carry, not the one the process booted on.
-	var persisted platform.Identity
-	b, err := os.ReadFile(filepath.Join(simDir, "tee_identity.json"))
-	if err != nil {
-		t.Fatalf("read tee identity: %v", err)
-	}
-	if err := json.Unmarshal(b, &persisted); err != nil {
-		t.Fatalf("decode tee identity: %v", err)
-	}
-	if persisted.KeyID != rotated.Identity().KeyID {
+	if got := readPersistedIdentity(t, simDir); got.KeyID != rotated.Identity().KeyID {
 		t.Fatal("persisted identity still names the startup epoch key")
 	}
 
@@ -209,31 +201,54 @@ func fakeServerTLS(t *testing.T, commonName string) *tls.Config {
 	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}}}
 }
 
-// TestPublishEpochRefusesARotationItCannotPublishATleafFor is the other half of
-// the same rule: publishing precedes signing, so a rotation whose new leaf
-// cannot be written must be abandoned rather than left serving a certificate the
-// published file denies. The process keeps signing under the previous epoch,
-// which is the state whose leaf the file still describes.
-func TestPublishEpochRefusesARotationItCannotPublishATleafFor(t *testing.T) {
+// TestPublishEpochAdoptsWhenTheLeafCannotBePublished: the published leaf and
+// identity are diagnostics — files an operator, or the simulation's pin mode,
+// reads — so a rotation that cannot rewrite them still adopts. Refusing would
+// wedge the signer: the listener has already rotated by the time a refresh
+// returns, and the process would go on signing under the key the Hub no longer
+// sees on the wire.
+func TestPublishEpochAdoptsWhenTheLeafCannotBePublished(t *testing.T) {
 	simDir := t.TempDir()
 	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
 
-	runtime := newTestRuntime(t, fakeEpoch([]byte("startup-evidence")))
+	runtime := newTestRuntime(t, fakeEpoch([]byte("startup-evidence")), false)
 	before := runtime.get()
 
-	rotated := fakeEpoch(nitroAttestation(t, time.Now().Add(3*time.Hour)))
-	// No ServerTLSConfig: nothing to publish.
-	if err := publishOnce(&fakeRefresher{snapshot: rotated}, runtime); err == nil {
-		t.Fatal("published an epoch whose RA-TLS leaf could not be written")
+	rotated := fakeEpoch([]byte("rotated-evidence"))
+	// A TLS config with no certificate: there are no leaf bytes to write, which
+	// is how a publication failure reaches the log.
+	refresher := &fakeRefresher{snapshot: rotated, serverTLS: &tls.Config{}}
+	if err := publishOnce(refresher, runtime); err != nil {
+		t.Fatalf("publish rotated epoch: %v", err)
+	}
+	if runtime.get() == before {
+		t.Fatal("a leaf that could not be published stopped the rotation from signing")
+	}
+	if got := readPersistedIdentity(t, simDir); got.KeyID != rotated.Identity().KeyID {
+		t.Fatal("persisted identity does not name the epoch that is signing")
+	}
+}
+
+// TestPublishEpochSkipsTheStoreForInlineReceipts: an inline receipt carries its
+// own evidence, so a store entry would be a file nothing resolves. Only the
+// hash-only form — the one with a hash to look up — writes to it.
+func TestPublishEpochSkipsTheStoreForInlineReceipts(t *testing.T) {
+	t.Setenv("TOKENHIVE_SIM_DIR", t.TempDir())
+
+	runtime := newTestRuntime(t, fakeEpoch([]byte("startup-evidence")), true)
+	rotated := fakeEpoch([]byte("rotated-evidence"))
+	refresher := &fakeRefresher{snapshot: rotated, serverTLS: fakeServerTLS(t, "rotated-ra-tls-leaf")}
+	if err := publishOnce(refresher, runtime); err != nil {
+		t.Fatalf("publish rotated epoch: %v", err)
 	}
 
-	if runtime.get() != before {
-		t.Fatal("runtime adopted an epoch whose RA-TLS leaf could not be published")
+	store, err := evidence.NewStore(shared.EvidenceDir())
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The refused rotation must also leave no file naming the epoch that never
-	// started signing: a half-published identity is the mismatch the ordering in
-	// publishEpoch exists to avoid.
-	assertIdentityNotRotated(t, simDir, rotated.Identity())
+	if store.Has(rotated.Identity()) {
+		t.Fatal("the store holds evidence no verifier would resolve for an inline receipt")
+	}
 }
 
 // TestPublishEpochKeepsSigningWhenEvidenceCannotBePublished is the fail-closed
@@ -246,7 +261,7 @@ func TestPublishEpochKeepsSigningWhenEvidenceCannotBePublished(t *testing.T) {
 	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
 
 	startup := fakeEpoch([]byte("startup-evidence"))
-	runtime := newTestRuntime(t, startup)
+	runtime := newTestRuntime(t, startup, false)
 	before := runtime.get()
 
 	// Evidence that does not hash to the identity's EvidenceHash: the store
@@ -271,20 +286,27 @@ func TestPublishEpochKeepsSigningWhenEvidenceCannotBePublished(t *testing.T) {
 // naming the epoch it refused to adopt.
 func assertIdentityNotRotated(t *testing.T, simDir string, rotated platform.Identity) {
 	t.Helper()
+	if got := readPersistedIdentity(t, simDir); got.KeyID == rotated.KeyID {
+		t.Fatal("a refused rotation left tee_identity.json naming the epoch that never started signing")
+	}
+}
+
+// readPersistedIdentity reads the identity file an auditor inspects, or a zero
+// identity when the process never wrote one.
+func readPersistedIdentity(t *testing.T, simDir string) platform.Identity {
+	t.Helper()
 	b, err := os.ReadFile(filepath.Join(simDir, "tee_identity.json"))
 	if errors.Is(err, os.ErrNotExist) {
-		return
+		return platform.Identity{}
 	}
 	if err != nil {
 		t.Fatalf("read tee identity: %v", err)
 	}
-	var persisted platform.Identity
-	if err := json.Unmarshal(b, &persisted); err != nil {
+	var id platform.Identity
+	if err := json.Unmarshal(b, &id); err != nil {
 		t.Fatalf("decode tee identity: %v", err)
 	}
-	if persisted.KeyID == rotated.KeyID {
-		t.Fatal("a refused rotation left tee_identity.json naming the epoch that never started signing")
-	}
+	return id
 }
 
 // publishOnce drives the publication half of one refresh tick. A tick reaches
@@ -304,7 +326,7 @@ func publishOnce(refresher epochRefresher, runtime *serviceRuntime) error {
 func TestAdoptPublishesTheSignerToTheLiveCell(t *testing.T) {
 	t.Setenv("TOKENHIVE_SIM_DIR", t.TempDir())
 
-	runtime := newTestRuntime(t, fakeEpoch([]byte("startup-evidence")))
+	runtime := newTestRuntime(t, fakeEpoch([]byte("startup-evidence")), false)
 	cell := &atomic.Pointer[proof.Signer]{}
 	runtime.template.SignerCell = cell
 
@@ -324,8 +346,9 @@ func TestAdoptPublishesTheSignerToTheLiveCell(t *testing.T) {
 
 // newTestRuntime builds the smallest real service: the runtime's own logic is
 // what is under test, so the transport never runs and the policy is never
-// consulted.
-func newTestRuntime(t *testing.T, epoch platform.Epoch) *serviceRuntime {
+// consulted. includeEvidence picks the receipt form the runtime publishes for;
+// the hash-only form is the one that needs the evidence store.
+func newTestRuntime(t *testing.T, epoch platform.Epoch, includeEvidence bool) *serviceRuntime {
 	t.Helper()
 	seq, err := tee.NewFileSeqStore(filepath.Join(t.TempDir(), "seqstore.json"))
 	if err != nil {
@@ -342,12 +365,12 @@ func newTestRuntime(t *testing.T, epoch platform.Epoch) *serviceRuntime {
 		Seq:       seq,
 		InboxKey:  inbox,
 	}
-	template.Signer.IncludeEvidence = true
-	svc, err := tee.NewService(template)
+	template.Signer.IncludeEvidence = includeEvidence
+	runtime, err := newServiceRuntime(template, epoch, nil, rootShared.NewNopLogger())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("build service runtime: %v", err)
 	}
-	return newServiceRuntime(template, svc)
+	return runtime
 }
 
 type fakeRefresher struct {
@@ -364,8 +387,8 @@ func (f *fakeRefresher) Snapshot(context.Context) (platform.Epoch, error) {
 	return f.snapshot, nil
 }
 
-// ServerTLSConfig is nil unless a test hands over a leaf: the rotation path
-// treats "nothing to publish" as a failed publication on purpose.
+// ServerTLSConfig is nil unless a test hands over a leaf, which is the "nothing
+// to publish" case the rotation logs about and signs through.
 func (f *fakeRefresher) ServerTLSConfig() *tls.Config { return f.serverTLS }
 
 type fakeEpochImpl struct {
