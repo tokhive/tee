@@ -119,6 +119,15 @@ func runAndExit(bin string, args ...string) {
 
 func supervise() error {
 	start(mpCmd(18080))
+	// Clear any leaf a previous tee left at this path before spawning this
+	// run's, because waitForTEECert treats the file's presence as "the tee can
+	// serve". On a fresh boot the state directory is empty and this is a no-op;
+	// a supervisor restarted within one boot would otherwise find the old file
+	// instantly and let the Hub dial a listener that has not come up yet. The
+	// child writes this path itself, synchronously, before it starts serving.
+	if err := os.Remove(teeCert); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clear stale %s: %w", teeCert, err)
+	}
 	start(teeCmd())
 	if initToken == "" {
 		return fmt.Errorf("TOKENHIVE_SUPERVISE requires TEE_INIT_TOKEN")
@@ -167,7 +176,12 @@ func selfTest() {
 }
 
 func waitAll() {
-	// Restart-on-exit keeps the loop up if a child dies; it runs forever.
+	// Park forever so the dispatcher outlives the children it started. It does
+	// NOT restart them: start() runs each child once and only logs its exit, so a
+	// child that dies stays dead while this loop keeps the process (and the
+	// loader's view of the instance) up. There is no supervision here — if the
+	// loop-back topology needs a crashed child brought back, that has to be
+	// built, not assumed.
 	for {
 		time.Sleep(60 * time.Second)
 	}

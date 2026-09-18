@@ -71,6 +71,11 @@ func ServerMTLSConfig(serverTLS *tls.Config, clientCAPath string) (*tls.Config, 
 // handshake proves the peer is the attested TEE, and presents the Hub's own
 // client certificate so the TEE admits it. Either half may be omitted.
 //
+// A pin only fits a peer whose epoch is fixed. An attested TEE on AWS SEV-SNP
+// rotates its RA-TLS leaf for as long as it serves (see ratls_refresh.go in
+// cmd/tee), and a rotation produces a leaf this pin does not name — see the
+// verifier below for the error that names that state.
+//
 // The pin is verified with the standard chain check against the pool, but
 // hostname verification is deliberately skipped: RA-TLS certificates are
 // attested keys, not DNS identities, and the trust statement is "this exact
@@ -103,7 +108,12 @@ func ClientMTLSConfig(caPEMPath, certPath, keyPath string) (*tls.Config, error) 
 				Intermediates: intermediates,
 				KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 			}); err != nil {
-				return fmt.Errorf("tee certificate is not pinned: %w", err)
+				// A pin names one certificate, and an attested TEE that keeps its
+				// evidence fresh presents a new leaf on every rotation. So this is
+				// the failure that arrives hours into a run, on the first re-dial,
+				// and reads like an ordinary TLS problem. Say what it actually is,
+				// because the two causes need opposite operator actions.
+				return fmt.Errorf("tee certificate is not pinned: %w (a rotating attested TEE presents a new leaf each rotation, which no pin can name — authenticate that deployment by evidence with -tee-verify=attestation; a pin is for a peer whose epoch is fixed, such as the simulation)", err)
 			}
 			return nil
 		},
@@ -121,28 +131,41 @@ func ClientMTLSConfig(caPEMPath, certPath, keyPath string) (*tls.Config, error) 
 	return cfg, nil
 }
 
-// WriteTEECert publishes the leaf certificate a TEE listener presents, so the
-// Hub (or the deployment tooling) can pin it. The certificate is extracted
-// from the server TLS config the platform adapter produced: on sevsnp this is
-// the attested RA-TLS leaf (its SPKI is the receipt KeyID), on simulated it is
-// the sim test certificate minted from the epoch key.
-func WriteTEECert(cfg *tls.Config, outPath string) error {
+// LeafCertificate returns the leaf certificate a server TLS config presents:
+// the live one from GetCertificate (RA-TLS rotates it per handshake), or the
+// first static entry when no callback is set. Publishing that leaf to disk and
+// handing it to a bootstrap caller make exactly this choice, so it lives here
+// rather than being spelled out at each of them.
+func LeafCertificate(cfg *tls.Config) (*x509.Certificate, error) {
 	var cert *tls.Certificate
 	if cfg.GetCertificate != nil {
 		c, err := cfg.GetCertificate(nil)
 		if err != nil {
-			return fmt.Errorf("read RA-TLS certificate: %w", err)
+			return nil, fmt.Errorf("read RA-TLS certificate: %w", err)
 		}
 		cert = c
 	} else if len(cfg.Certificates) > 0 {
 		c := cfg.Certificates[0]
 		cert = &c
-	} else {
-		return errors.New("server TLS config has no certificate to publish")
+	}
+	if cert == nil || len(cert.Certificate) == 0 {
+		return nil, errors.New("server TLS config has no certificate to serve")
 	}
 	leaf, err := x509.ParseCertificate(cert.Certificate[0])
 	if err != nil {
-		return fmt.Errorf("parse RA-TLS leaf: %w", err)
+		return nil, fmt.Errorf("parse RA-TLS leaf: %w", err)
+	}
+	return leaf, nil
+}
+
+// WriteTEECert publishes the leaf certificate a TEE listener presents. The
+// certificate is extracted from the server TLS config the platform adapter
+// produced: on sevsnp this is the attested RA-TLS leaf (its SPKI is the receipt
+// KeyID), on simulated it is the sim test certificate minted from the epoch key.
+func WriteTEECert(cfg *tls.Config, outPath string) error {
+	leaf, err := LeafCertificate(cfg)
+	if err != nil {
+		return err
 	}
 	if err := os.WriteFile(outPath, pemEncode("CERTIFICATE", leaf.Raw), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", outPath, err)

@@ -38,7 +38,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -53,6 +52,7 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/transport"
@@ -97,12 +97,16 @@ func main() {
 	caFile := flag.String("ca", os.Getenv("TEE_CA"), "root CA PEM for provider TLS; empty = sim test CA on simulated, system roots on sevsnp")
 	mtls := flag.Bool("mtls", envOrBool("TEE_MTLS", false), "serve the Hub-facing API over mutual TLS: the platform's RA-TLS server certificate (sevsnp) or the sim test certificate (simulated), demanding a Hub client certificate")
 	mtlsClientCA := flag.String("mtls-client-ca", envOr("TEE_MTLS_CLIENT_CA", ""), "PEM CA(s) that sign Hub client certificates; empty defaults to <simdir>/hub-ca.pem (required with -mtls)")
-	// Trust-on-first-use bootstrap: the confidential instance has no out-of-band
-	// channel, so before the Hub can pin our RA-TLS certificate it must fetch it.
-	// A one-shot plain-HTTP listener (gated by TEE_INIT_TOKEN) serves exactly that
-	// leaf over GET /v1/init-cert and nothing else; the Hub never talks TLS to it.
-	initAddr := flag.String("init-addr", envOr("TEE_INIT_ADDR", ""), "plain-HTTP bootstrap listener (e.g. 0.0.0.0:18091); serves /v1/init-cert gated by -init-token")
-	initToken := flag.String("init-token", envOr("TEE_INIT_TOKEN", ""), "bearer token guarding the bootstrap /v1/init-cert endpoint (required with -init-addr)")
+	// Diagnostic bootstrap listener: a plain-HTTP one-shot that serves the
+	// current RA-TLS leaf over GET /v1/init-cert (gated by -init-token) so an
+	// operator with no shell on the instance can read which certificate the mTLS
+	// plane presents. It is NOT part of the trust chain: the Hub authenticates
+	// the TEE by verifying the evidence inside the leaf (-tee-verify attestation)
+	// and never fetches or pins this endpoint, so nothing it returns establishes
+	// trust. Trust-on-first-use via this leaf is exactly the design the Hub no
+	// longer uses — do not restore it by pointing a pin at this output.
+	initAddr := flag.String("init-addr", envOr("TEE_INIT_ADDR", ""), "diagnostic plain-HTTP listener (e.g. 0.0.0.0:18091) serving /v1/init-cert gated by -init-token; not a trust path")
+	initToken := flag.String("init-token", envOr("TEE_INIT_TOKEN", ""), "bearer token guarding the diagnostic /v1/init-cert endpoint (required with -init-addr)")
 	// On an SNP instance the deployment whitelist is baked inside the measured
 	// bundle at a fixed path. Pointing this flag there means the policy the
 	// enclave enforces IS the measured copy in the bundle tar, whose digest the
@@ -452,25 +456,14 @@ func serveInitCert(addr, initToken string, mTLSConfig *tls.Config) {
 	}
 }
 
-// leafCertPEM extracts the RA-TLS leaf certificate PEM from a server TLS config,
-// mirroring what shared.WriteTEECert writes to disk (the same bytes the Hub pins).
+// leafCertPEM renders the RA-TLS leaf a server TLS config presents, exactly the
+// bytes shared.WriteTEECert writes to disk. Both read the live certificate
+// through the same helper, so the diagnostic endpoint and the published file
+// cannot answer with different leaves.
 func leafCertPEM(cfg *tls.Config) ([]byte, error) {
-	var cert *tls.Certificate
-	if cfg.GetCertificate != nil {
-		c, err := cfg.GetCertificate(nil)
-		if err != nil {
-			return nil, err
-		}
-		cert = c
-	} else if len(cfg.Certificates) > 0 {
-		c := cfg.Certificates[0]
-		cert = &c
-	} else {
-		return nil, fmt.Errorf("server TLS config has no certificate to serve")
-	}
-	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	leaf, err := mtls.LeafCertificate(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("parse RA-TLS leaf: %w", err)
+		return nil, err
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leaf.Raw}), nil
 }
