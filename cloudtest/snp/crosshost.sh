@@ -389,10 +389,17 @@ chmod 755 ./tee/hub ./tee/agent ./tee/mockprovider
 ./tee/mockprovider -addr 127.0.0.1:18080 -tls -stats-addr 127.0.0.1:18081 \
   -ca mtls/mp-ca.pem -cert mtls/mp-cert.pem -key mtls/mp-key.pem >tee/mp.log 2>&1 &
 sleep 1
+# The Hub resolves a receipt's EvidenceHash from memory, then from its own
+# evidence store, then from the TEE's /v1/evidence over the same mTLS channel
+# (-evidence-fetch). That remote leg is what keeps a hash-only TEE
+# (-evidence=false) verifiable here: Hub and TEE are on different machines, so
+# the TEE's evidence store is never on this host. Harmless when the TEE embeds
+# evidence inline (the fetch is never reached), essential the moment it does not.
 ./tee/hub -serve 0.0.0.0:18085 -agent-keys 'openai-sim=${agent_key}' -relay-key '${relay_key}' \
   -policy-dir "\$HOME/${REMOTE_POLICY_REL}" \
   -host 127.0.0.1:18080 \
   -model sim-mock-0.5b -tee https://${tip}:18090 -tee-verify attestation \
+  -evidence-fetch https://${tip}:18090 \
   -mtls-cert mtls/hub-cert.pem -mtls-key mtls/hub-key.pem \
   -allowed-platforms aws-sev-snp -expected-app 'snp-app:${app_hash}' >tee/hub.log 2>&1 &
 sleep 1
