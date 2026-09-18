@@ -560,7 +560,14 @@ func writeJSON(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	// Write-then-rename so a crash cannot leave a truncated file that later
+	// reads back as a valid document describing nothing — the same reason the
+	// evidence store stages and renames its entries.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func readJSON(path string, v any) error {

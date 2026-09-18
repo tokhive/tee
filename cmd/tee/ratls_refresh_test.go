@@ -64,7 +64,7 @@ func TestNextRefreshDelayTracksTheNitroTPMLeaf(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			refresher := &fakeRefresher{snapshot: fakeEpoch(nitroAttestation(t, test.notAfter))}
-			got := nextRefreshDelay(context.Background(), refresher, true)
+			got := nextRefreshDelay(context.Background(), refresher, true, rootShared.NewNopLogger())
 			if !test.want(got) {
 				t.Fatalf("nextRefreshDelay = %s, want %s", got, test.wantWhy)
 			}
@@ -73,7 +73,7 @@ func TestNextRefreshDelayTracksTheNitroTPMLeaf(t *testing.T) {
 
 	t.Run("a failed snapshot retries on the floor", func(t *testing.T) {
 		refresher := &fakeRefresher{err: platform.ErrNotReady}
-		if got := nextRefreshDelay(context.Background(), refresher, true); got != minRefreshFloor {
+		if got := nextRefreshDelay(context.Background(), refresher, true, rootShared.NewNopLogger()); got != minRefreshFloor {
 			t.Fatalf("nextRefreshDelay = %s, want %s so an unhealthy adapter is retried promptly", got, minRefreshFloor)
 		}
 	})
@@ -85,10 +85,24 @@ func TestNextRefreshDelayTracksTheNitroTPMLeaf(t *testing.T) {
 	// evidence would leave the TEE signing receipts that resolve to stale proof.
 	t.Run("a failed publication retries on the floor although the evidence looks fresh", func(t *testing.T) {
 		refresher := &fakeRefresher{snapshot: fakeEpoch(nitroAttestation(t, time.Now().Add(10*time.Hour)))}
-		if got := nextRefreshDelay(context.Background(), refresher, false); got != minRefreshFloor {
+		if got := nextRefreshDelay(context.Background(), refresher, false, rootShared.NewNopLogger()); got != minRefreshFloor {
 			t.Fatalf("nextRefreshDelay = %s, want %s after a publication that did not land", got, minRefreshFloor)
 		}
 	})
+}
+
+// TestAttestationExpiryReportsWhetherItTrackedTheLeaf pins the flag the
+// cadence logs on. An AWS evidence's deadline comes from its NitroTPM leaf and
+// is adaptive; anything else falls back to the fixed TTL, and the loop has to
+// be able to announce that instead of looking like a healthy schedule.
+func TestAttestationExpiryReportsWhetherItTrackedTheLeaf(t *testing.T) {
+	tracked := nitroAttestation(t, time.Now().Add(3*time.Hour))
+	if _, ok := rootShared.SNPAttestationExpiryFromLeaf(tracked); !ok {
+		t.Fatal("AWS evidence reported an untracked expiry")
+	}
+	if _, ok := rootShared.SNPAttestationExpiryFromLeaf([]byte("not-an-aws-envelope")); ok {
+		t.Fatal("non-AWS evidence reported a tracked expiry")
+	}
 }
 
 // TestRunEpochRefreshAdoptsAndPublishesRotatedEpoch covers the wiring the
@@ -198,7 +212,8 @@ func fakeServerTLS(t *testing.T, commonName string) *tls.Config {
 // published file denies. The process keeps signing under the previous epoch,
 // which is the state whose leaf the file still describes.
 func TestRunEpochRefreshRefusesARotationItCannotPublishATleafFor(t *testing.T) {
-	t.Setenv("TOKENHIVE_SIM_DIR", t.TempDir())
+	simDir := t.TempDir()
+	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
 
 	runtime := newTestRuntime(t, fakeEpoch([]byte("startup-evidence")))
 	before := runtime.get()
@@ -209,6 +224,10 @@ func TestRunEpochRefreshRefusesARotationItCannotPublishATleafFor(t *testing.T) {
 	if runtime.get() != before {
 		t.Fatal("runtime adopted an epoch whose RA-TLS leaf could not be published")
 	}
+	// The refused rotation must also leave no file naming the epoch that never
+	// started signing: a half-published identity is the mismatch the ordering in
+	// publishEpoch exists to avoid.
+	assertIdentityNotRotated(t, simDir, rotated.Identity())
 }
 
 // TestRunEpochRefreshKeepsSigningWhenEvidenceCannotBePublished is the
@@ -217,7 +236,8 @@ func TestRunEpochRefreshRefusesARotationItCannotPublishATleafFor(t *testing.T) {
 // whole: the previous service keeps signing, and it keeps signing under the
 // epoch whose evidence IS resolvable.
 func TestRunEpochRefreshKeepsSigningWhenEvidenceCannotBePublished(t *testing.T) {
-	t.Setenv("TOKENHIVE_SIM_DIR", t.TempDir())
+	simDir := t.TempDir()
+	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
 
 	startup := fakeEpoch([]byte("startup-evidence"))
 	runtime := newTestRuntime(t, startup)
@@ -232,6 +252,30 @@ func TestRunEpochRefreshKeepsSigningWhenEvidenceCannotBePublished(t *testing.T) 
 
 	if runtime.get() != before {
 		t.Fatal("runtime adopted an epoch whose evidence could not be published")
+	}
+	// Evidence is written first precisely so its failure cannot leave a later
+	// file — the identity an auditor reads — describing an epoch that never
+	// signed anything.
+	assertIdentityNotRotated(t, simDir, unpublishable.Identity())
+}
+
+// assertIdentityNotRotated fails when a refused rotation left tee_identity.json
+// naming the epoch it refused to adopt.
+func assertIdentityNotRotated(t *testing.T, simDir string, rotated platform.Identity) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(simDir, "tee_identity.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		t.Fatalf("read tee identity: %v", err)
+	}
+	var persisted platform.Identity
+	if err := json.Unmarshal(b, &persisted); err != nil {
+		t.Fatalf("decode tee identity: %v", err)
+	}
+	if persisted.KeyID == rotated.KeyID {
+		t.Fatal("a refused rotation left tee_identity.json naming the epoch that never started signing")
 	}
 }
 

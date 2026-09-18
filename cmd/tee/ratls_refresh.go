@@ -54,11 +54,11 @@ type epochAssembly struct {
 }
 
 // minRefreshFloor bounds how soon the adaptive cadence may fire again. It is
-// the floor tee_k/tee_t apply too, and it earns its keep after a failed
-// rotation: the adapter latches itself unhealthy and Snapshot reports
-// ErrNotReady, so without a floor the retry would fall back to the two-hour SNP
-// ceiling and a single transient attestation failure would keep the TEE's TLS
-// listener closed for the rest of that window.
+// the floor tee_k/tee_t apply too, and it earns its keep once a rotation has
+// failed for long enough that the epoch still being served reaches its margin:
+// the adapter then stops admitting and Snapshot reports ErrNotReady, so without
+// the floor the retry would wait out the two-hour SNP ceiling while the TLS
+// listener has no evidence left worth presenting.
 const minRefreshFloor = 10 * time.Minute
 
 // serviceRuntime is the mutable half of this process. A receipt names the
@@ -135,7 +135,7 @@ func runEpochRefresh(ctx context.Context, refresher epochRefresher, runtime *ser
 		published = err == nil
 		return err
 	}
-	next := func() time.Duration { return nextRefreshDelay(ctx, refresher, published) }
+	next := func() time.Duration { return nextRefreshDelay(ctx, refresher, published, logger) }
 	// The health tracker is intentionally nil: AttestationHealth exists to
 	// self-reset a guest whose attestation device has wedged, and this process
 	// has no recovery path to drive. A refresh that keeps failing is logged by
@@ -144,31 +144,34 @@ func runEpochRefresh(ctx context.Context, refresher epochRefresher, runtime *ser
 }
 
 // publishEpoch makes one rotated epoch the epoch this process serves: the
-// identity an auditor reads, the evidence a hash-only receipt resolves, the
-// published leaf, then the signer. Everything the process shows the outside
+// evidence a hash-only receipt resolves, the published leaf, the identity an
+// auditor reads, then the signer. Everything the process shows the outside
 // world is updated before it is allowed to sign with the new key — a rotated
 // epoch that never lands in the store signs receipts nobody can verify.
 // Whichever half fails, the previous service keeps signing, so the failure is
 // visible as a rotation that did not happen rather than as unverifiable
 // receipts.
+//
+// These writes cannot be one atomic step, so they go in the order that leaves
+// the least harmful state behind when one of them fails. The evidence store is
+// append-only and keyed by hash: an entry a later failure orphans is harmless,
+// and it is what a hash-only receipt needs, so it goes first. The leaf already
+// describes the listener — the refresh adopted the rotated epoch before
+// returning — so writing it next keeps the file true. The identity goes last of
+// the three because it is the one file that describes the *signer*: written any
+// earlier it would name a key the receipts do not yet carry.
 func publishEpoch(ctx context.Context, refresher epochRefresher, runtime *serviceRuntime) error {
 	snapshot, err := refresher.Snapshot(ctx)
 	if err != nil {
 		return err
 	}
 	identity := snapshot.Identity()
-	// Publish the rotated identity before it starts signing: the
-	// tee_identity.json an auditor reads has to describe the key the
-	// receipts carry.
-	if err := shared.WriteTEEIdentity(identity); err != nil {
-		return err
-	}
 	// The evidence store is how a hash-only receipt's EvidenceHash resolves
 	// — locally, and over /v1/evidence for a Hub on another host.
 	if err := shared.RecordTEEEvidence(identity); err != nil {
 		return err
 	}
-	// And the leaf the listener now presents, for the same reason: the file
+	// The leaf the listener now presents, for the same reason: the file
 	// exists so something outside this process can learn which certificate to
 	// expect, and a stale one answers that question wrongly. It is written
 	// after the refresh has adopted the new epoch (Refresh publishes before
@@ -181,6 +184,12 @@ func publishEpoch(ctx context.Context, refresher epochRefresher, runtime *servic
 		return errors.New("rotated epoch provides no RA-TLS server config to publish")
 	}
 	if err := shared.WriteTEECert(cfg); err != nil {
+		return err
+	}
+	// Publish the rotated identity before it starts signing: the
+	// tee_identity.json an auditor reads has to describe the key the
+	// receipts carry.
+	if err := shared.WriteTEEIdentity(identity); err != nil {
 		return err
 	}
 	return runtime.adopt(snapshot)
@@ -197,16 +206,24 @@ func publishEpoch(ctx context.Context, refresher epochRefresher, runtime *servic
 // refresh succeeded but the epoch never reached the service — the floor applies
 // however fresh the evidence looks, because the listener has already rotated and
 // the mismatch has to be corrected promptly rather than at the ceiling.
-func nextRefreshDelay(ctx context.Context, refresher epochRefresher, published bool) time.Duration {
+func nextRefreshDelay(ctx context.Context, refresher epochRefresher, published bool, logger *rootShared.Logger) time.Duration {
 	if !published {
 		return minRefreshFloor
 	}
 	snapshot, err := refresher.Snapshot(ctx)
 	if err != nil {
-		// The previous rotation failed (or one is in flight) and the adapter is
-		// not admitting anything until it succeeds.
+		// The adapter admits nothing until a rotation succeeds, which is what
+		// happens once the epoch it is serving reaches its margin.
 		return minRefreshFloor
 	}
-	expiry := rootShared.SNPAttestationExpiry(snapshot.Identity().Evidence)
+	expiry, tracked := rootShared.SNPAttestationExpiryFromLeaf(snapshot.Identity().Evidence)
+	if !tracked {
+		// The adaptive half of the cadence reads the NitroTPM leaf's NotAfter.
+		// When that read fails the loop silently falls back to the two-hour
+		// ceiling, which for a three-hour AWS leaf sits only thirty minutes
+		// inside expiry — no longer adaptive, just short enough to look fine.
+		// Say so, because there is no other trace of it until evidence goes stale.
+		logger.Warn("evidence carries no readable NitroTPM leaf expiry; refresh cadence falls back to the fixed two-hour ceiling")
+	}
 	return max(min(time.Until(expiry), rootShared.RATLSRefreshIntervalSNP), minRefreshFloor)
 }
