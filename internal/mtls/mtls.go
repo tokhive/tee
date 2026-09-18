@@ -172,9 +172,8 @@ func LeafCertificate(cfg *tls.Config) (*x509.Certificate, error) {
 // produced: on sevsnp this is the attested RA-TLS leaf (its SPKI is the receipt
 // KeyID), on simulated it is the sim test certificate minted from the epoch key.
 //
-// Only a fixed epoch (the simulation) is ever published: its leaf is stable
-// for the process lifetime, so the Hub's -tee-verify=pin mode can name it. A
-// rotating epoch presents a new leaf every rotation, which no pin can name.
+// Only a fixed epoch (the simulation) is ever published — a rotating one
+// presents a new leaf every rotation, which no pin can name.
 func WriteTEECert(cfg *tls.Config, outPath string) error {
 	leaf, err := LeafCertificate(cfg)
 	if err != nil {

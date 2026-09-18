@@ -253,12 +253,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("publish startup epoch: %v", err)
 	}
-	// A fixed epoch (the simulation) never rotates, so the leaf the mTLS
-	// listener presents is stable for the process lifetime and pinning it is
-	// sound. Publish it once for the Hub's -tee-verify=pin mode (see harness
-	// scenario 18). A rotating epoch (sevsnp) presents a new leaf every
-	// rotation, which no pin can name — the Hub verifies the evidence inside
-	// the leaf instead, so there is nothing to publish.
+	// A fixed epoch (the simulation) never rotates, so its leaf is stable and
+	// pinning it is sound: publish it once for the Hub's -tee-verify=pin mode.
+	// A rotating epoch (sevsnp) is verified by evidence, never by pin.
 	if assembly.Refresher == nil && leafTLS != nil {
 		if err := shared.WriteTEECert(leafTLS); err != nil {
 			log.Fatalf("publish tee certificate: %v", err)

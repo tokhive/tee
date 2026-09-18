@@ -315,9 +315,8 @@ cmd_fetch() {
   out="$(remote_exec "$(host_field public_ip)" bash <<EOF
 set -e
 for _ in \$(seq 1 60); do
-  if echo | openssl s_client -connect ${tip}:18090 -cert mtls/hub-cert.pem -key mtls/hub-key.pem -showcerts 2>/dev/null | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' >tee-cert.pem; then
-    [ -s tee-cert.pem ] && break
-  fi
+  echo | openssl s_client -connect ${tip}:18090 -cert mtls/hub-cert.pem -key mtls/hub-key.pem -showcerts 2>/dev/null | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' >tee-cert.pem
+  [ -s tee-cert.pem ] && break
   sleep 5
 done
 [ -s tee-cert.pem ] || { echo 'mTLS fetch never succeeded'; exit 1; }

@@ -372,14 +372,10 @@ const (
 	// presented with -mtls-cert/-mtls-key.
 	MTLSClientCertPath = "hub-client.pem"
 	MTLSClientKeyPath  = "hub-client-key.pem"
-	// MTLSServerCertPath is the TEE's RA-TLS leaf cert, published once at startup
-	// when the epoch is fixed (the simulation) so the listener's identity can
-	// be read from outside. The Hub that verifies attestation takes the
-	// evidence inside the leaf, not this file: a Hub that pins the file instead
-	// has to be told about every rotation, which is exactly what
-	// -tee-verify=attestation removes. Pin mode is sound only where the epoch
-	// is fixed (the simulation and the harness), which is where this file is
-	// the whole trust statement.
+	// MTLSServerCertPath is the TEE's RA-TLS leaf, published once at startup
+	// when the epoch is fixed (the simulation) so the Hub's pin mode can name
+	// it. A rotating epoch (sevsnp) presents a new leaf every rotation, which
+	// no pin can name — attestation mode verifies the evidence instead.
 	MTLSServerCertPath = "tee-cert.pem"
 )
 

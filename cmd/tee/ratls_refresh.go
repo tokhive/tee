@@ -84,10 +84,9 @@ func newServiceRuntime(template tee.Config, epoch platform.Epoch, logger *rootSh
 
 // publish makes an epoch observable outside this process: the evidence a
 // hash-only receipt resolves, then the identity an auditor reads. The RA-TLS
-// leaf the listener presents is deliberately NOT published: a rotating epoch
-// presents a new leaf every rotation, which no pin can name — the Hub verifies
-// the evidence inside the leaf instead. The simulation's fixed epoch publishes
-// its leaf once from main, where the listener config lives, not from here.
+// leaf is deliberately NOT published — a rotating epoch presents a new one
+// every rotation, which no pin can name (the fixed sim epoch publishes its
+// leaf once from main instead).
 func (r *serviceRuntime) publish(epoch platform.Epoch) error {
 	identity := epoch.Identity()
 	// Only the hash-only receipt form needs the store: an inline receipt carries
