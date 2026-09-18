@@ -10,10 +10,14 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"errors"
+	"math/big"
 	"testing"
 	"time"
+
+	"github.com/fxamacker/cbor/v2"
 
 	"github.com/reclaimprotocol/reclaim-tee/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
@@ -128,9 +132,17 @@ func TestRefreshPublishesOneNewVerifiedEpoch(t *testing.T) {
 	}
 }
 
-func TestRefreshFailureClosesTLSAdmission(t *testing.T) {
+// TestRefreshFailureKeepsServingAnEpochThatStillHasMargin: a rotation that fails
+// while the epoch it is replacing is still outside its margin keeps being
+// served. The failure is a rotation that did not happen; it must not become a
+// listener that refuses every new handshake until a retry succeeds.
+func TestRefreshFailureKeepsServingAnEpochThatStillHasMargin(t *testing.T) {
 	manager := newFakeManager(t)
 	adapter, err := newAWS(context.Background(), Config{Role: "tokenhive_tee"}, testDependencies(manager))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := adapter.Snapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,8 +151,34 @@ func TestRefreshFailureClosesTLSAdmission(t *testing.T) {
 	if err := adapter.Refresh(context.Background()); err == nil {
 		t.Fatal("Refresh succeeded")
 	}
+	if !adapter.Healthy() {
+		t.Fatal("adapter stopped admitting while the served epoch still had margin")
+	}
+	after, err := adapter.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot after a failed refresh = %v, want the epoch still being served", err)
+	}
+	if after.Identity().KeyID != before.Identity().KeyID {
+		t.Fatal("a failed refresh changed the epoch that is served")
+	}
+	if _, err := adapter.ServerTLSConfig().GetCertificate(nil); err != nil {
+		t.Fatalf("GetCertificate after a failed refresh = %v, want the served certificate", err)
+	}
+}
+
+// TestAdapterFailsClosedOnceTheServedEpochIsInItsMargin is the other half: the
+// adapter stops admitting exactly when the evidence it would present reaches
+// the refresh margin, which is the point a verifier stops accepting it.
+func TestAdapterFailsClosedOnceTheServedEpochIsInItsMargin(t *testing.T) {
+	manager := newFakeManager(t)
+	// A leaf expiring in ten minutes is already inside the thirty-minute margin.
+	manager.current = newFakeSnapshot(t, string(nitroLeafExpiringAt(t, time.Now().Add(10*time.Minute))))
+	adapter, err := newAWS(context.Background(), Config{Role: "tokenhive_tee"}, testDependencies(manager))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if adapter.Healthy() {
-		t.Fatal("adapter remained healthy after refresh failure")
+		t.Fatal("adapter admitted an epoch whose evidence is inside the refresh margin")
 	}
 	if _, err := adapter.Snapshot(context.Background()); !errors.Is(err, platform.ErrNotReady) {
 		t.Fatalf("Snapshot error = %v, want ErrNotReady", err)
@@ -148,6 +186,44 @@ func TestRefreshFailureClosesTLSAdmission(t *testing.T) {
 	if _, err := adapter.ServerTLSConfig().GetCertificate(nil); !errors.Is(err, platform.ErrNotReady) {
 		t.Fatalf("GetCertificate error = %v, want ErrNotReady", err)
 	}
+}
+
+// nitroLeafExpiringAt builds an AWS-tagged combined envelope carrying a
+// NitroTPM document whose leaf expires at notAfter. SNPNitroLeafNotAfter only
+// reads the expiry of a document the caller just generated, never to trust it,
+// so a synthetic document is a faithful input to the admission deadline.
+func nitroLeafExpiringAt(t *testing.T, notAfter time.Time) []byte {
+	t.Helper()
+	notAfter = notAfter.Truncate(time.Second)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "synthetic-nitrotpm-leaf"},
+		NotBefore:    notAfter.Add(-3 * time.Hour),
+		NotAfter:     notAfter,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := cbor.Marshal(map[string]any{"certificate": der})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cose, err := cbor.Marshal([]any{[]byte("protected"), nil, doc, []byte("signature")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := cbor.Marshal(map[string]any{"nitrotpm": cose})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 0x02 is the AWS tag: the reader keys off it, so untagged bytes are not a
+	// NitroTPM attestation no matter what they contain.
+	return append([]byte{0x02}, envelope...)
 }
 
 func TestTLSAdmissionUsesTheVerifiedEpochCertificate(t *testing.T) {
@@ -179,6 +255,10 @@ func TestSnapshotDoesNotBlockOnAttestationRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	before, err := adapter.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	manager.refreshStarted = make(chan struct{})
 	manager.refreshRelease = make(chan struct{})
 	refreshDone := make(chan error, 1)
@@ -187,15 +267,24 @@ func TestSnapshotDoesNotBlockOnAttestationRefresh(t *testing.T) {
 	}()
 	<-manager.refreshStarted
 
-	snapshotDone := make(chan error, 1)
+	// A rotation in flight must not block admission, and it must not expose a
+	// half-rotated state either: a reader sees the epoch still being served.
+	type snapshotResult struct {
+		epoch platform.Epoch
+		err   error
+	}
+	snapshotDone := make(chan snapshotResult, 1)
 	go func() {
-		_, err := adapter.Snapshot(context.Background())
-		snapshotDone <- err
+		e, err := adapter.Snapshot(context.Background())
+		snapshotDone <- snapshotResult{e, err}
 	}()
 	select {
-	case err := <-snapshotDone:
-		if !errors.Is(err, platform.ErrNotReady) {
-			t.Fatalf("Snapshot error during refresh = %v, want ErrNotReady", err)
+	case got := <-snapshotDone:
+		if got.err != nil {
+			t.Fatalf("Snapshot during refresh = %v, want the epoch still being served", got.err)
+		}
+		if got.epoch.Identity().KeyID != before.Identity().KeyID {
+			t.Fatal("Snapshot during refresh returned an epoch that is not the one being served")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Snapshot blocked on the attestation refresh operation")

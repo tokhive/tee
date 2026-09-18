@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
@@ -25,6 +26,13 @@ type Config struct {
 }
 
 // Adapter keeps admission, evidence, and signing on a verified RA-TLS epoch.
+//
+// Admission is derived from the epoch itself — what it is serving and whether
+// that epoch's evidence is still outside the refresh margin — rather than from
+// a flag a refresh flips. A rotation therefore never interrupts service: it
+// swaps one verified epoch for the next in a single assignment, and the epoch
+// it replaces stays admissible until its own margin, which is exactly the point
+// at which a verifier would stop accepting it.
 type Adapter struct {
 	manager ratlsManager
 	baseTLS *tls.Config
@@ -32,7 +40,6 @@ type Adapter struct {
 	refreshGate chan struct{}
 	mu          sync.RWMutex
 	current     *epoch
-	healthy     bool
 }
 
 // NewAWS initializes and self-verifies an AWS SEV-SNP RA-TLS epoch. It refuses
@@ -97,31 +104,48 @@ func newAWS(ctx context.Context, config Config, deps dependencies) (*Adapter, er
 		return nil, fmt.Errorf("verify initial AWS SEV-SNP epoch: %w", err)
 	}
 	adapter.current = initial
-	adapter.healthy = true
 	return adapter, nil
 }
 
 // Healthy reports whether new trusted work and TLS handshakes may be admitted.
+// It is true exactly while the adapter holds an epoch whose evidence is still
+// outside its margin, so a failed rotation shows up here at the margin — when
+// the served evidence is no longer worth presenting — and not from the start of
+// the attempt.
 func (a *Adapter) Healthy() bool {
 	if a == nil {
 		return false
 	}
+	return a.admitted() != nil
+}
+
+// admitted returns the epoch the adapter is serving, or nil when it holds none
+// or the one it holds has reached its margin.
+func (a *Adapter) admitted() *epoch {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.healthy
+	return a.served()
+}
+
+// served is admitted's body, for callers already holding a.mu.
+func (a *Adapter) served() *epoch {
+	if a.current == nil || !a.current.fresh() {
+		return nil
+	}
+	return a.current
 }
 
 // ServerTLSConfig returns an RA-TLS server configuration whose certificate
-// admission fails closed while evidence refresh is unhealthy.
+// admission fails closed once the served epoch's evidence reaches the refresh
+// margin — never merely because a rotation is in progress.
 func (a *Adapter) ServerTLSConfig() *tls.Config {
 	config := a.baseTLS.Clone()
 	config.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-		a.mu.RLock()
-		defer a.mu.RUnlock()
-		if !a.healthy || a.current == nil {
+		served := a.admitted()
+		if served == nil {
 			return nil, platform.ErrNotReady
 		}
-		certificate := a.current.snapshot.Certificate()
+		certificate := served.snapshot.Certificate()
 		if certificate == nil {
 			return nil, platform.ErrNotReady
 		}
@@ -140,14 +164,24 @@ func (a *Adapter) Snapshot(ctx context.Context) (platform.Epoch, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !a.healthy || a.current == nil {
+	served := a.served()
+	if served == nil {
 		return nil, platform.ErrNotReady
 	}
-	return a.current, nil
+	return served, nil
 }
 
-// Refresh rotates the RA-TLS key and evidence. New handshakes are rejected
-// from the start of rotation until the new epoch has self-verified.
+// Refresh rotates the RA-TLS key and evidence and publishes the new epoch in
+// one step. The epoch it replaces keeps serving until then, because it is still
+// outside its margin — the rotation is scheduled with room to spare — so
+// refusing new handshakes for the duration of an attestation call would drop
+// traffic to prove nothing.
+//
+// A rotation that fails leaves the previous epoch in place and admits from it
+// until its margin; the failure reads as a rotation that did not happen. A
+// rotation that succeeds swaps the epoch, and admission follows the new one
+// automatically, with no window in between for a reader to glimpse a
+// half-rotated state.
 func (a *Adapter) Refresh(ctx context.Context) error {
 	select {
 	case a.refreshGate <- struct{}{}:
@@ -158,9 +192,6 @@ func (a *Adapter) Refresh(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	a.mu.Lock()
-	a.healthy = false
-	a.mu.Unlock()
 	if err := a.manager.Refresh(ctx); err != nil {
 		return fmt.Errorf("refresh AWS SEV-SNP RA-TLS epoch: %w", err)
 	}
@@ -170,7 +201,6 @@ func (a *Adapter) Refresh(ctx context.Context) error {
 	}
 	a.mu.Lock()
 	a.current = next
-	a.healthy = true
 	a.mu.Unlock()
 	return nil
 }
@@ -178,7 +208,18 @@ func (a *Adapter) Refresh(ctx context.Context) error {
 type epoch struct {
 	identity platform.Identity
 	snapshot ratlsSnapshot
+	// freshUntil is when this epoch's evidence enters the refresh margin:
+	// SNPRefreshMargin before the NitroTPM leaf's NotAfter, or the fixed TTL for
+	// evidence without a short-lived leaf. Reading it once here keeps admission
+	// from re-parsing the attestation on every handshake.
+	freshUntil time.Time
 }
+
+// fresh reports whether the epoch's evidence is still outside the margin a
+// verifier expects. It is the adapter's whole admission rule: an epoch is
+// served exactly while its own evidence is fresh, so no mutable flag can
+// disagree with what the listener presents.
+func (e *epoch) fresh() bool { return time.Now().Before(e.freshUntil) }
 
 func buildEpoch(snapshot ratlsSnapshot) (*epoch, error) {
 	if snapshot == nil || snapshot.Certificate() == nil {
@@ -220,7 +261,11 @@ func buildEpoch(snapshot ratlsSnapshot) (*epoch, error) {
 		PublicKeyDER:    append([]byte(nil), publicKeyDER...),
 		KeyID:           keyID,
 	}
-	return &epoch{identity: identity, snapshot: snapshot}, nil
+	return &epoch{
+		identity:   identity,
+		snapshot:   snapshot,
+		freshUntil: shared.SNPAttestationExpiry(evidence),
+	}, nil
 }
 
 func (e *epoch) Identity() platform.Identity {
