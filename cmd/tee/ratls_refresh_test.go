@@ -105,12 +105,12 @@ func TestAttestationExpiryReportsWhetherItTrackedTheLeaf(t *testing.T) {
 	}
 }
 
-// TestRunEpochRefreshAdoptsAndPublishesRotatedEpoch covers the wiring the
+// TestPublishEpochAdoptsAndPublishesRotatedEpoch covers the wiring the
 // deployment depends on: one rotation must move the receipt signer to the new
 // attested key AND leave the new evidence where a hash-only receipt can resolve
 // it. Either half alone is a broken deployment — a signer the Hub cannot match
 // to evidence it is willing to accept.
-func TestRunEpochRefreshAdoptsAndPublishesRotatedEpoch(t *testing.T) {
+func TestPublishEpochAdoptsAndPublishesRotatedEpoch(t *testing.T) {
 	simDir := t.TempDir()
 	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
 
@@ -120,7 +120,9 @@ func TestRunEpochRefreshAdoptsAndPublishesRotatedEpoch(t *testing.T) {
 
 	rotated := fakeEpoch(nitroAttestation(t, time.Now().Add(3*time.Hour)))
 	refresher := &fakeRefresher{snapshot: rotated, serverTLS: fakeServerTLS(t, "rotated-ra-tls-leaf")}
-	runRefreshOnce(t, refresher, runtime)
+	if err := publishOnce(refresher, runtime); err != nil {
+		t.Fatalf("publish rotated epoch: %v", err)
+	}
 
 	if runtime.get() == before {
 		t.Fatal("rotation did not reach the service that signs receipts")
@@ -206,12 +208,12 @@ func fakeServerTLS(t *testing.T, commonName string) *tls.Config {
 	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}}}
 }
 
-// TestRunEpochRefreshRefusesARotationItCannotPublishATleafFor is the other half
-// of the same rule: publishing precedes signing, so a rotation whose new leaf
+// TestPublishEpochRefusesARotationItCannotPublishATleafFor is the other half of
+// the same rule: publishing precedes signing, so a rotation whose new leaf
 // cannot be written must be abandoned rather than left serving a certificate the
 // published file denies. The process keeps signing under the previous epoch,
 // which is the state whose leaf the file still describes.
-func TestRunEpochRefreshRefusesARotationItCannotPublishATleafFor(t *testing.T) {
+func TestPublishEpochRefusesARotationItCannotPublishATleafFor(t *testing.T) {
 	simDir := t.TempDir()
 	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
 
@@ -219,7 +221,10 @@ func TestRunEpochRefreshRefusesARotationItCannotPublishATleafFor(t *testing.T) {
 	before := runtime.get()
 
 	rotated := fakeEpoch(nitroAttestation(t, time.Now().Add(3*time.Hour)))
-	runRefreshOnce(t, &fakeRefresher{snapshot: rotated}, runtime) // no ServerTLSConfig: nothing to publish
+	// No ServerTLSConfig: nothing to publish.
+	if err := publishOnce(&fakeRefresher{snapshot: rotated}, runtime); err == nil {
+		t.Fatal("published an epoch whose RA-TLS leaf could not be written")
+	}
 
 	if runtime.get() != before {
 		t.Fatal("runtime adopted an epoch whose RA-TLS leaf could not be published")
@@ -230,12 +235,12 @@ func TestRunEpochRefreshRefusesARotationItCannotPublishATleafFor(t *testing.T) {
 	assertIdentityNotRotated(t, simDir, rotated.Identity())
 }
 
-// TestRunEpochRefreshKeepsSigningWhenEvidenceCannotBePublished is the
-// fail-closed half. A rotated key that the deployment cannot publish evidence
-// for would sign receipts nobody can verify, so the rotation must be abandoned
-// whole: the previous service keeps signing, and it keeps signing under the
-// epoch whose evidence IS resolvable.
-func TestRunEpochRefreshKeepsSigningWhenEvidenceCannotBePublished(t *testing.T) {
+// TestPublishEpochKeepsSigningWhenEvidenceCannotBePublished is the fail-closed
+// half. A rotated key that the deployment cannot publish evidence for would
+// sign receipts nobody can verify, so the rotation must be abandoned whole: the
+// previous service keeps signing, and it keeps signing under the epoch whose
+// evidence IS resolvable.
+func TestPublishEpochKeepsSigningWhenEvidenceCannotBePublished(t *testing.T) {
 	simDir := t.TempDir()
 	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
 
@@ -248,7 +253,9 @@ func TestRunEpochRefreshKeepsSigningWhenEvidenceCannotBePublished(t *testing.T) 
 	unpublishable := fakeEpoch([]byte("startup-evidence"))
 	unpublishable.id.Evidence = []byte("rotated-evidence")
 	refresher := &fakeRefresher{snapshot: unpublishable}
-	runRefreshOnce(t, refresher, runtime)
+	if err := publishOnce(refresher, runtime); err == nil {
+		t.Fatal("published an epoch whose evidence could not be written")
+	}
 
 	if runtime.get() != before {
 		t.Fatal("runtime adopted an epoch whose evidence could not be published")
@@ -279,14 +286,14 @@ func assertIdentityNotRotated(t *testing.T, simDir string, rotated platform.Iden
 	}
 }
 
-// runRefreshOnce drives one iteration of the real refresh loop: a cancelled
-// context makes RunRATLSRefresh adopt the current snapshot and return, which is
-// exactly the "rotate, then adopt" step a scheduled tick performs.
-func runRefreshOnce(t *testing.T, refresher epochRefresher, runtime *serviceRuntime) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	runEpochRefresh(ctx, refresher, runtime, rootShared.NewNopLogger())
+// publishOnce drives the publication half of one refresh tick. A tick reaches
+// here after the adapter has already adopted the rotated epoch (Refresh
+// publishes before returning), so this is exactly the step that has to bring the
+// signer and every published file along with it. The loop around it is Go timer
+// machinery, not the logic under test; runEpochRefresh deliberately skips the
+// priming call it would otherwise get (see shared.RunRATLSRefresh).
+func publishOnce(refresher epochRefresher, runtime *serviceRuntime) error {
+	return publishEpoch(context.Background(), refresher, runtime)
 }
 
 // newTestRuntime builds the smallest real service: the runtime's own logic is

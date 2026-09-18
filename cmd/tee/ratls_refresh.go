@@ -140,7 +140,12 @@ func runEpochRefresh(ctx context.Context, refresher epochRefresher, runtime *ser
 	// self-reset a guest whose attestation device has wedged, and this process
 	// has no recovery path to drive. A refresh that keeps failing is logged by
 	// the loop and shows up as the Hub losing its TLS peer.
-	rootShared.RunRATLSRefresh(ctx, refresher, publish, next, nil, logger)
+	// skipInitial: publish is a full publish, not a cache-priming hook, and this
+	// process has already published its startup epoch — main writes the identity,
+	// the evidence and (with -mtls) the leaf, then builds the signer. Letting the
+	// loop prime it again would rewrite all of that and rebuild the signer on
+	// every boot, for a state that is already in place.
+	rootShared.RunRATLSRefresh(ctx, refresher, publish, next, nil, logger, true)
 }
 
 // publishEpoch makes one rotated epoch the epoch this process serves: the
