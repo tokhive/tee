@@ -15,6 +15,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -53,20 +54,15 @@ func bundlePolicyArgs() []string {
 }
 
 var (
-	simDir    string
-	initToken string
-	agentKey  string
+	simDir   string
+	agentKey string
 	// relayKey authenticates the tee's dial-in to the Hub's TeeRelay. The Hub
 	// now refuses to serve without one, so the loopback topology needs it just
 	// as the cross-host one does; both sides read the same value from this
 	// process, so it never leaves the instance.
-	relayKey string
-	// teeCert is the path the tee child publishes its RA-TLS leaf to
-	// (shared.MTLSServerCertPath under the same sim dir). The supervisor only
-	// watches it for readiness — the Hub trusts the attestation in the leaf, not
-	// the leaf itself.
-	teeCert   string
-	teeSvcFD3 *os.File // the app copy's attestation broker socket, re-passed to the tee server
+	relayKey    string
+	teeSvcFD3   *os.File            // the app copy's attestation broker socket, re-passed to the tee server
+	teeDialAddr = "127.0.0.1:18090" // must match teeCmd's -addr: the readiness probe dials it
 )
 
 func main() {
@@ -79,10 +75,8 @@ func main() {
 	}
 
 	simDir = rootShared.GetEnvOrDefault("TOKENHIVE_SIM_DIR", "/tmp/tee")
-	initToken = rootShared.GetEnvOrDefault("TEE_INIT_TOKEN", "")
 	agentKey = rootShared.GetEnvOrDefault("TOKENHIVE_AGENT_KEY", "xhost-single-key")
 	relayKey = rootShared.GetEnvOrDefault("TOKENHIVE_RELAY_KEY", "xhost-relay-key")
-	teeCert = filepath.Join(simDir, "tee-cert.pem")
 	if err := os.MkdirAll(simDir, 0o755); err != nil {
 		logf("mkdir simdir: %v", err)
 		os.Exit(1)
@@ -120,28 +114,16 @@ func runAndExit(bin string, args ...string) {
 
 func supervise() error {
 	start(mpCmd(18080))
-	// Clear any leaf a previous tee left at this path before spawning this
-	// run's, because waitForTEECert treats the file's presence as "the tee can
-	// serve". On a fresh boot the state directory is empty and this is a no-op;
-	// a supervisor restarted within one boot would otherwise find the old file
-	// instantly and let the Hub dial a listener that has not come up yet. The
-	// child writes this path itself, synchronously, before it starts serving.
-	if err := os.Remove(teeCert); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("clear stale %s: %w", teeCert, err)
-	}
 	start(teeCmd())
-	if initToken == "" {
-		return fmt.Errorf("TOKENHIVE_SUPERVISE requires TEE_INIT_TOKEN")
-	}
 	appHash := os.Getenv("SNP_APP_HASH")
 	if appHash == "" {
 		return fmt.Errorf("SNP_APP_HASH not set by loader; cannot pin the attested app identity")
 	}
 	// Ordering, not trust: the Hub must not dial the tee before the tee serves.
-	// The startup handshake that used to carry both is gone — the Hub no longer
-	// pins the tee's certificate, it verifies the SEV-SNP evidence inside it
-	// (see hubCmd), so there is nothing to fetch. What remains is the wait.
-	if err := waitForTEECert(); err != nil {
+	// The Hub verifies the SEV-SNP evidence inside the leaf (see hubCmd), so
+	// the probe below only establishes that the listener answers — a TCP
+	// accept on the mTLS port — not what it presents.
+	if err := waitForTEE(); err != nil {
 		return err
 	}
 	start(hubCmd(appHash))
@@ -193,14 +175,12 @@ func waitAll() {
 func teeCmd() *exec.Cmd {
 	c := cmd("svc/tee",
 		append([]string{
-			"-addr", "127.0.0.1:18090",
+			"-addr", teeDialAddr,
 			"-relay", "ws://127.0.0.1:18085/v1/relay",
 			"-relay-key", relayKey,
 			"-platform", "sevsnp",
 			"-mtls",
 			"-mtls-client-ca", filepath.Join(bundleDir, "mtls", "hub-ca.pem"),
-			"-init-addr", "127.0.0.1:18091",
-			"-init-token", initToken,
 			"-seq", filepath.Join(simDir, "seqstore.json"),
 		}, bundlePolicyArgs()...)...)
 	c.Env = withEnv("SNP_ATTEST_BROKER_FD=3", "TOKENHIVE_SIM_DIR="+simDir)
@@ -282,24 +262,19 @@ func start(c *exec.Cmd) {
 	}()
 }
 
-// waitForTEECert blocks until the tee child has published its RA-TLS leaf. The
-// tee writes that file itself (shared.WriteTEECert) immediately before it starts
-// serving, and rewrites it on every epoch rotation, so its presence is the
-// signal that the mTLS listener is about to answer.
-//
-// This replaced an HTTP fetch of the same bytes over the bootstrap listener: the
-// supervisor used to pull the leaf through /v1/init-cert so it could hand the
-// Hub a pin. Both the fetch and the pin are gone (the Hub verifies attestation),
-// and the tee had been writing this very path all along — so the handshake was
-// reading back a file it already had.
-func waitForTEECert() error {
+// waitForTEE blocks until the tee child's mTLS listener accepts connections.
+// A TCP accept proves the listener is up; what it presents is the Hub's job
+// (attestation verification, see hubCmd), not this probe's. The deadline stays
+// generous because attestation (broker handshake, policy load) is slow.
+func waitForTEE() error {
 	deadline := time.Now().Add(4 * time.Minute)
 	for {
-		if fi, err := os.Stat(teeCert); err == nil && fi.Size() > 0 {
+		if c, err := net.DialTimeout("tcp", teeDialAddr, 2*time.Second); err == nil {
+			_ = c.Close()
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("tee RA-TLS cert never appeared at %s", teeCert)
+			return fmt.Errorf("tee listener never accepted at %s", teeDialAddr)
 		}
 		time.Sleep(2 * time.Second)
 	}

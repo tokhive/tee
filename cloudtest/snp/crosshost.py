@@ -13,14 +13,12 @@ loader from EC2 user-data, so this script encodes it as KEY=VAL lines:
     TEE_PLATFORM=sevsnp               real attestation (fail-fast off SNP)
     TEE_MTLS=1                         RA-TLS + demand a Hub client cert
     TEE_MTLS_CLIENT_CA=/run/bundle/mtls/hub-ca.pem
-    TEE_INIT_ADDR=0.0.0.0:18091        one-shot TOFU bootstrap listener
-    TEE_INIT_TOKEN=<random>            gates GET /v1/init-cert
 
 Both instances share one VPC/subnet/SG. The SG additionally permits the
-cross-host ports (18085 hub relay, 18090/18091 tee) between its own members
+cross-host ports (18085 hub relay, 18090 tee) between its own members
 (source = the SG itself), so they reach each other regardless of public IP.
 
-    python3 crosshost.py <snp-ami-id> --token <init-token> [--host-ip <hub-public-ip>]
+    python3 crosshost.py <snp-ami-id> [--host-ip <hub-public-ip>]
                           [--single] [--tee-only] [--dry-run]
 Writes crosshost.json {host:{...}, tee:{...}} and never deletes anything.
 Refuses to run without TOKENHIVE_USER.
@@ -63,7 +61,7 @@ HERE = Path(__file__).resolve().parent
 HOSTS_FILE = CLOUDTEST / "crosshost.json"
 KEY_FILE = CLOUDTEST / "ssh-key.pem"
 
-CROSS_PORTS = [18085, 18090, 18091]
+CROSS_PORTS = [18085, 18090]
 
 # The Hub's TeeRelay now requires the TEE to present a key, and the Hub refuses
 # to serve without it. crosshost.sh starts the Hub with this same default, so a
@@ -171,20 +169,22 @@ def main() -> None:
     # --tee-only (a bare cross-host tee, no Hub anywhere).
     no_host = single or tee_only
     args = [a for a in sys.argv[1:] if a not in ("--dry-run", "--single", "--tee-only")]
-    token = host_ip = None
+    host_ip = None
     ami_id = None
     i = 0
     while i < len(args):
         if args[i] == "--token":
-            token = args[i + 1]; i += 2
+            # Removed with the /v1/init-cert bootstrap listener: accepted and
+            # ignored so old crosshost.sh callers keep working.
+            i += 2
         elif args[i] == "--host-ip":
             host_ip = args[i + 1]; i += 2
         else:
             ami_id = args[i]; i += 1
     # --host-ip is optional: the ordinary host is launched first and its public
     # ip feeds the tee's relay URL automatically when not supplied.
-    if not (ami_id and token):
-        sys.exit("usage: python3 crosshost.py <snp-ami-id> --token <init-token> [--host-ip <hub-public-ip>] [--single] [--dry-run]")
+    if not ami_id:
+        sys.exit("usage: python3 crosshost.py <snp-ami-id> [--host-ip <hub-public-ip>] [--single] [--dry-run]")
     cfg = load()
     if not cfg.user:
         sys.exit("TOKENHIVE_USER is empty; refusing to launch untagged instances")
@@ -290,8 +290,6 @@ def main() -> None:
         # The mock provider's CA rides in the measured bundle: the TEE trusts it
         # for the upstream TLS leg, which is otherwise system roots on sevsnp.
         "TEE_CA=/run/bundle/mtls/mp-ca.pem\n"
-        "TEE_INIT_ADDR=0.0.0.0:18091\n"
-        f"TEE_INIT_TOKEN={token}\n"
     )
     if single:
         userdata += f"TOKENHIVE_RELAY_KEY={relay_key}\n"
@@ -310,7 +308,6 @@ def main() -> None:
             "private_ip": inst.get("PrivateIpAddress", ""),
             "role": "tee",
             "ami_id": ami_id,
-            "user_data_token": token,
             "mode": "single" if single else ("tee-only" if tee_only else "cross-host"),
             # Where this tee will dial for a provider connection. Recorded so a
             # decoupled deploy is self-describing: with no ordinary host in this
@@ -328,11 +325,10 @@ def main() -> None:
     elif tee_only:
         print(f"==> tee-only {tee['instance_id']} @ {tee.get('public_ip')} (no ordinary host)")
         print(f"==>    TEE_RELAY={relay_url}")
-        print(f"==>    bootstrap http://{tee.get('private_ip')}:18091/v1/init-cert?token={token}")
     else:
         print(f"==> host {host['instance_id']} @ {host['public_ip']}")
         print(f"==> tee  {tee['instance_id']} @ {tee.get('public_ip')}")
-        print(f"==> tee relay {relay_url}; bootstrap http://<tee-priv>:18091/v1/init-cert?token={token}")
+        print(f"==> tee relay {relay_url}; inspect the leaf over mTLS with ./crosshost.sh fetch")
 
 
 def describe(ec2, iid: str) -> dict:

@@ -144,9 +144,7 @@ func ClientMTLSConfig(caPEMPath, certPath, keyPath string) (*tls.Config, error) 
 
 // LeafCertificate returns the leaf certificate a server TLS config presents:
 // the live one from GetCertificate (RA-TLS rotates it per handshake), or the
-// first static entry when no callback is set. Publishing that leaf to disk and
-// handing it to a bootstrap caller make exactly this choice, so it lives here
-// rather than being spelled out at each of them.
+// first static entry when no callback is set.
 func LeafCertificate(cfg *tls.Config) (*x509.Certificate, error) {
 	var cert *tls.Certificate
 	if cfg.GetCertificate != nil {
@@ -173,26 +171,19 @@ func LeafCertificate(cfg *tls.Config) (*x509.Certificate, error) {
 // certificate is extracted from the server TLS config the platform adapter
 // produced: on sevsnp this is the attested RA-TLS leaf (its SPKI is the receipt
 // KeyID), on simulated it is the sim test certificate minted from the epoch key.
+//
+// Only a fixed epoch (the simulation) is ever published: its leaf is stable
+// for the process lifetime, so the Hub's -tee-verify=pin mode can name it. A
+// rotating epoch presents a new leaf every rotation, which no pin can name.
 func WriteTEECert(cfg *tls.Config, outPath string) error {
-	leafPEM, err := LeafCertificatePEM(cfg)
+	leaf, err := LeafCertificate(cfg)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(outPath, leafPEM, 0o644); err != nil {
+	if err := os.WriteFile(outPath, pemEncode("CERTIFICATE", leaf.Raw), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", outPath, err)
 	}
 	return nil
-}
-
-// LeafCertificatePEM renders the leaf certificate a server TLS config presents
-// as PEM: the same bytes WriteTEECert writes to disk, for callers that hand
-// the leaf out directly (the diagnostic bootstrap endpoint).
-func LeafCertificatePEM(cfg *tls.Config) ([]byte, error) {
-	leaf, err := LeafCertificate(cfg)
-	if err != nil {
-		return nil, err
-	}
-	return pemEncode("CERTIFICATE", leaf.Raw), nil
 }
 
 // GenHubClientCerts generates a throwaway CA and a Hub client certificate

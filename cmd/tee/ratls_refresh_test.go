@@ -6,11 +6,9 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"math/big"
 	"os"
@@ -120,7 +118,7 @@ func TestPublishEpochAdoptsAndPublishesRotatedEpoch(t *testing.T) {
 	before := runtime.get()
 
 	rotated := fakeEpoch(nitroAttestation(t, time.Now().Add(3*time.Hour)))
-	refresher := &fakeRefresher{snapshot: rotated, serverTLS: fakeServerTLS(t, "rotated-ra-tls-leaf")}
+	refresher := &fakeRefresher{snapshot: rotated}
 	if err := publishOnce(refresher, runtime); err != nil {
 		t.Fatalf("publish rotated epoch: %v", err)
 	}
@@ -149,84 +147,9 @@ func TestPublishEpochAdoptsAndPublishesRotatedEpoch(t *testing.T) {
 		t.Fatal("rotated epoch evidence was not published to the evidence store")
 	}
 
-	// And the published leaf follows the rotation. It is the file an operator (or
-	// tooling) reads to learn which certificate the listener presents, so a
-	// startup-only copy would keep answering with a key this process no longer
-	// holds — for the whole life of a process whose listener rotates.
-	leaf, err := os.ReadFile(filepath.Join(simDir, shared.MTLSServerCertPath))
-	if err != nil {
-		t.Fatalf("read published RA-TLS leaf: %v", err)
-	}
-	parsed, err := x509.ParseCertificate(pemBlock(t, leaf))
-	if err != nil {
-		t.Fatalf("parse published RA-TLS leaf: %v", err)
-	}
-	if parsed.Subject.CommonName != "rotated-ra-tls-leaf" {
-		t.Fatalf("published leaf is %q, want the rotated epoch's certificate", parsed.Subject.CommonName)
-	}
-}
-
-// pemBlock decodes the single PEM block a published certificate file holds.
-func pemBlock(t *testing.T, data []byte) []byte {
-	t.Helper()
-	block, _ := pem.Decode(data)
-	if block == nil {
-		t.Fatal("published RA-TLS leaf is not PEM")
-	}
-	return block.Bytes
-}
-
-// fakeServerTLS mints the self-signed RA-TLS leaf a rotated epoch would publish,
-// so the write that follows a rotation can be observed on disk.
-func fakeServerTLS(t *testing.T, commonName string) *tls.Config {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: commonName},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(time.Hour),
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	leaf, err := x509.ParseCertificate(der)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}}}
-}
-
-// TestPublishEpochAdoptsWhenTheLeafCannotBePublished: the published leaf and
-// identity are diagnostics — files an operator, or the simulation's pin mode,
-// reads — so a rotation that cannot rewrite them still adopts. Refusing would
-// wedge the signer: the listener has already rotated by the time a refresh
-// returns, and the process would go on signing under the key the Hub no longer
-// sees on the wire.
-func TestPublishEpochAdoptsWhenTheLeafCannotBePublished(t *testing.T) {
-	simDir := t.TempDir()
-	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
-
-	runtime := newTestRuntime(t, fakeEpoch([]byte("startup-evidence")), false)
-	before := runtime.get()
-
-	rotated := fakeEpoch([]byte("rotated-evidence"))
-	// A TLS config with no certificate: there are no leaf bytes to write, which
-	// is how a publication failure reaches the log.
-	refresher := &fakeRefresher{snapshot: rotated, serverTLS: &tls.Config{}}
-	if err := publishOnce(refresher, runtime); err != nil {
-		t.Fatalf("publish rotated epoch: %v", err)
-	}
-	if runtime.get() == before {
-		t.Fatal("a leaf that could not be published stopped the rotation from signing")
-	}
-	if got := readPersistedIdentity(t, simDir); got.KeyID != rotated.Identity().KeyID {
-		t.Fatal("persisted identity does not name the epoch that is signing")
-	}
+	// The RA-TLS leaf is deliberately not published: a rotating epoch
+	// presents a new leaf every rotation, which no pin can name. The Hub
+	// verifies the evidence inside the leaf instead (see publish).
 }
 
 // TestPublishEpochSkipsTheStoreForInlineReceipts: an inline receipt carries its
@@ -237,7 +160,7 @@ func TestPublishEpochSkipsTheStoreForInlineReceipts(t *testing.T) {
 
 	runtime := newTestRuntime(t, fakeEpoch([]byte("startup-evidence")), true)
 	rotated := fakeEpoch([]byte("rotated-evidence"))
-	refresher := &fakeRefresher{snapshot: rotated, serverTLS: fakeServerTLS(t, "rotated-ra-tls-leaf")}
+	refresher := &fakeRefresher{snapshot: rotated}
 	if err := publishOnce(refresher, runtime); err != nil {
 		t.Fatalf("publish rotated epoch: %v", err)
 	}
@@ -331,7 +254,7 @@ func TestAdoptPublishesTheSignerToTheLiveCell(t *testing.T) {
 	runtime.template.SignerCell = cell
 
 	rotated := fakeEpoch(nitroAttestation(t, time.Now().Add(3*time.Hour)))
-	refresher := &fakeRefresher{snapshot: rotated, serverTLS: fakeServerTLS(t, "rotated-ra-tls-leaf")}
+	refresher := &fakeRefresher{snapshot: rotated}
 	if err := publishOnce(refresher, runtime); err != nil {
 		t.Fatalf("publish rotated epoch: %v", err)
 	}
@@ -366,7 +289,7 @@ func newTestRuntime(t *testing.T, epoch platform.Epoch, includeEvidence bool) *s
 		InboxKey:  inbox,
 	}
 	template.Signer.IncludeEvidence = includeEvidence
-	runtime, err := newServiceRuntime(template, epoch, nil, rootShared.NewNopLogger())
+	runtime, err := newServiceRuntime(template, epoch, rootShared.NewNopLogger())
 	if err != nil {
 		t.Fatalf("build service runtime: %v", err)
 	}
@@ -374,9 +297,8 @@ func newTestRuntime(t *testing.T, epoch platform.Epoch, includeEvidence bool) *s
 }
 
 type fakeRefresher struct {
-	snapshot  platform.Epoch
-	err       error
-	serverTLS *tls.Config
+	snapshot platform.Epoch
+	err      error
 }
 
 func (f *fakeRefresher) Refresh(context.Context) error { return nil }
@@ -386,10 +308,6 @@ func (f *fakeRefresher) Snapshot(context.Context) (platform.Epoch, error) {
 	}
 	return f.snapshot, nil
 }
-
-// ServerTLSConfig is nil unless a test hands over a leaf, which is the "nothing
-// to publish" case the rotation logs about and signs through.
-func (f *fakeRefresher) ServerTLSConfig() *tls.Config { return f.serverTLS }
 
 type fakeEpochImpl struct {
 	id platform.Identity

@@ -22,9 +22,10 @@
 #               Add --host-ip <hub-ip> when the Hub lives on a separate machine:
 #               it becomes the tee's TEE_RELAY target (the address as the tee
 #               sees the Hub, i.e. the private IP when both share this VPC/SG).
-#   ./crosshost.sh fetch     ssh to host: pull the tee's current RA-TLS leaf via
-#                            /v1/init-cert, for inspection only — the Hub
-#                            verifies the evidence in it, it is not pinned
+#   ./crosshost.sh fetch     ssh to host: pull the tee's current RA-TLS leaf over
+#                            the mTLS port (with the Hub client identity), for
+#                            inspection only — the Hub verifies the evidence in
+#                            it, it is not pinned
 #   ./crosshost.sh deploy    scp binaries+certs, start mockprovider/hub/agent on host
 #   ./crosshost.sh drive     curl a chat request via the host's Hub
 #   ./crosshost.sh verify    hub/tee/agent logs + tee console attestation
@@ -242,7 +243,7 @@ cmd_build_single() {
 
 cmd_up() {
   [ -f "${CERTS_DIR}/hub-ca.pem" ] || { echo "run ./crosshost.sh build first (certs)"; exit 1; }
-  local a token mode="" name="snp-tokenhive" digest host_ip="" host_arg=""
+  local a mode="" name="snp-tokenhive" digest host_ip="" host_arg=""
   shift || true                       # drop the "up" verb
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -283,14 +284,7 @@ cmd_up() {
   # an unlabelled image can never be pinned, and discovering that afterwards
   # would have bought a confidential instance for a run that cannot finish.
   digest="snp-app:$(ami_app_digest "${a}")"
-  # Read or mint the one-shot bootstrap token (stick to one so a re-up reuses).
-  if [ -f "${CERTS_DIR}/init-token" ]; then
-    token="$(cat "${CERTS_DIR}/init-token")"
-  else
-    token="$(openssl rand -hex 16)"
-    printf '%s\n' "${token}" > "${CERTS_DIR}/init-token"
-  fi
-  ( cd "${HERE}" && "${PY}" crosshost.py "${a}" --token "${token}" ${mode} ${host_arg} ) | tee -a "${LOG_DIR}/run.log"
+  ( cd "${HERE}" && "${PY}" crosshost.py "${a}" ${mode} ${host_arg} ) | tee -a "${LOG_DIR}/run.log"
   # Record it only now that the instance exists: crosshost.py owns the state
   # file (it creates the tee record merged into below), and an identity recorded
   # for an instance that never came up would pin the next deploy to an app that
@@ -304,31 +298,33 @@ json.dump(p, open('${HOSTS}', 'w'), indent=2)
 }
 
 cmd_fetch() {
-  local tip tok out
+  local tip out
   # Cross-host traffic goes over the PRIVATE ips: both instances share the VPC
   # subnet and the SG's group-pair rule only matches in-VPC traffic (a public-ip
   # dial from a group member is dropped by AWS). ssh to the host still uses its
   # public ip.
   #
-  # The leaf pulled here is NOT what the Hub trusts any more: `deploy` runs the
-  # Hub with -tee-verify=attestation, so trust comes from the SEV-SNP evidence
-  # inside whatever certificate the TEE presents. This stays as an operator's
-  # way to read the current leaf (and its evidence) off the instance without
-  # sshd, which is worth keeping for diagnosis — and the TEE answers with the
-  # leaf its listener holds right now, not the one it booted with.
-  tip="$(tee_field private_ip)"; tok="$(cat "${CERTS_DIR}/init-token")"
-  log "step: fetch tee RA-TLS cert from bootstrap ${tip}:18091 (inspection only)"
+  # The leaf pulled here is NOT what the Hub trusts: `deploy` runs the Hub with
+  # -tee-verify=attestation, so trust comes from the SEV-SNP evidence inside
+  # whatever certificate the TEE presents. This stays as an operator's way to
+  # read the current leaf (and its evidence) off the instance without sshd —
+  # over the mTLS port itself, presenting the Hub client identity, so no
+  # plaintext listener is needed for diagnosis.
+  tip="$(tee_field private_ip)"
+  log "step: fetch tee RA-TLS cert from mTLS ${tip}:18090 (inspection only)"
   out="$(remote_exec "$(host_field public_ip)" bash <<EOF
+set -e
 for _ in \$(seq 1 60); do
-  code="\$(curl -s -o tee-cert.pem -w '%{http_code}' 'http://${tip}:18091/v1/init-cert?token=${tok}')"
-  [ "\$code" = "200" ] && [ -s tee-cert.pem ] && break
+  if echo | openssl s_client -connect ${tip}:18090 -cert mtls/hub-cert.pem -key mtls/hub-key.pem -showcerts 2>/dev/null | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' >tee-cert.pem; then
+    [ -s tee-cert.pem ] && break
+  fi
   sleep 5
 done
-[ -s tee-cert.pem ] || { echo 'bootstrap never succeeded'; exit 1; }
+[ -s tee-cert.pem ] || { echo 'mTLS fetch never succeeded'; exit 1; }
 wc -c tee-cert.pem
 EOF
 )"
-  log "bootstrap -> ${out}"
+  log "mTLS fetch -> ${out}"
   remote_pull "$(host_field public_ip)" "tee-cert.pem" "${CLOUDTEST}/snp/.certs/tee-cert.pem" >/dev/null
   log "current tee RA-TLS leaf saved to ${CERTS_DIR} (for inspection)"
 }

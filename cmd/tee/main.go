@@ -96,16 +96,6 @@ func main() {
 	caFile := flag.String("ca", os.Getenv("TEE_CA"), "root CA PEM for provider TLS; empty = sim test CA on simulated, system roots on sevsnp")
 	serveMTLS := flag.Bool("mtls", rootShared.GetEnvBoolOrDefault("TEE_MTLS", false), "serve the Hub-facing API over mutual TLS: the platform's RA-TLS server certificate (sevsnp) or the sim test certificate (simulated), demanding a Hub client certificate")
 	mtlsClientCA := flag.String("mtls-client-ca", rootShared.GetEnvOrDefault("TEE_MTLS_CLIENT_CA", ""), "PEM CA(s) that sign Hub client certificates; empty defaults to <simdir>/hub-ca.pem (required with -mtls)")
-	// Diagnostic bootstrap listener: a plain-HTTP one-shot that serves the
-	// current RA-TLS leaf over GET /v1/init-cert (gated by -init-token) so an
-	// operator with no shell on the instance can read which certificate the mTLS
-	// plane presents. It is NOT part of the trust chain: the Hub authenticates
-	// the TEE by verifying the evidence inside the leaf (-tee-verify attestation)
-	// and never fetches or pins this endpoint, so nothing it returns establishes
-	// trust. Trust-on-first-use via this leaf is exactly the design the Hub no
-	// longer uses — do not restore it by pointing a pin at this output.
-	initAddr := flag.String("init-addr", rootShared.GetEnvOrDefault("TEE_INIT_ADDR", ""), "diagnostic plain-HTTP listener (e.g. 0.0.0.0:18091) serving /v1/init-cert gated by -init-token; not a trust path")
-	initToken := flag.String("init-token", rootShared.GetEnvOrDefault("TEE_INIT_TOKEN", ""), "bearer token guarding the diagnostic /v1/init-cert endpoint (required with -init-addr)")
 	// On an SNP instance the deployment whitelist is baked inside the measured
 	// bundle at a fixed path. Pointing this flag there means the policy the
 	// enclave enforces IS the measured copy in the bundle tar, whose digest the
@@ -257,11 +247,22 @@ func main() {
 	// and never persisted, so a restart — not a rotation — is what makes agents
 	// re-register. Handlers reach the current service through it, so a rotation
 	// takes effect on the next request without dropping the listener. Building
-	// the runtime publishes the startup epoch — identity, evidence, leaf — the
+	// the runtime publishes the startup epoch — identity and evidence — the
 	// same way a rotation publishes the ones after it (see publish).
-	svcRuntime, err := newServiceRuntime(svcConfig, epoch, leafTLS, logger)
+	svcRuntime, err := newServiceRuntime(svcConfig, epoch, logger)
 	if err != nil {
 		log.Fatalf("publish startup epoch: %v", err)
+	}
+	// A fixed epoch (the simulation) never rotates, so the leaf the mTLS
+	// listener presents is stable for the process lifetime and pinning it is
+	// sound. Publish it once for the Hub's -tee-verify=pin mode (see harness
+	// scenario 18). A rotating epoch (sevsnp) presents a new leaf every
+	// rotation, which no pin can name — the Hub verifies the evidence inside
+	// the leaf instead, so there is nothing to publish.
+	if assembly.Refresher == nil && leafTLS != nil {
+		if err := shared.WriteTEECert(leafTLS); err != nil {
+			log.Fatalf("publish tee certificate: %v", err)
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -307,9 +308,6 @@ func main() {
 	}
 
 	if *serveMTLS {
-		if *initAddr != "" {
-			go serveInitCert(*initAddr, *initToken, leafTLS)
-		}
 		log.Printf("tee (platform=%s, includeEvidence=%t, mtls) listening on https://%s",
 			*platformName, *includeEvidence, *addr)
 		server := &http.Server{Addr: *addr, Handler: mux, TLSConfig: leafTLS}
@@ -368,36 +366,5 @@ func upstreamTLSConfig(platformName, caFile string) (*tls.Config, error) {
 			return nil, err
 		}
 		return &tls.Config{RootCAs: pool}, nil
-	}
-}
-
-// serveInitCert runs the diagnostic bootstrap listener: a plain-HTTP server
-// whose only handler is GET /v1/init-cert, protected by initToken. It returns
-// exactly the RA-TLS leaf the mTLS plane presents, so an operator with no shell
-// on the instance can read which certificate the listener holds. It is not a
-// trust path — the Hub authenticates the TEE by the evidence inside the leaf
-// and never pins this output — so nothing it returns establishes trust.
-func serveInitCert(addr, initToken string, mTLSConfig *tls.Config) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/init-cert", func(w http.ResponseWriter, r *http.Request) {
-		if initToken != "" && r.FormValue("token") != initToken {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		// Read the leaf per request rather than caching the startup one: this
-		// endpoint's contract is "the certificate the mTLS plane presents", and
-		// that certificate rotates. A cached copy would answer with the
-		// certificate of a key the listener no longer holds — for the one caller
-		// whose whole purpose is to learn the current one.
-		leaf, err := mtls.LeafCertificatePEM(mTLSConfig)
-		if err != nil {
-			http.Error(w, "no certificate", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/x-pem-file")
-		_, _ = w.Write(leaf)
-	})
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatalf("bootstrap listener: %v", err)
 	}
 }

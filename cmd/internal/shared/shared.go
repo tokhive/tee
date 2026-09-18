@@ -338,15 +338,6 @@ func WriteTEEIdentity(id platform.Identity) error {
 	return writeJSON(filepath.Join(ConfigDir(), "tee_identity.json"), id)
 }
 
-// LoadTEEIdentity reads the persisted public identity.
-func LoadTEEIdentity() (platform.Identity, error) {
-	var id platform.Identity
-	if err := readJSON(filepath.Join(ConfigDir(), "tee_identity.json"), &id); err != nil {
-		return platform.Identity{}, err
-	}
-	return id, nil
-}
-
 // EvidenceDir is where the TEE keeps the restart-surviving evidence store that
 // lets a hash-only receipt (no inline evidence) verify online or offline.
 func EvidenceDir() string { return filepath.Join(ConfigDir(), "evidence") }
@@ -381,14 +372,14 @@ const (
 	// presented with -mtls-cert/-mtls-key.
 	MTLSClientCertPath = "hub-client.pem"
 	MTLSClientKeyPath  = "hub-client-key.pem"
-	// MTLSServerCertPath is the TEE's RA-TLS leaf cert, published (and
-	// re-published on every epoch rotation) so the listener's current identity
-	// can be read from outside. On sevsnp this cert is attested — its SPKI is
-	// the receipt's KeyID — and the Hub that verifies it should take the
-	// attestation, not this file: a Hub that pins the file instead has to be
-	// told about every rotation, which is exactly what -tee-verify=attestation
-	// removes. Pin mode is sound only where the epoch is fixed (the simulation
-	// and the harness), which is where this file is the whole trust statement.
+	// MTLSServerCertPath is the TEE's RA-TLS leaf cert, published once at startup
+	// when the epoch is fixed (the simulation) so the listener's identity can
+	// be read from outside. The Hub that verifies attestation takes the
+	// evidence inside the leaf, not this file: a Hub that pins the file instead
+	// has to be told about every rotation, which is exactly what
+	// -tee-verify=attestation removes. Pin mode is sound only where the epoch
+	// is fixed (the simulation and the harness), which is where this file is
+	// the whole trust statement.
 	MTLSServerCertPath = "tee-cert.pem"
 )
 
