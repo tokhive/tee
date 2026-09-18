@@ -457,6 +457,17 @@ func (s *Service) perform(
 	hasher := proof.NewStreamingHasher(spec.JobID)
 	truncated := false
 
+	// The signer is pinned for this exchange rather than read again at the end.
+	// A receipt is held to the attested key of the connection that carried it,
+	// and that connection presented the epoch current when the request arrived;
+	// signing with whatever the process has rotated to since would hand the Hub
+	// a receipt and a certificate from two different epochs and nothing to tell
+	// them apart from a forgery. An execution is bounded by RequestTimeout,
+	// which is minutes against a rotation margin of half an hour, so the epoch
+	// it started under cannot go stale before it finishes. A session is not
+	// bounded, which is why Session.Receipt deliberately does the opposite.
+	signer := s.activeSigner()
+
 	// The response start: filter the upstream headers to the relay allowlist,
 	// hash them for the receipt, and (when the caller wants it) report them
 	// before the first chunk moves. The hash is computed before the callback
@@ -579,7 +590,7 @@ func (s *Service) perform(
 		ResponseHeadersHash: headerHash,
 	}
 
-	signed, err := s.activeSigner().Sign(receipt)
+	signed, err := signer.Sign(receipt)
 	if err != nil {
 		return nil, fmt.Errorf("sign receipt: %w", err)
 	}

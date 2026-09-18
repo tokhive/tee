@@ -307,7 +307,19 @@ func main() {
 	if *serveMTLS {
 		log.Printf("tee (platform=%s, includeEvidence=%t, mtls) listening on https://%s",
 			*platformName, *includeEvidence, *addr)
-		server := &http.Server{Addr: *addr, Handler: mux, TLSConfig: leafTLS}
+		// The three hooks below are what lets a rotation reach connections that
+		// are already up: the certificate they presented belongs to the epoch
+		// that accepted them, so they are stamped on arrival, refused if a
+		// request reaches them from a later epoch, and closed once they fall
+		// idle rather than kept alive into an epoch whose receipts they can no
+		// longer be paired with.
+		server := &http.Server{
+			Addr:        *addr,
+			Handler:     svcRuntime.conns.guard(mux),
+			TLSConfig:   leafTLS,
+			ConnContext: svcRuntime.conns.accept,
+			ConnState:   svcRuntime.conns.track,
+		}
 		log.Fatal(server.ListenAndServeTLS("", ""))
 	}
 
