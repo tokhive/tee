@@ -56,13 +56,6 @@ import (
 // integers.
 const microsPerUnit = 1_000_000
 
-// evidenceCache resolves full attestation evidence for hash-only receipts this
-// process has seen, layered on top of the restart-surviving evidence store the
-// TEE publishes. A receipt carrying only an evidence hash resolves against what
-// the Hub actually observed or the TEE recorded; the Hub never trusts an epoch
-// it has not seen evidence for.
-var evidenceCache attest.Cache
-
 // defaultTenantInflight is how many jobs one tenant may run at once unless the
 // operator says otherwise. Unlike the other tenant controls this one ships on:
 // it is the fairness control for a shared provider, and a Hub that leaves it
@@ -660,14 +653,20 @@ func splitCSV(s string) ([]string, error) {
 }
 
 // buildFetcher assembles the evidence retrieval path in resolution order: the
-// in-memory cache of epochs this process has verified, then the restart-surviving
-// local store, then an optional remote /v1/evidence endpoint. Each layer is
-// tried in turn until one holds the bytes. The remote layer reuses the Hub's
-// mTLS client so it trusts the same pinned RA-TLS certificate and presents the
-// same client certificate as the Hub↔TEE channel.
+// restart-surviving local store the TEE publishes, then an optional remote
+// /v1/evidence endpoint. Each layer is tried in turn until one holds the bytes.
+// The remote layer reuses the Hub's mTLS client so it trusts the same pinned
+// RA-TLS certificate and presents the same client certificate as the Hub↔TEE
+// channel.
+//
+// There is deliberately no in-memory layer here. attest.Cache exists for an
+// embedder that feeds it, and nothing in this process ever has: the Hub sees an
+// epoch's evidence only inside the receipts it verifies, and the two layers
+// below are the ones that actually resolve. Keeping an inert layer in front of
+// them only cost a lookup that could not hit and replaced the real "no evidence
+// stored" error with the cache's miss.
 func buildFetcher(evFetchURL string, evClient *http.Client) (attest.Fetcher, error) {
 	backend := &evidence.Chain{}
-	backend.Add(&evidenceCache)
 	if store, err := shared.LoadEvidenceStore(); err == nil {
 		backend.Add(store)
 	}
