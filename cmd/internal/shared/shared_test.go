@@ -459,3 +459,52 @@ func TestEnsureMTLSCertsWritesTheIdentityAsASet(t *testing.T) {
 		}
 	}
 }
+
+// TestEnsureMTLSCertsRebuildsAMismatchedSet is the case a presence check cannot
+// see: every file is there, and together they are not one identity. Two minting
+// calls give a CA from one generation and a certificate/key from another — the
+// subjects and serials are fixed, the keys are not — which is what a
+// hand-cleaned directory or two processes starting at once leaves behind. It has
+// to be rebuilt rather than trusted.
+func TestEnsureMTLSCertsRebuildsAMismatchedSet(t *testing.T) {
+	simDir := t.TempDir()
+	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
+
+	staleCA, _, _, err := mtls.GenHubClientCerts()
+	if err != nil {
+		t.Fatalf("GenHubClientCerts: %v", err)
+	}
+	_, freshCert, freshKey, err := mtls.GenHubClientCerts()
+	if err != nil {
+		t.Fatalf("GenHubClientCerts: %v", err)
+	}
+	for name, b := range map[string][]byte{
+		MTLSClientCAPath:   staleCA,
+		MTLSClientCertPath: freshCert,
+		MTLSClientKeyPath:  freshKey,
+	} {
+		if err := os.WriteFile(filepath.Join(simDir, name), b, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	if err := EnsureMTLSCerts(); err != nil {
+		t.Fatalf("EnsureMTLSCerts: %v", err)
+	}
+
+	// The CA that never signed the certificate on disk cannot still be there.
+	got, err := os.ReadFile(filepath.Join(simDir, MTLSClientCAPath))
+	if err != nil {
+		t.Fatalf("read hub CA: %v", err)
+	}
+	if string(got) == string(staleCA) {
+		t.Fatal("a complete-but-mismatched set was reused instead of rebuilt")
+	}
+	if err := loadHubMTLSIdentity(
+		filepath.Join(simDir, MTLSClientCAPath),
+		filepath.Join(simDir, MTLSClientCertPath),
+		filepath.Join(simDir, MTLSClientKeyPath),
+	); err != nil {
+		t.Fatalf("rebuilt set is still not one identity: %v", err)
+	}
+}

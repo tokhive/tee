@@ -498,17 +498,24 @@ func buildTEEClientTLS(opts teeChannelConfig) (*tls.Config, error) {
 }
 
 // hubClientIdentity resolves the Hub's own mTLS identity, materializing the
-// simulation fixtures when the operator named no files. Both verification modes
-// need it: the TEE demands a client certificate either way.
+// simulation fixtures when the operator named no files. The defaults come from
+// the same place EnsureMTLSCerts writes to (shared.HubIdentityPaths), so a
+// deployment cannot present a certificate from one location while the fixtures
+// were maintained at another. Both verification modes need this: the TEE demands
+// a client certificate either way.
 func hubClientIdentity(certFile, keyFile string) (string, string, error) {
-	if certFile == "" {
-		certFile = filepath.Join(shared.ConfigDir(), shared.MTLSClientCertPath)
-	}
-	if keyFile == "" {
-		keyFile = filepath.Join(shared.ConfigDir(), shared.MTLSClientKeyPath)
+	if certFile != "" && keyFile != "" {
+		return certFile, keyFile, nil
 	}
 	if err := shared.EnsureMTLSCerts(); err != nil {
 		return "", "", err
+	}
+	defaultCert, defaultKey := shared.HubIdentityPaths()
+	if certFile == "" {
+		certFile = defaultCert
+	}
+	if keyFile == "" {
+		keyFile = defaultKey
 	}
 	return certFile, keyFile, nil
 }

@@ -345,56 +345,99 @@ const (
 	// presented with -mtls-cert/-mtls-key.
 	MTLSClientCertPath = "hub-client.pem"
 	MTLSClientKeyPath  = "hub-client-key.pem"
-	// MTLSServerCertPath is the TEE's RA-TLS leaf cert, published so the Hub
-	// can pin it with -mtls-ca. In production this cert is attested (its SPKI
-	// is the receipt's KeyID) and is distributed out of band by the deployment.
+	// MTLSServerCertPath is the TEE's RA-TLS leaf cert, published (and
+	// re-published on every epoch rotation) so the listener's current identity
+	// can be read from outside. On sevsnp this cert is attested — its SPKI is
+	// the receipt's KeyID — and the Hub that verifies it should take the
+	// attestation, not this file: a Hub that pins the file instead has to be
+	// told about every rotation, which is exactly what -tee-verify=attestation
+	// removes. Pin mode is sound only where the epoch is fixed (the simulation
+	// and the harness), which is where this file is the whole trust statement.
 	MTLSServerCertPath = "tee-cert.pem"
 )
 
-// EnsureMTLSCerts writes the simulation's Hub mTLS identity if it is missing:
-// a throwaway CA (hub-ca.pem) and a client certificate it signs
-// (hub-client.pem/key). The TEE's -mtls-client-ca trusts the former, and the
-// Hub presents the latter with -mtls-cert/-mtls-key. Nothing here is
-// production material — it exists so the mTLS wiring can be exercised
-// end-to-end on a laptop.
+// HubIdentityPaths is where the simulation's Hub mTLS identity lives: the client
+// certificate the Hub presents on the Hub↔TEE channel and the key that goes with
+// it. EnsureMTLSCerts maintains exactly these two files under ConfigDir, so a
+// caller that has to resolve the same defaults must ask here rather than spell
+// the location out a second time — two spellings of one location is how a set
+// gets written in one place and read from another.
+func HubIdentityPaths() (certPath, keyPath string) {
+	dir := ConfigDir()
+	return filepath.Join(dir, MTLSClientCertPath), filepath.Join(dir, MTLSClientKeyPath)
+}
+
+// EnsureMTLSCerts writes the simulation's Hub mTLS identity when the working
+// directory does not already hold a usable one: a throwaway CA (hub-ca.pem) and
+// a client certificate it signs (hub-client.pem/key). The TEE's -mtls-client-ca
+// trusts the former, and the Hub presents the latter with -mtls-cert/-mtls-key.
+// Nothing here is production material — it exists so the mTLS wiring can be
+// exercised end-to-end on a laptop.
 //
 // The three files are one identity, not three independent fixtures: a client
 // certificate means nothing next to a CA that did not sign it or a key that is
-// not its own. So they are treated as a set — all three present means reuse,
-// anything missing means regenerate all three. Topping up only the files that
-// are absent (what this used to do, one writePEMIfAbsent per file) can leave a
-// freshly generated CA and key beside a client certificate that survived, and
-// the mismatch then surfaces as "tls: private key does not match public key"
-// while the Hub loads its own identity — nowhere near the deletion that caused
-// it.
+// not its own. So reuse is decided by asking whether the set still works as one
+// — see loadHubMTLSIdentity — and anything else is rebuilt whole. Deciding per
+// file (what this used to do, one writePEMIfAbsent per file) cannot see a
+// mismatch at all: it tops up the files that are absent and trusts the ones that
+// are there, so a directory that lost one file, or that two processes raced to
+// create, keeps a triple that never belonged together. The failure then lands
+// far from its cause — "tls: private key does not match public key" while the
+// Hub loads its own identity, or a peer refusing a chain that never existed.
 func EnsureMTLSCerts() error {
-	dir := ConfigDir()
+	caPath := filepath.Join(ConfigDir(), MTLSClientCAPath)
+	certPath, keyPath := HubIdentityPaths()
+
+	if loadHubMTLSIdentity(caPath, certPath, keyPath) == nil {
+		return nil
+	}
 	caPEM, certPEM, keyPEM, err := mtls.GenHubClientCerts()
 	if err != nil {
 		return err
 	}
 	files := []struct {
-		name string
+		path string
 		pem  []byte
 	}{
-		{MTLSClientCAPath, caPEM},
-		{MTLSClientCertPath, certPEM},
-		{MTLSClientKeyPath, keyPEM},
-	}
-	complete := true
-	for _, f := range files {
-		if _, err := os.Stat(filepath.Join(dir, f.name)); err != nil {
-			complete = false
-			break
-		}
-	}
-	if complete {
-		return nil
+		{caPath, caPEM},
+		{certPath, certPEM},
+		{keyPath, keyPEM},
 	}
 	for _, f := range files {
-		if err := os.WriteFile(filepath.Join(dir, f.name), f.pem, 0o644); err != nil {
+		if err := os.WriteFile(f.path, f.pem, 0o644); err != nil {
 			return err
 		}
+	}
+	// Read back what was just written rather than assuming it is coherent: a
+	// concurrent writer interleaving here, or a directory that cannot take the
+	// files properly, has to surface now — as a startup failure — and not later
+	// as a handshake that fails for no visible reason.
+	return loadHubMTLSIdentity(caPath, certPath, keyPath)
+}
+
+// loadHubMTLSIdentity reads the simulation's Hub mTLS identity as one unit,
+// reporting nil only when the three files are usable together: the CA parses,
+// the key belongs to the certificate, and the certificate is a client
+// certificate that CA signed. It is the whole reuse decision for
+// EnsureMTLSCerts, so no partially replaced set can pass for a working one.
+func loadHubMTLSIdentity(caPath, certPath, keyPath string) error {
+	pool, err := mtls.LoadCAPath(caPath)
+	if err != nil {
+		return err
+	}
+	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return err
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return err
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:     pool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		return fmt.Errorf("hub client certificate does not chain to %s: %w", caPath, err)
 	}
 	return nil
 }
