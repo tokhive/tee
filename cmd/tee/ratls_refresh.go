@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"sync"
 	"time"
 
@@ -36,6 +37,10 @@ import (
 type epochRefresher interface {
 	Refresh(context.Context) error
 	Snapshot(context.Context) (platform.Epoch, error)
+	// ServerTLSConfig is the listener's live view of the current epoch, which is
+	// how the published leaf follows a rotation. It is the same accessor the
+	// startup path publishes from, so the file and the listener cannot drift.
+	ServerTLSConfig() *tls.Config
 }
 
 // epochAssembly is what buildEpoch assembles for the selected platform: the
@@ -64,8 +69,7 @@ const minRefreshFloor = 10 * time.Minute
 // restructuring any of it. Service is immutable once NewService returns, which
 // is what makes publishing the new one a pointer assignment.
 type serviceRuntime struct {
-	template        tee.Config
-	includeEvidence bool
+	template tee.Config
 
 	mu      sync.RWMutex
 	current *tee.Service
@@ -74,11 +78,7 @@ type serviceRuntime struct {
 // newServiceRuntime keeps the template every rotation rebuilds from, plus the
 // service built for the startup epoch.
 func newServiceRuntime(template tee.Config, current *tee.Service) *serviceRuntime {
-	return &serviceRuntime{
-		template:        template,
-		includeEvidence: template.Signer.IncludeEvidence,
-		current:         current,
-	}
+	return &serviceRuntime{template: template, current: current}
 }
 
 // get returns the service signing receipts right now. Handlers go through it on
@@ -94,9 +94,14 @@ func (r *serviceRuntime) get() *tee.Service {
 // the TEE presents on its TLS listener, which is the pairing a verifier checks
 // when it resolves a receipt's attestation reference.
 func (r *serviceRuntime) adopt(epoch platform.Epoch) error {
+	// The template's signer is the startup one and is never rebound, so its
+	// options are this process's receipt-form configuration. A rotated key must
+	// not change the receipt form, so they carry over to the new signer.
+	signer := proof.NewSigner(epoch)
+	signer.IncludeEvidence = r.template.Signer.IncludeEvidence
+
 	template := r.template
-	template.Signer = proof.NewSigner(epoch)
-	template.Signer.IncludeEvidence = r.includeEvidence
+	template.Signer = signer
 	next, err := tee.NewService(template)
 	if err != nil {
 		return err
@@ -118,33 +123,67 @@ func (r *serviceRuntime) adopt(epoch platform.Epoch) error {
 // agents re-register; keeping the two independent is what lets a TEE rotate its
 // evidence without invalidating the envelopes providers sealed to it.
 func runEpochRefresh(ctx context.Context, refresher epochRefresher, runtime *serviceRuntime, logger *rootShared.Logger) {
-	adopt := func() error {
-		snapshot, err := refresher.Snapshot(ctx)
-		if err != nil {
-			return err
-		}
-		identity := snapshot.Identity()
-		// Publish the rotated identity before it starts signing: the
-		// tee_identity.json an auditor reads has to describe the key the
-		// receipts carry.
-		if err := shared.WriteTEEIdentity(identity); err != nil {
-			return err
-		}
-		// The evidence store is how a hash-only receipt's EvidenceHash resolves
-		// — locally, and over /v1/evidence for a Hub on another host. A rotated
-		// epoch that never lands here signs receipts nobody can verify, so this
-		// strictly precedes publishing the new signer.
-		if err := shared.RecordTEEEvidence(identity); err != nil {
-			return err
-		}
-		return runtime.adopt(snapshot)
+	// published remembers whether the last rotation reached the service. The loop
+	// asks for the next delay right after a failure, and a Refresh that succeeded
+	// leaves the adapter healthy — so without this memory a publication that
+	// never landed would wait out the two-hour ceiling while the listener already
+	// serves the new key and receipts are still signed by the previous epoch,
+	// whose evidence is about to age out.
+	published := true
+	publish := func() error {
+		err := publishEpoch(ctx, refresher, runtime)
+		published = err == nil
+		return err
 	}
-	next := func() time.Duration { return nextRefreshDelay(ctx, refresher) }
+	next := func() time.Duration { return nextRefreshDelay(ctx, refresher, published) }
 	// The health tracker is intentionally nil: AttestationHealth exists to
 	// self-reset a guest whose attestation device has wedged, and this process
 	// has no recovery path to drive. A refresh that keeps failing is logged by
 	// the loop and shows up as the Hub losing its TLS peer.
-	rootShared.RunRATLSRefresh(ctx, refresher, adopt, next, nil, logger)
+	rootShared.RunRATLSRefresh(ctx, refresher, publish, next, nil, logger)
+}
+
+// publishEpoch makes one rotated epoch the epoch this process serves: the
+// identity an auditor reads, the evidence a hash-only receipt resolves, the
+// published leaf, then the signer. Everything the process shows the outside
+// world is updated before it is allowed to sign with the new key — a rotated
+// epoch that never lands in the store signs receipts nobody can verify.
+// Whichever half fails, the previous service keeps signing, so the failure is
+// visible as a rotation that did not happen rather than as unverifiable
+// receipts.
+func publishEpoch(ctx context.Context, refresher epochRefresher, runtime *serviceRuntime) error {
+	snapshot, err := refresher.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	identity := snapshot.Identity()
+	// Publish the rotated identity before it starts signing: the
+	// tee_identity.json an auditor reads has to describe the key the
+	// receipts carry.
+	if err := shared.WriteTEEIdentity(identity); err != nil {
+		return err
+	}
+	// The evidence store is how a hash-only receipt's EvidenceHash resolves
+	// — locally, and over /v1/evidence for a Hub on another host.
+	if err := shared.RecordTEEEvidence(identity); err != nil {
+		return err
+	}
+	// And the leaf the listener now presents, for the same reason: the file
+	// exists so something outside this process can learn which certificate to
+	// expect, and a stale one answers that question wrongly. It is written
+	// after the refresh has adopted the new epoch (Refresh publishes before
+	// returning), so the config reports the rotated certificate — the same
+	// bytes the next handshake will serve. A rotation whose new leaf cannot be
+	// published is refused like any other half-failure, rather than left to
+	// serve a certificate the file denies.
+	cfg := refresher.ServerTLSConfig()
+	if cfg == nil {
+		return errors.New("rotated epoch provides no RA-TLS server config to publish")
+	}
+	if err := shared.WriteTEECert(cfg); err != nil {
+		return err
+	}
+	return runtime.adopt(snapshot)
 }
 
 // nextRefreshDelay picks how long to wait before the next rotation. It reads
@@ -153,7 +192,15 @@ func runEpochRefresh(ctx context.Context, refresher epochRefresher, runtime *ser
 // clamps the result between the two published bounds: RATLSRefreshIntervalSNP
 // caps churn when the leaf is long-lived, and minRefreshFloor keeps a failed
 // rotation from waiting out the full ceiling before it retries.
-func nextRefreshDelay(ctx context.Context, refresher epochRefresher) time.Duration {
+//
+// published says whether the last rotation completed. When it did not — the
+// refresh succeeded but the epoch never reached the service — the floor applies
+// however fresh the evidence looks, because the listener has already rotated and
+// the mismatch has to be corrected promptly rather than at the ceiling.
+func nextRefreshDelay(ctx context.Context, refresher epochRefresher, published bool) time.Duration {
+	if !published {
+		return minRefreshFloor
+	}
 	snapshot, err := refresher.Snapshot(ctx)
 	if err != nil {
 		// The previous rotation failed (or one is in flight) and the adapter is

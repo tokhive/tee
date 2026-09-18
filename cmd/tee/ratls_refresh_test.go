@@ -6,9 +6,11 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"math/big"
 	"os"
@@ -62,7 +64,7 @@ func TestNextRefreshDelayTracksTheNitroTPMLeaf(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			refresher := &fakeRefresher{snapshot: fakeEpoch(nitroAttestation(t, test.notAfter))}
-			got := nextRefreshDelay(context.Background(), refresher)
+			got := nextRefreshDelay(context.Background(), refresher, true)
 			if !test.want(got) {
 				t.Fatalf("nextRefreshDelay = %s, want %s", got, test.wantWhy)
 			}
@@ -71,8 +73,20 @@ func TestNextRefreshDelayTracksTheNitroTPMLeaf(t *testing.T) {
 
 	t.Run("a failed snapshot retries on the floor", func(t *testing.T) {
 		refresher := &fakeRefresher{err: platform.ErrNotReady}
-		if got := nextRefreshDelay(context.Background(), refresher); got != minRefreshFloor {
+		if got := nextRefreshDelay(context.Background(), refresher, true); got != minRefreshFloor {
 			t.Fatalf("nextRefreshDelay = %s, want %s so an unhealthy adapter is retried promptly", got, minRefreshFloor)
+		}
+	})
+
+	// The publication half can fail on its own: Refresh rotates the listener's
+	// key successfully, then the epoch never reaches the signer. The evidence the
+	// current signer names is then the previous epoch's — good for about the
+	// margin, not for the ceiling — so a cadence that trusted the fresh-looking
+	// evidence would leave the TEE signing receipts that resolve to stale proof.
+	t.Run("a failed publication retries on the floor although the evidence looks fresh", func(t *testing.T) {
+		refresher := &fakeRefresher{snapshot: fakeEpoch(nitroAttestation(t, time.Now().Add(10*time.Hour)))}
+		if got := nextRefreshDelay(context.Background(), refresher, false); got != minRefreshFloor {
+			t.Fatalf("nextRefreshDelay = %s, want %s after a publication that did not land", got, minRefreshFloor)
 		}
 	})
 }
@@ -91,7 +105,7 @@ func TestRunEpochRefreshAdoptsAndPublishesRotatedEpoch(t *testing.T) {
 	before := runtime.get()
 
 	rotated := fakeEpoch(nitroAttestation(t, time.Now().Add(3*time.Hour)))
-	refresher := &fakeRefresher{snapshot: rotated}
+	refresher := &fakeRefresher{snapshot: rotated, serverTLS: fakeServerTLS(t, "rotated-ra-tls-leaf")}
 	runRefreshOnce(t, refresher, runtime)
 
 	if runtime.get() == before {
@@ -124,6 +138,76 @@ func TestRunEpochRefreshAdoptsAndPublishesRotatedEpoch(t *testing.T) {
 	}
 	if !store.Has(rotated.Identity()) {
 		t.Fatal("rotated epoch evidence was not published to the evidence store")
+	}
+
+	// And the published leaf follows the rotation. It is the file an operator (or
+	// tooling) reads to learn which certificate the listener presents, so a
+	// startup-only copy would keep answering with a key this process no longer
+	// holds — for the whole life of a process whose listener rotates.
+	leaf, err := os.ReadFile(filepath.Join(simDir, shared.MTLSServerCertPath))
+	if err != nil {
+		t.Fatalf("read published RA-TLS leaf: %v", err)
+	}
+	parsed, err := x509.ParseCertificate(pemBlock(t, leaf))
+	if err != nil {
+		t.Fatalf("parse published RA-TLS leaf: %v", err)
+	}
+	if parsed.Subject.CommonName != "rotated-ra-tls-leaf" {
+		t.Fatalf("published leaf is %q, want the rotated epoch's certificate", parsed.Subject.CommonName)
+	}
+}
+
+// pemBlock decodes the single PEM block a published certificate file holds.
+func pemBlock(t *testing.T, data []byte) []byte {
+	t.Helper()
+	block, _ := pem.Decode(data)
+	if block == nil {
+		t.Fatal("published RA-TLS leaf is not PEM")
+	}
+	return block.Bytes
+}
+
+// fakeServerTLS mints the self-signed RA-TLS leaf a rotated epoch would publish,
+// so the write that follows a rotation can be observed on disk.
+func fakeServerTLS(t *testing.T, commonName string) *tls.Config {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: commonName},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}}}
+}
+
+// TestRunEpochRefreshRefusesARotationItCannotPublishATleafFor is the other half
+// of the same rule: publishing precedes signing, so a rotation whose new leaf
+// cannot be written must be abandoned rather than left serving a certificate the
+// published file denies. The process keeps signing under the previous epoch,
+// which is the state whose leaf the file still describes.
+func TestRunEpochRefreshRefusesARotationItCannotPublishATleafFor(t *testing.T) {
+	t.Setenv("TOKENHIVE_SIM_DIR", t.TempDir())
+
+	runtime := newTestRuntime(t, fakeEpoch([]byte("startup-evidence")))
+	before := runtime.get()
+
+	rotated := fakeEpoch(nitroAttestation(t, time.Now().Add(3*time.Hour)))
+	runRefreshOnce(t, &fakeRefresher{snapshot: rotated}, runtime) // no ServerTLSConfig: nothing to publish
+
+	if runtime.get() != before {
+		t.Fatal("runtime adopted an epoch whose RA-TLS leaf could not be published")
 	}
 }
 
@@ -190,8 +274,9 @@ func newTestRuntime(t *testing.T, epoch platform.Epoch) *serviceRuntime {
 }
 
 type fakeRefresher struct {
-	snapshot platform.Epoch
-	err      error
+	snapshot  platform.Epoch
+	err       error
+	serverTLS *tls.Config
 }
 
 func (f *fakeRefresher) Refresh(context.Context) error { return nil }
@@ -201,6 +286,10 @@ func (f *fakeRefresher) Snapshot(context.Context) (platform.Epoch, error) {
 	}
 	return f.snapshot, nil
 }
+
+// ServerTLSConfig is nil unless a test hands over a leaf: the rotation path
+// treats "nothing to publish" as a failed publication on purpose.
+func (f *fakeRefresher) ServerTLSConfig() *tls.Config { return f.serverTLS }
 
 type fakeEpochImpl struct {
 	id platform.Identity

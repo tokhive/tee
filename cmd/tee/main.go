@@ -267,6 +267,16 @@ func main() {
 	// deployment's structured one (CloudWatch on an AWS guest, console JSON
 	// elsewhere), and a logger failure is not worth refusing to start an enclave
 	// over — the rotation does not depend on it.
+	//
+	// The context is intentionally the process's, with no cancellation: the
+	// refresher must run for exactly as long as the listener serves, and there is
+	// no state in which stopping it early is right — a cancelled loop adopts its
+	// last snapshot once and returns, leaving the epoch to age out while the
+	// listener keeps answering with it. Both serving paths below end the process
+	// (log.Fatal on a listener error) rather than unwinding through a shutdown
+	// sequence, and swallowing SIGTERM/SIGINT to cancel here would replace the
+	// default "die on signal" with "ignore signal" — a deployment hazard well
+	// beyond the tidiness it would buy.
 	if assembly.Refresher != nil {
 		logger, err := rootShared.NewLoggerFromEnv("tokenhive-tee")
 		if err != nil {
@@ -413,19 +423,25 @@ func envOrDuration(name string, fallback time.Duration) time.Duration {
 
 // serveInitCert runs the TOFU bootstrap listener: a plain-HTTP server whose only
 // handler is GET /v1/init-cert, protected by initToken. It returns exactly the
-// RA-TLS leaf PEM the mTLS plane presents, so a Hub can pin it before the first
+// RA-TLS leaf the mTLS plane presents, so a Hub can pin it before the first
 // mTLS exchange. The token gates who may read the attested identity; the leaf is
 // public key material and holds nothing secret, but we keep the endpoint
 // unauthenticated-scannable by requiring it.
 func serveInitCert(addr, initToken string, mTLSConfig *tls.Config) {
-	leaf, err := leafCertPEM(mTLSConfig)
-	if err != nil {
-		log.Fatalf("bootstrap: extract RA-TLS leaf: %v", err)
-	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/init-cert", func(w http.ResponseWriter, r *http.Request) {
 		if initToken != "" && r.FormValue("token") != initToken {
 			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		// Read the leaf per request rather than caching the startup one: this
+		// endpoint's contract is "the certificate the mTLS plane presents", and
+		// that certificate rotates. A cached copy would answer with the
+		// certificate of a key the listener no longer holds — for the one caller
+		// whose whole purpose is to learn the current one.
+		leaf, err := leafCertPEM(mTLSConfig)
+		if err != nil {
+			http.Error(w, "no certificate", http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/x-pem-file")
