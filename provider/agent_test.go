@@ -621,6 +621,41 @@ func TestAgentRefusesToComeOnlineWithoutDiscoverableModels(t *testing.T) {
 	}
 }
 
+// TestAgentDerivesHTTPBaseFromEitherGateScheme pins the scheme rewrite the
+// credential-key fetch depends on: a TLS Hub gate (wss://) has to become
+// https://, because http.NewRequest rejects a WebSocket scheme outright and the
+// agent would then never register.
+func TestAgentDerivesHTTPBaseFromEitherGateScheme(t *testing.T) {
+	cases := map[string]string{
+		"ws://127.0.0.1:18085/v1/agent":  "http://127.0.0.1:18085",
+		"wss://hub.example:443/v1/agent": "https://hub.example:443",
+	}
+	for gate, want := range cases {
+		a, err := NewAgent(AgentConfig{
+			HubGateURL:     gate,
+			SharedKey:      []byte(testAgentSecret),
+			Self:           hub.AgentRegister{Provider: "p"},
+			AllowedTargets: []string{"api.example.com"},
+		})
+		if err != nil {
+			t.Fatalf("NewAgent(%s): %v", gate, err)
+		}
+		if got := a.hubHTTPURL(); got != want {
+			t.Errorf("hubHTTPURL(%s) = %s, want %s", gate, got, want)
+		}
+	}
+}
+
+// TestAgentRefusesToLeakItsTokenToACleartextModelsURL pins that model discovery
+// will not put the provider credential on the wire over http://: -models-url is
+// operator input, and the same token also pays for inference.
+func TestAgentRefusesToLeakItsTokenToACleartextModelsURL(t *testing.T) {
+	auth := http.Header{"Authorization": []string{"Bearer secret"}}
+	if _, err := fetchModels("http://models.example/v1/models", http.DefaultClient, auth); err == nil {
+		t.Fatal("fetchModels sent a credential to a cleartext URL")
+	}
+}
+
 // TestReconnectPauseIsJittered pins the two properties that stop a fleet of
 // agents from reconnecting as one block: the pause stays inside the backoff
 // window the doubling computed, and it is actually spread out inside it. A

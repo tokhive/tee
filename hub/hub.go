@@ -277,6 +277,13 @@ func New(cfg Config) (*Hub, error) {
 	}
 	var budget *Budget
 	if len(cfg.Budgets) > 0 {
+		// A budget that no per-job ceiling backs cannot hold: admission is
+		// check-then-record, so concurrent jobs overshoot by in-flight x the
+		// largest single charge, and without MaxJobMicros that charge is whatever
+		// the seller's card asks for.
+		if cfg.MaxJobMicros == 0 {
+			return nil, fmt.Errorf("%w: budgets need a per-job ceiling to bound their overshoot", ErrInvalidBudget)
+		}
 		built, err := NewBudget(cfg.Budgets)
 		if err != nil {
 			return nil, err

@@ -403,6 +403,13 @@ func (a *Agent) prepareModels() error {
 // auth, when non-nil, is applied to the request (many providers require the
 // same credential on the models endpoint as on the inference endpoints).
 func fetchModels(url string, client *http.Client, auth http.Header) ([]string, error) {
+	// The credential is applied below, before the upstream is known to be who
+	// it claims: over cleartext it would travel readable. Refuse rather than
+	// leak it, and let the operator point -models-url at an https endpoint (the
+	// conventional one already is).
+	if len(auth) > 0 && !strings.HasPrefix(strings.ToLower(url), "https://") {
+		return nil, fmt.Errorf("refusing to send the provider credential to the non-https models URL %s", url)
+	}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("models url: %w", err)
@@ -461,9 +468,11 @@ func (a *Agent) credentialKey() (tee.InboxPublic, error) {
 }
 
 // hubHTTPURL rewrites the dialed WebSocket gate URL into the Hub's HTTP base,
-// e.g. ws://hub:port/v1/agent -> http://hub:port.
+// e.g. ws://hub:port/v1/agent -> http://hub:port, and wss:// -> https://.
 func (a *Agent) hubHTTPURL() string {
-	return strings.TrimSuffix(strings.Replace(a.cfg.HubGateURL, "ws://", "http://", 1), "/v1/agent")
+	base := strings.Replace(a.cfg.HubGateURL, "wss://", "https://", 1)
+	base = strings.Replace(base, "ws://", "http://", 1)
+	return strings.TrimSuffix(base, "/v1/agent")
 }
 
 // httpClient returns a bounded client for the control-plane HTTP calls the

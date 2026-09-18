@@ -640,6 +640,7 @@ func TestNewRejectsIncompleteWiring(t *testing.T) {
 		{"no rates", ErrNoRates, func(c *Config) { c.Rates = nil }},
 		{"no store", ErrNoStore, func(c *Config) { c.Store = nil }},
 		{"no verifier", ErrNoVerifier, func(c *Config) { c.Verify = nil }},
+		{"budgets without a job ceiling", ErrInvalidBudget, func(c *Config) { c.Budgets = map[string]uint64{"t": 1} }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -82,9 +82,10 @@ func TestBudgetBlocksBeforeDispatch(t *testing.T) {
 	}}
 	// Exactly one job's worth: the first fits, the second has nothing left.
 	h := mustHub(t, Config{
-		TEE:     fake,
-		Rates:   ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 1_000_000}}),
-		Budgets: map[string]uint64{"tenant": 1_000_000},
+		TEE:          fake,
+		Rates:        ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 1_000_000}}),
+		Budgets:      map[string]uint64{"tenant": 1_000_000},
+		MaxJobMicros: 1_000_000,
 	})
 
 	first, err := h.Execute(context.Background(), "tenant", "m", testSpec(testProvider, "m"), nil, nil)
@@ -120,9 +121,10 @@ func TestBudgetOvershootsByOneJobAtMost(t *testing.T) {
 		return Result{Chunks: stream, Receipt: makeReceipt(uint64(call), stream, nil)}, nil
 	}}
 	h := mustHub(t, Config{
-		TEE:     fake,
-		Rates:   ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 1_000_000}}),
-		Budgets: map[string]uint64{"tenant": 1_500_000},
+		TEE:          fake,
+		Rates:        ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 1_000_000}}),
+		Budgets:      map[string]uint64{"tenant": 1_500_000},
+		MaxJobMicros: 2_000_000,
 	})
 	ctx := context.Background()
 
@@ -172,9 +174,10 @@ func TestBudgetIsPerTenant(t *testing.T) {
 		return Result{Chunks: stream, Receipt: makeReceipt(uint64(call), stream, nil)}, nil
 	}}
 	h := mustHub(t, Config{
-		TEE:     fake,
-		Rates:   ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 1_000_000}}),
-		Budgets: map[string]uint64{"alice": 1_000_000},
+		TEE:          fake,
+		Rates:        ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 1_000_000}}),
+		Budgets:      map[string]uint64{"alice": 1_000_000},
+		MaxJobMicros: 1_000_000,
 	})
 
 	if _, err := h.Execute(context.Background(), "alice", "m", testSpec(testProvider, "m"), nil, nil); err != nil {
@@ -199,9 +202,10 @@ func TestBudgetBlocksSessionsBeforeOpen(t *testing.T) {
 		},
 	}
 	h := mustHub(t, Config{
-		TEE:     fake,
-		Rates:   ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 1_000_000}}),
-		Budgets: map[string]uint64{"tenant": 1_000_000},
+		TEE:          fake,
+		Rates:        ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 1_000_000}}),
+		Budgets:      map[string]uint64{"tenant": 1_000_000},
+		MaxJobMicros: 1_000_000,
 	})
 	h.budget.Record("tenant", 1_000_000) // spend the whole ceiling
 
