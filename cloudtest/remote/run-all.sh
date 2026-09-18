@@ -37,6 +37,23 @@ fi
 EXPECTED_ARG=()
 [ -n "$EXPECTED_APP" ] && EXPECTED_ARG=(-expected-app "$EXPECTED_APP")
 
+# How the Hub authenticates the TEE's RA-TLS certificate. The two are mutually
+# exclusive, and the platform decides which one is meaningful:
+#
+#   sevsnp     the certificate embeds SEV-SNP evidence, which the Hub verifies
+#              against the AWS/AMD roots and pins to the measured bundle. This
+#              is the only mode a long-lived TEE can use: the epoch rotates
+#              (its NitroTPM evidence is hours-scale), so a pinned leaf — or the
+#              tee-cert.pem below — stops matching within a refresh interval.
+#   simulated  no such evidence exists. The sim test certificate is only
+#              meaningful against the exact bytes the TEE published, so the Hub
+#              pins them.
+if [ "$TEE_PLATFORM" = "sevsnp" ]; then
+  TRUST_ARG=(-tee-verify attestation)
+else
+  TRUST_ARG=(-mtls-ca "$SIM/tee-cert.pem")
+fi
+
 echo "==> installing system dependencies"
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends ca-certificates curl >/dev/null
@@ -58,7 +75,7 @@ if [ "$TEE_PLATFORM" = "simulated" ]; then CA_ARG="-ca $SIM/ca.pem"; fi
   $CA_ARG >"$RESULTS/tee.log" 2>&1 &
 TEE_PID=$!
 
-echo "==> waiting for the TEE's attested certificate ($SIM/tee-cert.pem)"
+echo "==> waiting for the TEE to publish its RA-TLS certificate ($SIM/tee-cert.pem)"
 for _ in $(seq 1 60); do
   [ -s "$SIM/tee-cert.pem" ] && break
   kill -0 "$TEE_PID" 2>/dev/null || break
@@ -72,8 +89,8 @@ if [ ! -s "$SIM/tee-cert.pem" ]; then
 fi
 
 FAILED=0
-echo "==> driving 3 requests over mTLS (Hub pins the attested TEE cert)"
-./hub -tee https://127.0.0.1:18090 -mtls-ca "$SIM/tee-cert.pem" \
+echo "==> driving 3 requests over mTLS (Hub authenticating the TEE: $TEE_PLATFORM)"
+./hub -tee https://127.0.0.1:18090 "${TRUST_ARG[@]}" \
   -credential sk-cloudtest-secret -n 3 -allowed-platforms "$ALLOWED_PLATFORM" \
   "${EXPECTED_ARG[@]}" >"$RESULTS/hub.log" 2>&1 \
   || { echo "!! hub run failed (see $RESULTS/hub.log)"; tail -20 "$RESULTS/hub.log"; FAILED=1; }

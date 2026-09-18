@@ -3,11 +3,13 @@
 # real `tee` binary under the two-tier loader) + an ordinary host running the
 # real Hub / provider-agent / mockprovider. The whole business loop travels the
 # real data planes:
-#   request:  hub --mTLS(pin RA-TLS)--> tee /v1/execute
+#   request:  hub --mTLS(attested RA-TLS)--> tee /v1/execute
 #   upstream: tee --relay WS--> hub --agent tunnel--> mockprovider
 # The confidential instance has no sshd; its config is injected from EC2
-# user-data by the loader, and its RA-TLS cert is fetched by the Hub over the
-# one-shot TOFU bootstrap (/v1/init-cert). Tear-down is strictly by tag.
+# user-data by the loader. The Hub authenticates the TEE by verifying the
+# SEV-SNP evidence the RA-TLS certificate embeds, pinned to the measured app
+# identity — nothing is distributed out of band, so the TEE's hourly epoch
+# rotation is invisible to the deployment. Tear-down is strictly by tag.
 #
 #   ./crosshost.sh build     certs + pack bundle(real tee)+AMI + linux binaries
 #   ./crosshost.sh build-single  certs + pack supervisor bundle + AMI
@@ -20,7 +22,9 @@
 #               Add --host-ip <hub-ip> when the Hub lives on a separate machine:
 #               it becomes the tee's TEE_RELAY target (the address as the tee
 #               sees the Hub, i.e. the private IP when both share this VPC/SG).
-#   ./crosshost.sh fetch     ssh to host: pull tee RA-TLS cert via /v1/init-cert
+#   ./crosshost.sh fetch     ssh to host: pull the tee's current RA-TLS leaf via
+#                            /v1/init-cert, for inspection only — the Hub
+#                            verifies the evidence in it, it is not pinned
 #   ./crosshost.sh deploy    scp binaries+certs, start mockprovider/hub/agent on host
 #   ./crosshost.sh drive     curl a chat request via the host's Hub
 #   ./crosshost.sh verify    hub/tee/agent logs + tee console attestation
@@ -305,8 +309,15 @@ cmd_fetch() {
   # subnet and the SG's group-pair rule only matches in-VPC traffic (a public-ip
   # dial from a group member is dropped by AWS). ssh to the host still uses its
   # public ip.
+  #
+  # The leaf pulled here is NOT what the Hub trusts any more: `deploy` runs the
+  # Hub with -tee-verify=attestation, so trust comes from the SEV-SNP evidence
+  # inside whatever certificate the TEE presents. This stays as an operator's
+  # way to read the current leaf (and its evidence) off the instance without
+  # sshd, which is worth keeping for diagnosis — and the TEE answers with the
+  # leaf its listener holds right now, not the one it booted with.
   tip="$(tee_field private_ip)"; tok="$(cat "${CERTS_DIR}/init-token")"
-  log "step: fetch tee RA-TLS cert from bootstrap ${tip}:18091"
+  log "step: fetch tee RA-TLS cert from bootstrap ${tip}:18091 (inspection only)"
   out="$(remote_exec "$(host_field public_ip)" bash <<EOF
 for _ in \$(seq 1 60); do
   code="\$(curl -s -o tee-cert.pem -w '%{http_code}' 'http://${tip}:18091/v1/init-cert?token=${tok}')"
@@ -319,7 +330,7 @@ EOF
 )"
   log "bootstrap -> ${out}"
   remote_pull "$(host_field public_ip)" "tee-cert.pem" "${CLOUDTEST}/snp/.certs/tee-cert.pem" >/dev/null
-  log "pinned tee-cert.pem saved to ${CERTS_DIR}"
+  log "current tee RA-TLS leaf saved to ${CERTS_DIR} (for inspection)"
 }
 
 cmd_deploy() {
@@ -356,8 +367,9 @@ cmd_deploy() {
   remote_push "$hip" "${CERTS_DIR}/mp-ca.pem" "mtls/mp-ca.pem" >/dev/null
   remote_push "$hip" "${CERTS_DIR}/mp-cert.pem" "mtls/mp-cert.pem" >/dev/null
   remote_push "$hip" "${CERTS_DIR}/mp-key.pem" "mtls/mp-key.pem" >/dev/null
-  # tee-cert.pem (pinned) lives in CERTS_DIR after fetch
-  remote_push "$hip" "${CERTS_DIR}/tee-cert.pem" "mtls/tee-cert.pem" >/dev/null
+  # No tee-cert.pem is shipped: the Hub does not pin the TEE's leaf, it verifies
+  # the attested epoch the leaf carries. That is also why nothing here needs
+  # refreshing when the TEE rotates (see the hub invocation below).
   remote_push "$hip" "${policy_file}" "${REMOTE_POLICY_REL}/policy.cbor" >/dev/null
 
   # Per-provider agent key and the tee relay key. The Hub now requires both
@@ -380,7 +392,7 @@ sleep 1
 ./tee/hub -serve 0.0.0.0:18085 -agent-keys 'openai-sim=${agent_key}' -relay-key '${relay_key}' \
   -policy-dir "\$HOME/${REMOTE_POLICY_REL}" \
   -host 127.0.0.1:18080 \
-  -model sim-mock-0.5b -tee https://${tip}:18090 -mtls-ca mtls/tee-cert.pem \
+  -model sim-mock-0.5b -tee https://${tip}:18090 -tee-verify attestation \
   -mtls-cert mtls/hub-cert.pem -mtls-key mtls/hub-key.pem \
   -allowed-platforms aws-sev-snp -expected-app 'snp-app:${app_hash}' >tee/hub.log 2>&1 &
 sleep 1

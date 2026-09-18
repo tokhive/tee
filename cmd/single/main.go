@@ -4,9 +4,9 @@
 // ./app is instead this binary, which keeps the WHOLE loop inside one measured
 // confidential instance: the loader's root broker copy hands the attestation
 // role to the real tee, while the unprivileged app copy brings up mockprovider,
-// a real tee server, the Hub and a provider agent — all on loopback — and pins
-// the tee's RA-TLS certificate through the same /v1/init-cert handshake as the
-// cross-host flow, just against 127.0.0.1.
+// a real tee server, the Hub and a provider agent — all on loopback. The Hub
+// authenticates the tee by attestation, so the instance's epoch rotation never
+// invalidates anything the supervisor set up at startup.
 //
 // Whatever the topology, ./svc/tee is the measured, attested process: this
 // dispatcher adds no trust boundary, only process topology.
@@ -59,7 +59,11 @@ var (
 	// now refuses to serve without one, so the loopback topology needs it just
 	// as the cross-host one does; both sides read the same value from this
 	// process, so it never leaves the instance.
-	relayKey  string
+	relayKey string
+	// teeCert is the path the tee child publishes its RA-TLS leaf to
+	// (shared.MTLSServerCertPath under the same sim dir). The supervisor only
+	// watches it for readiness — the Hub trusts the attestation in the leaf, not
+	// the leaf itself.
 	teeCert   string
 	teeSvcFD3 *os.File // the app copy's attestation broker socket, re-passed to the tee server
 )
@@ -123,14 +127,12 @@ func supervise() error {
 	if appHash == "" {
 		return fmt.Errorf("SNP_APP_HASH not set by loader; cannot pin the attested app identity")
 	}
-	fetch := time.Now()
-	for {
-		if err := fetchTEECert(); err == nil {
-			break
-		} else if time.Since(fetch) > 4*time.Minute {
-			return fmt.Errorf("tee RA-TLS cert never appeared: %v", err)
-		}
-		time.Sleep(2 * time.Second)
+	// Ordering, not trust: the Hub must not dial the tee before the tee serves.
+	// The startup handshake that used to carry both is gone — the Hub no longer
+	// pins the tee's certificate, it verifies the SEV-SNP evidence inside it
+	// (see hubCmd), so there is nothing to fetch. What remains is the wait.
+	if err := waitForTEECert(); err != nil {
+		return err
 	}
 	start(hubCmd(appHash))
 	start(agentCmd())
@@ -216,7 +218,13 @@ func hubCmd(appHash string) *exec.Cmd {
 			"-host", "127.0.0.1:18080",
 			"-model", "sim-mock-0.5b",
 			"-tee", "https://127.0.0.1:18090",
-			"-mtls-ca", teeCert,
+			// Attestation, not a pinned certificate: this instance rotates its
+			// attested epoch for as long as it runs, so a leaf handed to the Hub
+			// at startup stops matching within one refresh interval. Verifying the
+			// evidence the leaf carries is the only statement that survives the
+			// rotation — and it is just as strong, since the evidence is bound to
+			// that leaf's own key and narrowed to the measured bundle below.
+			"-tee-verify", "attestation",
 			"-mtls-cert", filepath.Join(bundleDir, "mtls", "hub-cert.pem"),
 			"-mtls-key", filepath.Join(bundleDir, "mtls", "hub-key.pem"),
 			// Real SNP receipts: the hub must trust the platform and pin the exact
@@ -259,23 +267,27 @@ func start(c *exec.Cmd) {
 	}()
 }
 
-// fetchTEECert pulls the tee's RA-TLS leaf over the same one-shot bootstrap as
-// the cross-host flow and pins it for the Hub's -mtls-ca.
-func fetchTEECert() error {
-	httpc := &http.Client{Timeout: 3 * time.Second}
-	resp, err := httpc.Get(fmt.Sprintf("http://127.0.0.1:18091/v1/init-cert?token=%s", initToken))
-	if err != nil {
-		return err
+// waitForTEECert blocks until the tee child has published its RA-TLS leaf. The
+// tee writes that file itself (shared.WriteTEECert) immediately before it starts
+// serving, and rewrites it on every epoch rotation, so its presence is the
+// signal that the mTLS listener is about to answer.
+//
+// This replaced an HTTP fetch of the same bytes over the bootstrap listener: the
+// supervisor used to pull the leaf through /v1/init-cert so it could hand the
+// Hub a pin. Both the fetch and the pin are gone (the Hub verifies attestation),
+// and the tee had been writing this very path all along — so the handshake was
+// reading back a file it already had.
+func waitForTEECert() error {
+	deadline := time.Now().Add(4 * time.Minute)
+	for {
+		if fi, err := os.Stat(teeCert); err == nil && fi.Size() > 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("tee RA-TLS cert never appeared at %s", teeCert)
+		}
+		time.Sleep(2 * time.Second)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("init-cert HTTP %d", resp.StatusCode)
-	}
-	pem, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(teeCert, pem, 0o644)
 }
 
 type logWriter struct{ name string }
