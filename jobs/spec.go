@@ -254,35 +254,48 @@ func ValidateProviderName(provider string) error {
 }
 
 func validateHost(host string) error {
-	if host == "" || len(host) > MaxHostLength {
-		return fmt.Errorf("%w: %q", ErrInvalidHost, host)
+	if err := ValidateHostShape(host, MaxHostLength); err != nil {
+		return fmt.Errorf("%w: %q %v", ErrInvalidHost, host, err)
+	}
+	return nil
+}
+
+// ValidateHostShape reports why host is not a plain DNS name with an optional
+// numeric port, or nil when it is. A host is the one place a credential could
+// be smuggled to an attacker-controlled endpoint, so the shape is checked
+// twice — by the policy at load time, and here at spec time — and those two
+// checks have to be one implementation rather than two: they exist to be
+// independent of each other in *when* they run, and a second copy can only
+// drift about what a host even is.
+func ValidateHostShape(host string, maxLen int) error {
+	if host == "" || len(host) > maxLen {
+		return fmt.Errorf("is empty or over %d bytes", maxLen)
 	}
 	if strings.ContainsAny(host, " \t\r\n") {
-		return fmt.Errorf("%w: %q contains whitespace", ErrInvalidHost, host)
+		return errors.New("contains whitespace")
 	}
 	// A job targets one absolute host:port. Anything carrying a scheme, path,
 	// or userinfo is a sign that the Hub passed through an attacker-controlled
 	// URL instead of matching against a provider policy.
-	if strings.Contains(host, "/") || strings.Contains(host, "@") || strings.Contains(host, "?") {
-		return fmt.Errorf("%w: %q must be host or host:port", ErrInvalidHost, host)
+	if strings.ContainsAny(host, "/@?") {
+		return errors.New("must be host or host:port")
 	}
 
 	hostname, port, err := net.SplitHostPort(host)
 	if err != nil {
 		// No port is acceptable; the TLS layer defaults to 443.
-		hostname = host
-		port = ""
+		hostname, port = host, ""
 	}
 	if port != "" && !isDigits(port) {
-		return fmt.Errorf("%w: %q has a non-numeric port", ErrInvalidHost, host)
+		return errors.New("has a non-numeric port")
 	}
 	if hostname == "" {
-		return fmt.Errorf("%w: %q has an empty hostname", ErrInvalidHost, host)
+		return errors.New("has an empty hostname")
 	}
 	// Reject IPv6 literals and trailing separators, which SplitHostPort
 	// otherwise tolerates in ways that complicate policy matching.
 	if strings.Contains(hostname, ":") || strings.HasSuffix(hostname, ".") {
-		return fmt.Errorf("%w: %q is not a plain DNS name", ErrInvalidHost, host)
+		return errors.New("is not a plain DNS name")
 	}
 	return nil
 }
@@ -319,7 +332,7 @@ func validateHeaders(headers map[string]string) error {
 		if name == "" {
 			return fmt.Errorf("%w: empty header name", ErrInvalidHeaders)
 		}
-		if !isToken(name) {
+		if !IsToken(name) {
 			return fmt.Errorf("%w: %q is not a valid header name", ErrInvalidHeaders, name)
 		}
 		if strings.ContainsAny(value, "\r\n\x00") {
@@ -370,7 +383,12 @@ func (s Spec) HeaderNames() []string {
 	return names
 }
 
-func isToken(s string) bool {
+// IsToken reports whether s is an RFC 7230 token: the only shape a header name,
+// or the scheme a credential is presented in, may take before it reaches the
+// wire. Exported because the same field is checked again in the policy's
+// allowed-header list and in the credential an envelope opens to, and those
+// checks must agree by construction.
+func IsToken(s string) bool {
 	if s == "" {
 		return false
 	}

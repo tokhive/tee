@@ -7,6 +7,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -129,7 +130,7 @@ func (k *InboxKey) Open(env Envelope) (Secret, string, error) {
 	if len(env.KeyID) != sha256.Size {
 		return Secret{}, "", errors.New("envelope has no key ID")
 	}
-	if !constantTimeEqual(env.KeyID, k.id[:]) {
+	if subtle.ConstantTimeCompare(env.KeyID, k.id[:]) != 1 {
 		return Secret{}, "", errors.New("envelope was not encrypted for this inbox key")
 	}
 	if len(env.Ephemeral) != 32 {
@@ -177,7 +178,7 @@ func EncryptCredential(pub InboxPublic, provider string, secret Secret) (Envelop
 		return Envelope{}, errors.New("inbox public key is not an X25519 key")
 	}
 	computedID := sha256.Sum256(pub.PublicKey)
-	if !constantTimeEqual(pub.KeyID[:], computedID[:]) {
+	if subtle.ConstantTimeCompare(pub.KeyID[:], computedID[:]) != 1 {
 		return Envelope{}, errors.New("inbox key ID does not match its public key")
 	}
 
@@ -233,20 +234,6 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 		return nil, fmt.Errorf("build AES cipher: %w", err)
 	}
 	return cipher.NewGCM(block)
-}
-
-// constantTimeEqual compares two byte slices in constant time. It is used for
-// key IDs and derived digests, which are public, but a constant-time compare
-// costs nothing at these sizes and keeps the discipline uniform.
-func constantTimeEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := range a {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
 }
 
 // credentialPublicJSON is the wire form of InboxPublic: base64 like every

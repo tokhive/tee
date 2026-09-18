@@ -1,5 +1,5 @@
 // Package simulated provides a software-only implementation of the
-// platform.Epoch and platform.Adapter interfaces used by TokenHive.
+// platform.Epoch interface TokenHive signs with.
 //
 // It exists for local development and the simulation harness. It does NOT
 // provide real confidentiality or attestation: the "enclave" is an in-process

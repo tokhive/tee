@@ -16,6 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
@@ -319,12 +320,12 @@ func (c *userHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if req.Provider != "" {
 		outcome, err = c.h.ExecuteForProvider(r.Context(), tenant, req.Model, req.Provider, body,
 			func(provider string) (jobs.Spec, error) {
-				return buildSpec(provider, c.cfg.HostFor(provider), c.route.Path, c.cfg.Query, body, c.cfg.Max)
+				return shared.BuildSpec(provider, c.cfg.HostFor(provider), c.route.Path, c.cfg.Query, body, c.cfg.Max)
 			}, onChunk, commit)
 	} else {
 		outcome, err = c.h.ExecuteForModel(r.Context(), tenant, req.Model, body,
 			func(provider string) (jobs.Spec, error) {
-				return buildSpec(provider, c.cfg.HostFor(provider), c.route.Path, c.cfg.Query, body, c.cfg.Max)
+				return shared.BuildSpec(provider, c.cfg.HostFor(provider), c.route.Path, c.cfg.Query, body, c.cfg.Max)
 			}, onChunk, commit)
 	}
 	if !started {
@@ -663,7 +664,7 @@ func (c *sessionHandler) buildSession(provider string) (jobs.Spec, error) {
 		Path:             realtimePath,
 		Query:            c.cfg.Query,
 		Headers:          map[string]string{},
-		BodyHash:         hashBodyBytes(nil),
+		BodyHash:         shared.BodyHash(nil),
 		Nonce:            nonce,
 		ExpiresAt:        time.Now().Add(time.Hour).Unix(),
 		MaxResponseBytes: c.cfg.Max,

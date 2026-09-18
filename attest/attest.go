@@ -22,10 +22,8 @@ package attest
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
-	"sync"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
@@ -52,66 +50,11 @@ func (f FuncFetcher) Fetch(ctx context.Context, id platform.Identity) ([]byte, e
 	return f(ctx, id)
 }
 
-// defaultProofOptions mirrors the canonical receipt verification: no offline
-// cache means evidence must be inline; MaxAge is deliberately off here because
-// freshness is a policy choice the caller owns.
-var (
-	errFetcherMiss = errors.New("attestation evidence not in cache")
-
-	// ErrPolicyMismatch means the receipt names a whitelist other than the one
-	// the deployment pinned. The signature is genuine and the enclave may be
-	// trusted; it simply ran under different rules than the verifier is willing
-	// to accept, which is precisely the case the pin exists to catch.
-	ErrPolicyMismatch = errors.New("receipt names a different policy than the deployment")
-)
-
-// Cache is an in-memory Fetcher, populated when a trusted TEE is seen online.
-// It is keyed by platform, application ID and evidence hash so that several
-// concurrent TEEs (or the same app across restarts) never collide.
-type Cache struct {
-	mu sync.Mutex
-	m  map[cacheKey][]byte
-}
-
-type cacheKey struct {
-	platform string
-	app      string
-	evHash   [32]byte
-}
-
-// Put stores the full evidence of an identity, keyed for later hash-only
-// resolution.
-func (c *Cache) Put(id platform.Identity) {
-	if len(id.Evidence) == 0 {
-		return
-	}
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.m == nil {
-		c.m = make(map[cacheKey][]byte)
-	}
-	c.m[cacheKey{platform: id.Platform, app: id.ApplicationID, evHash: id.EvidenceHash}] = append([]byte(nil), id.Evidence...)
-}
-
-// Fetch implements Fetcher.
-func (c *Cache) Fetch(_ context.Context, id platform.Identity) ([]byte, error) {
-	if c == nil {
-		return nil, errFetcherMiss
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	ev, ok := c.m[cacheKey{platform: id.Platform, app: id.ApplicationID, evHash: id.EvidenceHash}]
-	if !ok {
-		return nil, errFetcherMiss
-	}
-	if sum := sha256Sum(ev); sum != id.EvidenceHash {
-		return nil, errFetcherMiss
-	}
-	return append([]byte(nil), ev...), nil
-}
+// ErrPolicyMismatch means the receipt names a whitelist other than the one the
+// deployment pinned. The signature is genuine and the enclave may be trusted;
+// it simply ran under different rules than the verifier is willing to accept,
+// which is precisely the case the pin exists to catch.
+var ErrPolicyMismatch = errors.New("receipt names a different policy than the deployment")
 
 // Config assembles a Verifier. It is the deployer's trust-root statement.
 type Config struct {
@@ -279,8 +222,6 @@ func (v *Verifier) allowedList() []string {
 	sortStrings(out)
 	return out
 }
-
-func sha256Sum(b []byte) [32]byte { return sha256.Sum256(b) }
 
 // sortStrings sorts a string slice ascending in place.
 func sortStrings(s []string) {

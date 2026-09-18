@@ -14,10 +14,9 @@ type Fetcher interface {
 	Fetch(ctx context.Context, id platform.Identity) ([]byte, error)
 }
 
-// Chain tries fetchers in order until one resolves the evidence. It composes
-// the in-memory "what this process has seen" cache with the durable local store
-// and, when configured, a remote peer's endpoint, so a hash-only receipt
-// resolves from whichever source actually holds the bytes.
+// Chain tries fetchers in order until one resolves the evidence: the durable
+// local store, and when configured a remote peer's /v1/evidence endpoint, so a
+// hash-only receipt resolves from whichever source actually holds the bytes.
 type Chain struct {
 	fetchers []Fetcher
 }

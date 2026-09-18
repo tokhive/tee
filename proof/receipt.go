@@ -9,6 +9,7 @@ package proof
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"time"
@@ -231,7 +232,7 @@ func validateAttestation(ref *AttestationRef) error {
 		return fmt.Errorf("%w: evidence hash length %d, want %d",
 			ErrInvalidAttestation, len(ref.EvidenceHash), EvidenceHashLength)
 	}
-	if computed := sha256.Sum256(ref.PublicKeyDER); !constantTimeEqual(computed[:], ref.KeyID) {
+	if computed := sha256.Sum256(ref.PublicKeyDER); subtle.ConstantTimeCompare(computed[:], ref.KeyID) != 1 {
 		return fmt.Errorf("%w: key ID does not match the public key", ErrInvalidAttestation)
 	}
 	return nil
@@ -387,7 +388,7 @@ func Verify(signed SignedReceipt, opts VerifyOptions) error {
 	// The signature must have been made by the key the receipt names. Without
 	// this check a receipt could name a genuine enclave while carrying a
 	// signature from an unrelated key.
-	if !constantTimeEqual(signed.Signature.KeyID[:], identity.KeyID[:]) {
+	if subtle.ConstantTimeCompare(signed.Signature.KeyID[:], identity.KeyID[:]) != 1 {
 		return fmt.Errorf("%w: signature key ID %x, receipt key ID %x",
 			ErrAttestationMismatch, signed.Signature.KeyID, identity.KeyID)
 	}
@@ -421,7 +422,7 @@ func (r Receipt) MatchesStream(chunks [][]byte) bool {
 		return false
 	}
 	computed := HashResponseStream(r.JobID, chunks)
-	return constantTimeEqual(computed[:], r.StreamHash)
+	return subtle.ConstantTimeCompare(computed[:], r.StreamHash) == 1
 }
 
 func containsString(values []string, target string) bool {
@@ -431,15 +432,4 @@ func containsString(values []string, target string) bool {
 		}
 	}
 	return false
-}
-
-func constantTimeEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := range a {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
 }

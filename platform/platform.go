@@ -1,14 +1,16 @@
-// Package platform defines the trusted-runtime interface used by TokenHive.
-// Platform-specific attestation details stay behind Adapter.
+// Package platform defines the trusted-runtime vocabulary TokenHive shares
+// across platforms: an attested identity, the signing epoch behind it, and the
+// signature primitives that bind them. There is deliberately no adapter
+// interface here — each runtime declares the narrow surface it consumes (see
+// cmd/tee's epochRefresher), so a platform only has to satisfy the callers that
+// exist rather than a contract written for all of them.
 package platform
 
 import (
 	"bytes"
-	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/sha256"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
 	"errors"
@@ -70,14 +72,6 @@ type Signature struct {
 type Epoch interface {
 	Identity() Identity
 	Sign(domain string, payload []byte) (Signature, error)
-}
-
-// Adapter exposes the small platform surface needed by the TokenHive runtime.
-type Adapter interface {
-	ServerTLSConfig() *tls.Config
-	Snapshot(context.Context) (Epoch, error)
-	Refresh(context.Context) error
-	Healthy() bool
 }
 
 // SigningDigest constructs an unambiguous, domain-separated SHA-256 digest.

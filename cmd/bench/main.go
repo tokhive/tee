@@ -21,7 +21,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -232,7 +231,7 @@ func runTEE(n int, host, query string, maxBytes uint64, body []byte, teeURL stri
 	totalWall := time.Duration(0)
 	totalPayload := int64(0)
 	for i := 0; i < n; i++ {
-		spec, err := buildSpec(host, query, body, maxBytes)
+		spec, err := shared.BuildSpec("openai-sim", host, "/v1/chat/completions", query, body, maxBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -508,37 +507,4 @@ func percentile(vals []float64, p float64) float64 {
 		idx = len(vals) - 1
 	}
 	return vals[idx]
-}
-
-// buildSpec mirrors cmd/hub's buildSpec so the TEE sees the same JobSpec a real
-// Hub would send (same policy-matching fields).
-func buildSpec(host, query string, body []byte, maxBytes uint64) (jobs.Spec, error) {
-	jobID := make([]byte, jobs.JobIDLength)
-	if _, err := rand.Read(jobID); err != nil {
-		return jobs.Spec{}, err
-	}
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		return jobs.Spec{}, err
-	}
-	return jobs.Spec{
-		Version:          jobs.VersionV1,
-		JobID:            jobID,
-		Provider:         "openai-sim",
-		Method:           "POST",
-		Host:             host,
-		Path:             "/v1/chat/completions",
-		Query:            query,
-		Headers:          map[string]string{"Content-Type": "application/json"},
-		BodyHash:         hashBodyBytes(body),
-		Nonce:            nonce,
-		ExpiresAt:        time.Now().Add(time.Hour).Unix(),
-		MaxResponseBytes: maxBytes,
-		Stream:           true,
-	}, nil
-}
-
-func hashBodyBytes(body []byte) []byte {
-	h := jobs.HashBody(body)
-	return h[:]
 }

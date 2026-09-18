@@ -15,6 +15,7 @@ package shared
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -22,11 +23,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
@@ -234,6 +237,45 @@ func SealCredential(teeBase, provider string, secret tee.Secret) (tee.Envelope, 
 		return tee.Envelope{}, fmt.Errorf("seal credential: %w", err)
 	}
 	return envelope, nil
+}
+
+// BuildSpec assembles the one-shot job spec the simulation tools send: every
+// field a real Hub's spec carries, filled with what the caller varies and the
+// defaults it does not. It lives here because more than one of those tools
+// (cmd/hub -n, cmd/hub's user API, cmd/bench) has to emit the same shape — a
+// bench whose spec differed from the Hub's would measure a different path than
+// the one the Hub drives.
+func BuildSpec(provider, host, path, query string, body []byte, maxBytes uint64) (jobs.Spec, error) {
+	jobID := make([]byte, jobs.JobIDLength)
+	if _, err := rand.Read(jobID); err != nil {
+		return jobs.Spec{}, err
+	}
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return jobs.Spec{}, err
+	}
+	return jobs.Spec{
+		Version:          jobs.VersionV1,
+		JobID:            jobID,
+		Provider:         provider,
+		Method:           "POST",
+		Host:             host,
+		Path:             path,
+		Query:            query,
+		Headers:          map[string]string{"Content-Type": "application/json"},
+		BodyHash:         BodyHash(body),
+		Nonce:            nonce,
+		ExpiresAt:        time.Now().Add(time.Hour).Unix(),
+		MaxResponseBytes: maxBytes,
+		Stream:           true,
+	}, nil
+}
+
+// BodyHash is the spec's body commitment in its wire form (a 32-byte array
+// sliced), which jobs.Spec records as bytes.
+func BodyHash(body []byte) []byte {
+	h := jobs.HashBody(body)
+	return h[:]
 }
 
 // writePolicy encodes and writes the deployment whitelist into dir as

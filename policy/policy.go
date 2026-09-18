@@ -251,7 +251,7 @@ func (l Limits) Validate() error {
 	}
 	seen := make(map[string]bool, len(l.AllowedHeaders))
 	for _, name := range l.AllowedHeaders {
-		if !isToken(name) {
+		if !jobs.IsToken(name) {
 			return fmt.Errorf("%w: %q is not a valid header name", ErrInvalidHeaderName, name)
 		}
 		// Whitelisting a TEE-controlled header here would be self-defeating:
@@ -270,28 +270,13 @@ func (l Limits) Validate() error {
 
 // validatePolicyHost checks that a host is a plain DNS name with an optional
 // numeric port, so a policy can never name a URL the TEE would parse
-// differently than its matcher. A host is the one place a credential could be
-// smuggled to an attacker-controlled endpoint, so it is checked twice: once
-// here at policy load time, and again by jobs at spec time.
+// differently than its matcher. The shape itself is jobs.ValidateHostShape,
+// which the job layer applies again to every spec: the policy decides what a
+// deployment is willing to reach, and the spec decides what this one request
+// asks for, but both have to mean the same thing by "host".
 func validatePolicyHost(host string) error {
-	if host == "" || len(host) > jobs.MaxHostLength {
-		return fmt.Errorf("%w: %q", ErrInvalidHost, host)
-	}
-	if strings.ContainsAny(host, " \t\r\n") {
-		return fmt.Errorf("%w: %q contains whitespace", ErrInvalidHost, host)
-	}
-	if strings.ContainsAny(host, "/@?") {
-		return fmt.Errorf("%w: %q must be host or host:port", ErrInvalidHost, host)
-	}
-	hostname, port := splitHostPort(host)
-	if port != "" && !isDigits(port) {
-		return fmt.Errorf("%w: %q has a non-numeric port", ErrInvalidHost, host)
-	}
-	if hostname == "" {
-		return fmt.Errorf("%w: %q has an empty hostname", ErrInvalidHost, host)
-	}
-	if strings.Contains(hostname, ":") || strings.HasSuffix(hostname, ".") {
-		return fmt.Errorf("%w: %q is not a plain DNS name", ErrInvalidHost, host)
+	if err := jobs.ValidateHostShape(host, jobs.MaxHostLength); err != nil {
+		return fmt.Errorf("%w: %q %v", ErrInvalidHost, host, err)
 	}
 	return nil
 }
@@ -372,51 +357,6 @@ func isQueryKey(key string) bool {
 		}
 	}
 	return true
-}
-
-func isToken(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if r > 127 {
-			return false
-		}
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') {
-			continue
-		}
-		switch r {
-		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
-			continue
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func isDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-// splitHostPort splits on the last colon. It is used instead of
-// net.SplitHostPort because a host without a port is valid here, and because
-// an unbracketed IPv6 literal must be rejected rather than silently accepted
-// as a host with a very odd port.
-func splitHostPort(host string) (string, string) {
-	separator := strings.LastIndex(host, ":")
-	if separator < 0 {
-		return host, ""
-	}
-	return host[:separator], host[separator+1:]
 }
 
 // parseQueryKeys extracts and sorts the keys of a query string.

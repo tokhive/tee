@@ -328,5 +328,4 @@ func (s *sharedSnapshot) Evidence() (string, string, []byte, error) {
 	return shared.ExtractIdentityFromRATLS(s.snapshot, s.logger)
 }
 
-var _ platform.Adapter = (*Adapter)(nil)
 var _ platform.Epoch = (*epoch)(nil)

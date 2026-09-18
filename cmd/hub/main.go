@@ -20,7 +20,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
@@ -288,7 +287,7 @@ func main() {
 
 	for i := 1; i <= *n; i++ {
 		fmt.Printf("\n=== request %d/%d ===\n", i, *n)
-		spec, err := buildSpec(*provider, serveCfg.HostFor(*provider), "/v1/chat/completions", *query, body, *maxBytes)
+		spec, err := shared.BuildSpec(*provider, serveCfg.HostFor(*provider), "/v1/chat/completions", *query, body, *maxBytes)
 		if err != nil {
 			logf("build spec: %v", err)
 			continue
@@ -658,12 +657,11 @@ func splitCSV(s string) ([]string, error) {
 // RA-TLS certificate and presents the same client certificate as the Hub↔TEE
 // channel.
 //
-// There is deliberately no in-memory layer here. attest.Cache exists for an
-// embedder that feeds it, and nothing in this process ever has: the Hub sees an
-// epoch's evidence only inside the receipts it verifies, and the two layers
-// below are the ones that actually resolve. Keeping an inert layer in front of
-// them only cost a lookup that could not hit and replaced the real "no evidence
-// stored" error with the cache's miss.
+// There is deliberately no in-memory layer here. The Hub sees an epoch's
+// evidence only inside the receipts it verifies, so every layer it could keep
+// one in would be empty forever; the two below are the sources that actually
+// hold bytes, and an inert layer in front of them would only replace the real
+// "no evidence stored" error with a lookup that cannot hit.
 func buildFetcher(evFetchURL string, evClient *http.Client) (attest.Fetcher, error) {
 	backend := &evidence.Chain{}
 	if store, err := shared.LoadEvidenceStore(); err == nil {
@@ -809,37 +807,6 @@ func parseTenantKeys(spec string) (map[string]string, error) {
 		keys[p[0]] = p[1]
 	}
 	return keys, nil
-}
-
-func buildSpec(provider, host, path, query string, body []byte, maxBytes uint64) (jobs.Spec, error) {
-	jobID := make([]byte, jobs.JobIDLength)
-	if _, err := rand.Read(jobID); err != nil {
-		return jobs.Spec{}, err
-	}
-	nonce := make([]byte, 16)
-	if _, err := rand.Read(nonce); err != nil {
-		return jobs.Spec{}, err
-	}
-	return jobs.Spec{
-		Version:          jobs.VersionV1,
-		JobID:            jobID,
-		Provider:         provider,
-		Method:           "POST",
-		Host:             host,
-		Path:             path,
-		Query:            query,
-		Headers:          map[string]string{"Content-Type": "application/json"},
-		BodyHash:         hashBodyBytes(body),
-		Nonce:            nonce,
-		ExpiresAt:        time.Now().Add(time.Hour).Unix(),
-		MaxResponseBytes: maxBytes,
-		Stream:           true,
-	}, nil
-}
-
-func hashBodyBytes(body []byte) []byte {
-	h := jobs.HashBody(body)
-	return h[:]
 }
 
 func logf(format string, args ...any) { fmt.Printf("[hub] "+format+"\n", args...) }

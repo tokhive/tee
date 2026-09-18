@@ -5,6 +5,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"errors"
 	"testing"
@@ -311,7 +312,7 @@ func TestSignFillsAttestationFromEpoch(t *testing.T) {
 		t.Errorf("application ID = %q, want %q", attestation.ApplicationID, epoch.identity.ApplicationID)
 	}
 	wantEvidenceHash := sha256.Sum256(epoch.identity.Evidence)
-	if !constantTimeEqual(attestation.EvidenceHash, wantEvidenceHash[:]) {
+	if subtle.ConstantTimeCompare(attestation.EvidenceHash, wantEvidenceHash[:]) != 1 {
 		t.Error("evidence hash does not match the epoch evidence")
 	}
 }

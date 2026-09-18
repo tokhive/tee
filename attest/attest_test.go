@@ -3,6 +3,7 @@ package attest
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"testing"
 	"time"
@@ -153,7 +154,7 @@ func TestInlineEvidenceTamperedFails(t *testing.T) {
 	}
 }
 
-func TestHashOnlyReceiptResolvesViaCache(t *testing.T) {
+func TestHashOnlyReceiptResolvesViaFetcher(t *testing.T) {
 	signer, identity := makeSigner(t, [32]byte{})
 	// A small, hash-only receipt (IncludeEvidence=false is the Signer default).
 	signed := makeReceipt(t, signer)
@@ -161,11 +162,15 @@ func TestHashOnlyReceiptResolvesViaCache(t *testing.T) {
 		t.Fatal("expected a hash-only receipt")
 	}
 
-	// The verifier's cache is populated with the TEE identity it saw online.
-	cache := &Cache{}
-	cache.Put(identity)
-
-	v := defaultConfig(t, cache, [32]byte{})
+	// The verifier resolves the hash through whatever the deployment filled when
+	// it saw the TEE come online — its local store, a peer's endpoint, anything.
+	// This is that seam.
+	v := defaultConfig(t, FuncFetcher(func(_ context.Context, id platform.Identity) ([]byte, error) {
+		if id.EvidenceHash != identity.EvidenceHash {
+			return nil, errors.New("no evidence for that hash")
+		}
+		return identity.Evidence, nil
+	}), [32]byte{})
 	if err := v.Check(signed); err != nil {
 		t.Fatalf("Check(hash-only) = %v, want nil", err)
 	}
@@ -178,35 +183,6 @@ func TestHashOnlyReceiptWithoutFetcherFails(t *testing.T) {
 	v := defaultConfig(t, nil, [32]byte{})
 	if err := v.Check(signed); !errors.Is(err, proof.ErrEvidenceRequired) {
 		t.Fatalf("Check = %v, want ErrEvidenceRequired", err)
-	}
-}
-
-func TestCacheKeyedByPlatformAndAppAndHash(t *testing.T) {
-	cache := &Cache{}
-	cache.Put(platform.Identity{
-		Platform:      simulated.Platform,
-		ApplicationID: simulated.ApplicationID,
-		Evidence:      []byte("evidence-bytes"),
-		EvidenceHash:  sha256Of([]byte("evidence-bytes")),
-	})
-	got, err := cache.Fetch(context.Background(), platform.Identity{
-		Platform:      simulated.Platform,
-		ApplicationID: simulated.ApplicationID,
-		EvidenceHash:  sha256Of([]byte("evidence-bytes")),
-	})
-	if err != nil {
-		t.Fatalf("Fetch = %v", err)
-	}
-	if string(got) != "evidence-bytes" {
-		t.Fatalf("Fetch = %q, want evidence-bytes", got)
-	}
-	// A different application ID must miss.
-	if _, err := cache.Fetch(context.Background(), platform.Identity{
-		Platform:      simulated.Platform,
-		ApplicationID: "other-app",
-		EvidenceHash:  sha256Of([]byte("evidence-bytes")),
-	}); err == nil {
-		t.Fatal("Fetch hit for a different application ID")
 	}
 }
 
@@ -265,4 +241,4 @@ func TestDeploymentBindingEnforced(t *testing.T) {
 	}
 }
 
-func sha256Of(b []byte) [32]byte { return sha256Sum(b) }
+func sha256Of(b []byte) [32]byte { return sha256.Sum256(b) }

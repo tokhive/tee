@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 )
 
 // ErrInvalidSecret means a resolved credential is structurally unusable: an
@@ -51,13 +53,13 @@ func (s Secret) Validate() error {
 		}
 		return nil // no authentication
 	}
-	if !isHeaderToken(s.Header) {
+	if !jobs.IsToken(s.Header) {
 		return fmt.Errorf("%w: %q is not a valid header name", ErrInvalidSecret, s.Header)
 	}
 	if isReservedInjectionHeader(s.Header) {
 		return fmt.Errorf("%w: %q must not be injected", ErrInvalidSecret, s.Header)
 	}
-	if s.Scheme != "" && !isHeaderToken(s.Scheme) {
+	if s.Scheme != "" && !jobs.IsToken(s.Scheme) {
 		return fmt.Errorf("%w: %q is not a valid scheme", ErrInvalidSecret, s.Scheme)
 	}
 	if s.Token == "" {
@@ -117,25 +119,4 @@ func isReservedInjectionHeader(name string) bool {
 		}
 	}
 	return false
-}
-
-func isHeaderToken(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if r > 127 {
-			return false
-		}
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') {
-			continue
-		}
-		switch r {
-		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
-			continue
-		default:
-			return false
-		}
-	}
-	return true
 }
