@@ -4,12 +4,10 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp"
 )
 
@@ -26,7 +24,11 @@ import (
 // SEV-SNP host the whitelist ships inside the measured image, so the hardware
 // measurement covers it by construction; the parameter is threaded through for
 // API symmetry and is not otherwise used by the sevsnp branch.
-func buildEpoch(platformName string, policyHash [32]byte) (platform.Epoch, *tls.Config, error) {
+//
+// The adapter travels back with the epoch because the epoch it publishes
+// expires: the NitroTPM chain inside the RA-TLS leaf is valid for hours, so the
+// caller keeps rotating it for as long as it serves (see ratls_refresh.go).
+func buildEpoch(platformName string, policyHash [32]byte) (epochAssembly, error) {
 	switch platformName {
 	case "sevsnp":
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -35,19 +37,26 @@ func buildEpoch(platformName string, policyHash [32]byte) (platform.Epoch, *tls.
 			Role: envOr("TOKENHIVE_TEE_ROLE", "tokenhive-tee"),
 		})
 		if err != nil {
-			return nil, nil, err
+			return epochAssembly{}, err
 		}
 		snapshot, err := adapter.Snapshot(ctx)
 		if err != nil {
-			return nil, nil, err
+			return epochAssembly{}, err
 		}
-		return snapshot, adapter.ServerTLSConfig(), nil
+		return epochAssembly{
+			Epoch:     snapshot,
+			ServerTLS: adapter.ServerTLSConfig(),
+			Refresher: adapter,
+		}, nil
 	case "simulated":
 		epoch, err := buildSimulatedEpoch(policyHash)
 		if err != nil {
-			return nil, nil, err
+			return epochAssembly{}, err
 		}
-		return epoch, shared.PlatformServerTLS(epoch), nil
+		return epochAssembly{
+			Epoch:     epoch,
+			ServerTLS: shared.PlatformServerTLS(epoch),
+		}, nil
 	}
-	return nil, nil, fmt.Errorf("unsupported platform %q: this build supports simulated and sevsnp", platformName)
+	return epochAssembly{}, fmt.Errorf("unsupported platform %q: this build supports simulated and sevsnp", platformName)
 }

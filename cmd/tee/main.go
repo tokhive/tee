@@ -27,9 +27,16 @@
 // production enables mTLS at the listener using the platform adapter's
 // ServerTLSConfig (RA-TLS certificates). -mtls switches the listener to that
 // mode; -mtls-client-ca names the CA that signs Hub client certificates.
+//
+// An attested RA-TLS certificate expires — on AWS the NitroTPM chain inside the
+// leaf is valid for hours — so the process rotates the epoch in place for as
+// long as it serves, and a Hub in attestation mode verifies each rotation from
+// the handshake itself instead of pinning a leaf that would go stale. See
+// ratls_refresh.go.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -152,10 +159,11 @@ func main() {
 		log.Fatalf("hash policy: %v", err)
 	}
 
-	epoch, serverTLS, err := buildEpoch(*platformName, policyHash)
+	assembly, err := buildEpoch(*platformName, policyHash)
 	if err != nil {
 		log.Fatalf("build platform epoch: %v", err)
 	}
+	epoch, serverTLS := assembly.Epoch, assembly.ServerTLS
 	if err := shared.WriteTEEIdentity(epoch.Identity()); err != nil {
 		log.Fatalf("write tee identity: %v", err)
 	}
@@ -208,24 +216,32 @@ func main() {
 	signer := proof.NewSigner(epoch)
 	signer.IncludeEvidence = *includeEvidence
 
-	svc, err := tee.NewService(tee.Config{
+	svcConfig := tee.Config{
 		Policy:         policyDoc,
 		Transport:      cm,
 		Signer:         signer,
 		Seq:            store,
 		InboxKey:       inbox,
 		RequestTimeout: *requestTimeout,
-	})
+	}
+	svc, err := tee.NewService(svcConfig)
 	if err != nil {
 		log.Fatalf("build service: %v", err)
 	}
+	// svcRuntime holds the receipt signer, which is bound to the attested epoch
+	// key and is replaced whenever the platform rotates that key. The inbox key
+	// above is the other, deliberately independent half: it is generated once
+	// and never persisted, so a restart — not a rotation — is what makes agents
+	// re-register. Handlers reach the current service through it, so a rotation
+	// takes effect on the next request without dropping the listener.
+	svcRuntime := newServiceRuntime(svcConfig, svc)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/execute", func(w http.ResponseWriter, r *http.Request) {
-		tee.ServeExecute(svc, w, r)
+		tee.ServeExecute(svcRuntime.get(), w, r)
 	})
 	mux.HandleFunc("/v1/session", func(w http.ResponseWriter, r *http.Request) {
-		tee.ServeSession(svc, w, r)
+		tee.ServeSession(svcRuntime.get(), w, r)
 	})
 	// Credential plane: GET /v1/credential-key publishes the TEE's inbox public
 	// key, which provider agents fetch (through the Hub) to encrypt their tokens
@@ -244,6 +260,21 @@ func main() {
 		log.Fatalf("open evidence store: %v", err)
 	}
 	evidence.NewHTTPServer(evStore, mux)
+
+	// Keep the attested epoch inside its evidence's validity for as long as this
+	// process serves. The buildEpoch comment explains why the assembly carries a
+	// refresher here and not on the simulated platform; the logger is the
+	// deployment's structured one (CloudWatch on an AWS guest, console JSON
+	// elsewhere), and a logger failure is not worth refusing to start an enclave
+	// over — the rotation does not depend on it.
+	if assembly.Refresher != nil {
+		logger, err := rootShared.NewLoggerFromEnv("tokenhive-tee")
+		if err != nil {
+			log.Printf("ratls: structured logger unavailable (%v); rotations will not be logged", err)
+			logger = rootShared.NewNopLogger()
+		}
+		go runEpochRefresh(context.Background(), assembly.Refresher, svcRuntime, logger)
+	}
 
 	if *mtls {
 		clientCAPath := *mtlsClientCA

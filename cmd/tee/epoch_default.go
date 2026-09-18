@@ -3,11 +3,9 @@
 package main
 
 import (
-	"crypto/tls"
 	"fmt"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 )
 
 // buildEpoch assembles the attested signing epoch and its RA-TLS server TLS
@@ -19,13 +17,19 @@ import (
 // flag from go-sev-guest. Cloud deployments compile with `-tags sevsnp`
 // (real AWS adapter via epoch_sevsnp.go); any other platform name is a
 // descriptive error here.
-func buildEpoch(platformName string, policyHash [32]byte) (platform.Epoch, *tls.Config, error) {
+//
+// The simulated epoch carries no Refresher: its software evidence has no expiry
+// to stay ahead of, so it is fixed for the process lifetime.
+func buildEpoch(platformName string, policyHash [32]byte) (epochAssembly, error) {
 	if platformName != "simulated" {
-		return nil, nil, fmt.Errorf("platform %q is not in this binary; only simulated is built by default (rebuild with `-tags sevsnp` for AWS SEV-SNP)", platformName)
+		return epochAssembly{}, fmt.Errorf("platform %q is not in this binary; only simulated is built by default (rebuild with `-tags sevsnp` for AWS SEV-SNP)", platformName)
 	}
 	epoch, err := buildSimulatedEpoch(policyHash)
 	if err != nil {
-		return nil, nil, err
+		return epochAssembly{}, err
 	}
-	return epoch, shared.PlatformServerTLS(epoch), nil
+	return epochAssembly{
+		Epoch:     epoch,
+		ServerTLS: shared.PlatformServerTLS(epoch),
+	}, nil
 }

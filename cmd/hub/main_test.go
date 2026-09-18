@@ -1,8 +1,13 @@
 package main
 
 import (
+	"encoding/pem"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 )
 
 // buildVerifier's AWS SEV-SNP pin requirement: an allowlist entry for
@@ -45,6 +50,129 @@ func TestBuildVerifierRequiresAWSSEVSNPAppPin(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBuildTEEClientTLSModes locks in what each -tee-verify mode actually
+// checks. The failure it guards against is a Hub that looks configured to verify
+// the TEE and instead accepts anything: attestation mode has to fail closed on a
+// peer whose certificate carries no attestation rather than degrade to "TLS
+// only", and it has to keep presenting the Hub's own client certificate, which
+// the TEE demands whichever way its certificate is verified.
+func TestBuildTEEClientTLSModes(t *testing.T) {
+	simDir := t.TempDir()
+	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
+	if err := shared.EnsureMTLSCerts(); err != nil {
+		t.Fatal(err)
+	}
+	caFile := filepath.Join(simDir, shared.MTLSClientCAPath)
+	validPin := "snp-app:" + strings.Repeat("ab", 32)
+
+	t.Run("pin mode with no CA is a plain channel", func(t *testing.T) {
+		cfg, err := buildTEEClientTLS(teeChannelConfig{Mode: teeVerifyPin})
+		if err != nil || cfg != nil {
+			t.Fatalf("buildTEEClientTLS = (%v, %v), want (nil, nil)", cfg, err)
+		}
+	})
+
+	t.Run("pin mode refuses a client identity with nothing to pin against", func(t *testing.T) {
+		_, err := buildTEEClientTLS(teeChannelConfig{Mode: teeVerifyPin, CertFile: "cert.pem", KeyFile: "key.pem"})
+		if err == nil {
+			t.Fatal("pin mode accepted a client certificate without a pin")
+		}
+	})
+
+	t.Run("pin mode verifies against the named CA", func(t *testing.T) {
+		cfg, err := buildTEEClientTLS(teeChannelConfig{Mode: teeVerifyPin, CAFile: caFile})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg == nil || cfg.VerifyPeerCertificate == nil {
+			t.Fatal("pin mode installed no peer verifier")
+		}
+		if len(cfg.Certificates) != 1 {
+			t.Fatal("pin mode did not present the Hub's client certificate")
+		}
+		if err := cfg.VerifyPeerCertificate([][]byte{simClientCertDER(t, simDir)}, nil); err == nil {
+			t.Fatal("pin mode accepted a certificate the pinned CA did not issue")
+		}
+	})
+
+	t.Run("attestation mode rejects a peer that carries no attestation", func(t *testing.T) {
+		cfg, err := buildTEEClientTLS(teeChannelConfig{Mode: teeVerifyAttestation, ExpectedApp: validPin})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg == nil || cfg.VerifyPeerCertificate == nil {
+			t.Fatal("attestation mode installed no peer verifier")
+		}
+		if len(cfg.Certificates) != 1 {
+			t.Fatal("attestation mode did not present the Hub's client certificate")
+		}
+		// A well-formed certificate with no attestation extension is exactly what
+		// a substituted TLS peer looks like, and it must not pass.
+		err = cfg.VerifyPeerCertificate([][]byte{simClientCertDER(t, simDir)}, nil)
+		if err == nil {
+			t.Fatal("attestation mode accepted a peer certificate with no attestation")
+		}
+		if !strings.Contains(err.Error(), "attestation") {
+			t.Fatalf("attestation mode rejected the peer for %v, want a missing-attestation error", err)
+		}
+	})
+
+	tests := []struct {
+		name    string
+		opts    teeChannelConfig
+		wantErr string
+	}{
+		{
+			name:    "attestation mode refuses a competing pin",
+			opts:    teeChannelConfig{Mode: teeVerifyAttestation, CAFile: caFile, ExpectedApp: validPin},
+			wantErr: "-mtls-ca",
+		},
+		{
+			name:    "attestation mode requires the application pin",
+			opts:    teeChannelConfig{Mode: teeVerifyAttestation},
+			wantErr: "-expected-app",
+		},
+		{
+			name:    "attestation mode rejects a malformed pin",
+			opts:    teeChannelConfig{Mode: teeVerifyAttestation, ExpectedApp: "snp-app:abc"},
+			wantErr: "pin",
+		},
+		{
+			name:    "an unknown mode is refused rather than defaulted",
+			opts:    teeChannelConfig{Mode: "attest"},
+			wantErr: "-tee-verify",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := buildTEEClientTLS(test.opts)
+			if err == nil {
+				t.Fatalf("buildTEEClientTLS(%+v) succeeded, want error containing %q", test.opts, test.wantErr)
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("buildTEEClientTLS error = %q, want it to contain %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+// simClientCertDER returns the DER of the simulation Hub client certificate,
+// which is signed by the same CA the pin-mode subtests pin: a certificate the
+// deployment distributed deliberately, so a rejection is about what it carries
+// rather than about who signed it.
+func simClientCertDER(t *testing.T, simDir string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(simDir, shared.MTLSClientCertPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(b)
+	if block == nil {
+		t.Fatal("simulation client certificate is not PEM")
+	}
+	return block.Bytes
 }
 
 func TestRequireServeKeys(t *testing.T) {
