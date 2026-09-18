@@ -44,6 +44,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
@@ -218,10 +219,20 @@ func main() {
 	signer := proof.NewSigner(epoch)
 	signer.IncludeEvidence = *includeEvidence
 
+	// liveSigner tracks the process's current receipt signer across rotations.
+	// Services built from the template below sign session-final receipts with
+	// whatever it holds, so a session that outlives its opening epoch still
+	// finishes under fresh evidence. Every rotation stores its adopted signer
+	// here (see adopt); a stale cell only ever means the pipeline is down past
+	// its margin, which the service refuses loudly instead of signing.
+	liveSigner := &atomic.Pointer[proof.Signer]{}
+	liveSigner.Store(signer)
+
 	svcConfig := tee.Config{
 		Policy:         policyDoc,
 		Transport:      cm,
 		Signer:         signer,
+		SignerCell:     liveSigner,
 		Seq:            store,
 		InboxKey:       inbox,
 		RequestTimeout: *requestTimeout,

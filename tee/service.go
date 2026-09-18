@@ -11,6 +11,8 @@
 //
 // Execute runs its checks in a fixed order, and the order is the design:
 //
+//  0. epoch freshness — the signer must name evidence still inside its
+//     freshness margin (see Config.SignerCell)
 //  1. submitter identity (optional, see Config.SubmitterVerifier)
 //  2. spec structure and expiry
 //  3. body binding — the body must hash to the spec's committed digest
@@ -49,8 +51,10 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
@@ -86,6 +90,15 @@ var ErrNoSessionSupport = errors.New("transport does not support streaming sessi
 // session is opened by a handshake, not a payload: it commits to an empty body,
 // and the body hash must be the digest of zero bytes.
 var ErrSessionBody = errors.New("streaming session must carry an empty body")
+
+// ErrAttestationStale is a refusal: the receipt signer the service would use
+// names an epoch whose evidence has passed its freshness margin, so any
+// receipt it produced would fail verification. It is returned before any
+// sequence number is allocated and before anything is put on the wire —
+// unlike a mid-exchange failure, a stale epoch never spends provider work or
+// burns a ProviderSeq. The caller should retry once the platform has published
+// a fresh epoch.
+var ErrAttestationStale = errors.New("attested epoch past its freshness margin; rotation has not published")
 
 // Job is a request to execute: the spec plus the body it commits to.
 //
@@ -149,6 +162,15 @@ type Config struct {
 	// Signer issues execution receipts from an attested key.
 	Signer *proof.Signer
 
+	// SignerCell, when non-nil, tracks the process's current receipt signer
+	// across epoch rotations. The service signs with the signer it holds at
+	// sign time rather than the startup one, so a streaming session that
+	// outlives a rotation still finishes with a receipt under fresh evidence.
+	// The rotation loop stores each adopted signer here; services built
+	// without one keep signing with their own Signer. The cell is an
+	// atomic.Pointer[proof.Signer] so readers never block a rotation.
+	SignerCell *atomic.Pointer[proof.Signer]
+
 	// Seq assigns the per-provider monotonic sequence number signed into every
 	// receipt. Mandatory, and deliberately not defaulted: see ErrNoSeqStore.
 	Seq SeqStore
@@ -185,6 +207,7 @@ type Service struct {
 	policy          policy.Policy
 	transport       Transport
 	signer          *proof.Signer
+	signerCell      *atomic.Pointer[proof.Signer]
 	seq             SeqStore
 	clock           func() time.Time
 	requestTimeout  time.Duration
@@ -217,12 +240,46 @@ func NewService(cfg Config) (*Service, error) {
 		policy:          *cfg.Policy,
 		transport:       cfg.Transport,
 		signer:          cfg.Signer,
+		signerCell:      cfg.SignerCell,
 		seq:             cfg.Seq,
 		clock:           clock,
 		requestTimeout:  cfg.RequestTimeout,
 		submitterVerify: cfg.SubmitterVerifier,
 		inbox:           cfg.InboxKey,
 	}, nil
+}
+
+// activeSigner is the signer receipts are issued with right now: the rotation
+// loop's current one when this service follows it, else the startup one.
+func (s *Service) activeSigner() *proof.Signer {
+	if s.signerCell != nil {
+		if signer := s.signerCell.Load(); signer != nil {
+			return signer
+		}
+	}
+	return s.signer
+}
+
+// signerStaleAt reports whether signing with signer at now would produce a
+// receipt no verifier accepts: its epoch carries a short-lived NitroTPM leaf
+// that has passed the freshness margin. Evidence without a readable leaf
+// (simulated epochs, test fakes) has no TEE-side expiry verdict and never
+// goes stale here — the fallback TTL in SNPAttestationExpiryFromLeaf exists
+// for refresh scheduling, not for refusing work, and comparing it against an
+// injected test clock would mistake every pinned clock for an outage.
+func signerStaleAt(signer *proof.Signer, now time.Time) bool {
+	if signer == nil {
+		return true
+	}
+	epoch := signer.Epoch()
+	if epoch == nil {
+		return true
+	}
+	expiry, tracked := rootShared.SNPAttestationExpiryFromLeaf(epoch.Identity().Evidence)
+	if !tracked {
+		return false
+	}
+	return !now.Before(expiry)
 }
 
 // Execute runs one job and returns its signed receipt.
@@ -250,6 +307,12 @@ func NewService(cfg Config) (*Service, error) {
 // therefore that error is non-nil if and only if Result is nil.
 func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onStart ...StartFunc) (*Result, error) {
 	now := s.clock()
+
+	// Freshness before everything: a stale epoch can attest nothing, so the
+	// job is refused before it can spend provider work or a sequence number.
+	if signerStaleAt(s.activeSigner(), now) {
+		return nil, ErrAttestationStale
+	}
 
 	if s.submitterVerify != nil {
 		if err := s.submitterVerify(ctx, job.Spec); err != nil {
@@ -516,7 +579,7 @@ func (s *Service) perform(
 		ResponseHeadersHash: headerHash,
 	}
 
-	signed, err := s.signer.Sign(receipt)
+	signed, err := s.activeSigner().Sign(receipt)
 	if err != nil {
 		return nil, fmt.Errorf("sign receipt: %w", err)
 	}
@@ -595,6 +658,12 @@ type Session struct {
 // sees them.
 func (s *Service) OpenSession(ctx context.Context, job Job) (*Session, error) {
 	now := s.clock()
+
+	// Same freshness refusal as Execute, before the sequence or the provider
+	// handshake is spent.
+	if signerStaleAt(s.activeSigner(), now) {
+		return nil, ErrAttestationStale
+	}
 
 	if s.submitterVerify != nil {
 		if err := s.submitterVerify(ctx, job.Spec); err != nil {
@@ -789,7 +858,16 @@ func (s *Session) Receipt() (*Result, error) {
 		RequestBytes:  s.requestBytes,
 		ProviderSeq:   s.seq,
 	}
-	signed, err := s.svc.signer.Sign(receipt)
+	// The session may have outlived the rotation it opened under: sign with
+	// whatever the process serves now, so a long session still finishes under
+	// fresh evidence instead of the expired key it started with. If even that
+	// is stale the pipeline is down past its margin, and an explicit error
+	// beats a receipt no verifier would accept.
+	signer := s.svc.activeSigner()
+	if signerStaleAt(signer, s.svc.clock()) {
+		return nil, ErrAttestationStale
+	}
+	signed, err := signer.Sign(receipt)
 	result := &Result{
 		Receipt:       signed,
 		StatusCode:    101,

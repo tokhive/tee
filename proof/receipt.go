@@ -286,6 +286,16 @@ func NewSigner(epoch platform.Epoch) *Signer {
 	return &Signer{epoch: epoch}
 }
 
+// Epoch returns the attested epoch this signer signs for. The service layer
+// uses it to refuse work once the epoch's evidence has passed its freshness
+// margin, instead of executing jobs whose receipts no verifier would accept.
+func (s *Signer) Epoch() platform.Epoch {
+	if s == nil {
+		return nil
+	}
+	return s.epoch
+}
+
 // Sign validates and signs a receipt, filling in the attestation reference from
 // the signer's epoch. Any attestation the caller pre-populated is overwritten:
 // the reference must describe the key that actually signs.

@@ -93,6 +93,13 @@ func (r *serviceRuntime) get() *tee.Service {
 // that epoch's key and publishes it. Receipts signed from here on name the key
 // the TEE presents on its TLS listener, which is the pairing a verifier checks
 // when it resolves a receipt's attestation reference.
+//
+// The adopted signer is also stored in the template's live cell before the
+// service pointer swaps, so sessions opened under the previous epoch finish
+// with the fresh key instead of the expired one they started with. Either
+// order is safe — both epochs are fresh during a healthy rotation — but the
+// cell first means no new request can observe the new service while still
+// signing with the old key.
 func (r *serviceRuntime) adopt(epoch platform.Epoch) error {
 	// The template's signer is the startup one and is never rebound, so its
 	// options are this process's receipt-form configuration. A rotated key must
@@ -105,6 +112,9 @@ func (r *serviceRuntime) adopt(epoch platform.Epoch) error {
 	next, err := tee.NewService(template)
 	if err != nil {
 		return err
+	}
+	if template.SignerCell != nil {
+		template.SignerCell.Store(signer)
 	}
 	r.mu.Lock()
 	r.current = next
@@ -153,9 +163,10 @@ func runEpochRefresh(ctx context.Context, refresher epochRefresher, runtime *ser
 // auditor reads, then the signer. Everything the process shows the outside
 // world is updated before it is allowed to sign with the new key — a rotated
 // epoch that never lands in the store signs receipts nobody can verify.
-// Whichever half fails, the previous service keeps signing, so the failure is
-// visible as a rotation that did not happen rather than as unverifiable
-// receipts.
+// Whichever half fails, the previous service keeps signing while its evidence
+// is still inside the margin, so the failure reads as a rotation that did not
+// happen; past the margin the service refuses new work outright
+// (ErrAttestationStale) rather than signing receipts no verifier would accept.
 //
 // These writes cannot be one atomic step, so they go in the order that leaves
 // the least harmful state behind when one of them fails. The evidence store is

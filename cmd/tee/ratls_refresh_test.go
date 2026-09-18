@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -294,6 +295,31 @@ func assertIdentityNotRotated(t *testing.T, simDir string, rotated platform.Iden
 // priming call it would otherwise get (see shared.RunRATLSRefresh).
 func publishOnce(refresher epochRefresher, runtime *serviceRuntime) error {
 	return publishEpoch(context.Background(), refresher, runtime)
+}
+
+// TestAdoptPublishesTheSignerToTheLiveCell: adopting a rotated epoch must move
+// the live signer sessions sign with, not just the service pointer new
+// requests resolve. Otherwise a rotation fixes the listener while every
+// already-open session keeps finishing under the expired key.
+func TestAdoptPublishesTheSignerToTheLiveCell(t *testing.T) {
+	t.Setenv("TOKENHIVE_SIM_DIR", t.TempDir())
+
+	runtime := newTestRuntime(t, fakeEpoch([]byte("startup-evidence")))
+	cell := &atomic.Pointer[proof.Signer]{}
+	runtime.template.SignerCell = cell
+
+	rotated := fakeEpoch(nitroAttestation(t, time.Now().Add(3*time.Hour)))
+	refresher := &fakeRefresher{snapshot: rotated, serverTLS: fakeServerTLS(t, "rotated-ra-tls-leaf")}
+	if err := publishOnce(refresher, runtime); err != nil {
+		t.Fatalf("publish rotated epoch: %v", err)
+	}
+	got := cell.Load()
+	if got == nil {
+		t.Fatal("adopt left the live signer cell empty")
+	}
+	if got.Epoch().Identity().KeyID != rotated.Identity().KeyID {
+		t.Fatal("live signer still names the opening epoch after a rotation")
+	}
 }
 
 // newTestRuntime builds the smallest real service: the runtime's own logic is
