@@ -52,6 +52,38 @@ func TestBuildVerifierRequiresAWSSEVSNPAppPin(t *testing.T) {
 	}
 }
 
+// TestValidateTEEChannelRefusesAPinAgainstARotatingTEE: a pinned leaf cannot
+// name a TEE that replaces it every few hours. An operator who left the default
+// -tee-verify=pin on a real deployment should hear that at startup, not hours
+// later as a TLS failure on the first re-dial.
+func TestValidateTEEChannelRefusesAPinAgainstARotatingTEE(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    string
+		caFile  string
+		allowed string
+		audit   bool
+		wantErr bool
+	}{
+		{name: "pin against aws only is refused", mode: teeVerifyPin, caFile: "tee-cert.pem", allowed: "aws-sev-snp", wantErr: true},
+		{name: "pin against simulated is a fixed epoch and stays", mode: teeVerifyPin, caFile: "tee-cert.pem", allowed: "simulated"},
+		{name: "a mixed allowlist is left alone", mode: teeVerifyPin, caFile: "tee-cert.pem", allowed: "simulated,aws-sev-snp"},
+		{name: "attestation mode has nothing pinned to break", mode: teeVerifyAttestation, allowed: "aws-sev-snp"},
+		{name: "no pin, nothing to break", mode: teeVerifyPin, allowed: "aws-sev-snp"},
+		{name: "audit never dials the TEE", mode: teeVerifyPin, caFile: "tee-cert.pem", allowed: "aws-sev-snp", audit: true},
+		{name: "a malformed allowlist is refused", mode: teeVerifyPin, caFile: "tee-cert.pem", allowed: "", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateTEEChannel(test.mode, test.caFile, test.allowed, test.audit)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateTEEChannel(%q, %q, %q, audit=%v) = %v, want error=%v",
+					test.mode, test.caFile, test.allowed, test.audit, err, test.wantErr)
+			}
+		})
+	}
+}
+
 // TestBuildTEEClientTLSModes locks in what each -tee-verify mode actually
 // checks. The failure it guards against is a Hub that looks configured to verify
 // the TEE and instead accepts anything: attestation mode has to fail closed on a

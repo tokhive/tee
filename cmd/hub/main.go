@@ -114,6 +114,10 @@ func main() {
 	mtlsKey := flag.String("mtls-key", "", "private key for -mtls-cert; empty defaults to <simdir>/hub-client-key.pem")
 	flag.Parse()
 
+	if err := validateTEEChannel(*teeVerify, *mtlsCA, *allowed, *audit); err != nil {
+		log.Fatal(err)
+	}
+
 	store := hub.NewReceiptStore(filepath.Join(shared.ConfigDir(), "receipts"))
 
 	teeTLS, err := buildTEEClientTLS(teeChannelConfig{
@@ -443,6 +447,33 @@ type teeChannelConfig struct {
 	// ExpectedApp is the application pin attestation mode verifies the TEE
 	// against; see validateApplicationPin.
 	ExpectedApp string
+}
+
+// validateTEEChannel refuses a channel configuration that cannot survive the
+// peer it is aimed at. There is exactly one such case today: a pinned
+// certificate against a TEE that rotates its attested epoch.
+//
+// On aws-sev-snp the TEE replaces its RA-TLS leaf every few hours, so a pin
+// authenticates until the first rotation and then fails every re-dial — hours
+// into a run, and reading like an ordinary TLS problem. When aws-sev-snp is the
+// only platform the Hub trusts and a certificate is actually pinned, no peer
+// the pin could be for exists, so say so at startup rather than let it fail
+// later. A mixed allowlist is left alone: it exists so one Hub can face a
+// simulated peer (whose epoch is fixed, where a pin is right) beside a real one.
+// -audit never dials the TEE it names, so it keeps whatever configuration the
+// operator chose.
+func validateTEEChannel(mode, caFile, allowed string, audit bool) error {
+	if audit || mode != teeVerifyPin || caFile == "" {
+		return nil
+	}
+	platforms, err := splitCSV(allowed)
+	if err != nil {
+		return err
+	}
+	if len(platforms) == 1 && platforms[0] == platform.PlatformAWSSEVSNP {
+		return fmt.Errorf("-tee-verify=pin pins a certificate an aws-sev-snp TEE replaces every few hours, so it stops authenticating within one refresh interval; use -tee-verify=attestation with -expected-app=snp-app:<sha256> and drop -mtls-ca")
+	}
+	return nil
 }
 
 // buildTEEClientTLS assembles the Hub's client TLS config for the Hub↔TEE
