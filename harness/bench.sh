@@ -85,8 +85,13 @@ HUB_PID=$!
 wait_for_port 127.0.0.1 "$HUB_PORT"
 
 echo "==> starting provider agent (openai-sim), token registered at the gate"
+# -models, or the agent discovers them from the mock provider's /v1/models over
+# its throwaway TLS certificate and dies on the handshake: the agent would never
+# come online, every tee-mode job would relay nowhere, and the benchmark would
+# report zero-payload samples instead of a failure.
 "$BIN/agent" -hub "ws://127.0.0.1:$HUB_PORT/v1/agent" -key "$AGENT_SECRET" \
-  -provider openai-sim -targets "127.0.0.1:$MP_PORT" -token "$TOKEN" > "$SIM/agent.log" 2>&1 &
+  -provider openai-sim -targets "127.0.0.1:$MP_PORT" -token "$TOKEN" \
+  -models "sim-mock-0.5b,claude-sim-haiku,sim-claude-haiku" > "$SIM/agent.log" 2>&1 &
 AGENT_PID=$!
 sleep 1
 
@@ -106,11 +111,14 @@ section() { echo; echo "=================================================="; ech
 
 # --- latency scenario: small interactive-style response -------------------
 section "S5a. latency (normal small response, n=200)"
-"$BIN/bench" -mode both -query "" -max 1048576 -n 200 $RTT_ARG || FAIL=1
+# -credential: tee mode talks to the TEE directly, so it has to carry the
+# sealed token itself (a dialing agent's half of the job). Without it the TEE
+# refuses every job, and a bench that measured nothing still reported a pass.
+"$BIN/bench" -mode both -query "" -max 1048576 -n 200 -credential "$TOKEN" $RTT_ARG || FAIL=1
 
 # --- throughput scenario: large response, both modes capped at 1 MiB -------
 section "S5b. throughput (fault=big, capped at 1 MiB, n=20)"
-"$BIN/bench" -mode both -query "fault=big" -max 1048576 -n 20 $RTT_ARG || FAIL=1
+"$BIN/bench" -mode both -query "fault=big" -max 1048576 -n 20 -credential "$TOKEN" $RTT_ARG || FAIL=1
 
 echo
 echo "==> stopping services"

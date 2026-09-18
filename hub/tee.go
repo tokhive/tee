@@ -1,7 +1,6 @@
 package hub
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -230,77 +229,52 @@ func (t *HTTPTEE) CredentialKey(ctx context.Context) (tee.InboxPublic, error) {
 // before any chunk is forwarded, so the caller can commit its response status
 // ahead of the first body byte.
 func readSSE(r io.Reader, onChunk func([]byte) error, onStart ...func(tee.Response)) (Result, error) {
-	reader := bufio.NewReader(r)
+	stream := tee.NewSSEStream(r)
 	var (
-		eventType string
-		data      strings.Builder
-		dataLines int
-		result    Result
-		receipt   string
-		teeErr    string
-		startErr  error
+		result   Result
+		receipt  string
+		teeErr   string
+		startErr error
 	)
-	flush := func() {
-		switch eventType {
+	for {
+		frame, err := stream.Next()
+		if err != nil {
+			// The stream ended, cleanly or not. Either way the frames already
+			// read are the exchange's result, so the verdict below decides.
+			break
+		}
+		switch frame.Type {
 		case "", "message":
-			// Keyed on dataLines rather than on the accumulated length: an
-			// empty chunk is a real chunk and must be kept, or the count and
-			// the stream hash stop matching the receipt.
-			if dataLines > 0 {
-				payload := data.String()
-				result.Chunks = append(result.Chunks, []byte(payload))
+			// Keyed on the presence of a data line rather than on the
+			// accumulated length: an empty chunk is a real chunk and must be
+			// kept, or the count and the stream hash stop matching the receipt.
+			if frame.HasData {
+				// Two copies on purpose: the chunks kept here are what the Hub
+				// settles against, and the caller may write into the one it is
+				// handed without being able to alter the evidence.
+				result.Chunks = append(result.Chunks, []byte(frame.Data))
 				if onChunk != nil {
-					_ = onChunk([]byte(payload))
+					_ = onChunk([]byte(frame.Data))
 				}
 			}
 		case tee.EventStart:
-			var frame struct {
+			var start struct {
 				Status  uint32              `json:"status"`
 				Headers map[string][]string `json:"headers,omitempty"`
 			}
-			if err := json.Unmarshal([]byte(data.String()), &frame); err != nil {
+			if err := json.Unmarshal([]byte(frame.Data), &start); err != nil {
 				startErr = fmt.Errorf("decode response start frame: %w", err)
 				break
 			}
-			result.Status = frame.Status
-			result.Headers = frame.Headers
+			result.Status = start.Status
+			result.Headers = start.Headers
 			if len(onStart) > 0 && onStart[0] != nil {
-				onStart[0](tee.Response{StatusCode: frame.Status, Headers: frame.Headers})
+				onStart[0](tee.Response{StatusCode: start.Status, Headers: start.Headers})
 			}
 		case tee.EventReceipt:
-			receipt = data.String()
+			receipt = frame.Data
 		case tee.EventError:
-			teeErr = data.String()
-		}
-		eventType = ""
-		data.Reset()
-		dataLines = 0
-	}
-
-	for {
-		line, err := reader.ReadString('\n')
-		trimmed := strings.TrimRight(line, "\r\n")
-		switch {
-		case trimmed == "":
-			flush()
-		case strings.HasPrefix(trimmed, "event:"):
-			eventType = strings.TrimSpace(strings.TrimPrefix(trimmed, "event:"))
-		case strings.HasPrefix(trimmed, "data:"):
-			// SSE joins consecutive data lines with \n and removes exactly one
-			// leading space. Nothing else is touched: the chunk is payload the
-			// receipt hashes, so trimming it would silently corrupt the bytes
-			// the Hub forwards.
-			if dataLines > 0 {
-				data.WriteByte('\n')
-			}
-			dataLines++
-			data.WriteString(strings.TrimPrefix(strings.TrimPrefix(trimmed, "data:"), " "))
-		}
-		if err != nil {
-			// Flush any frame the final newline did not close, so a stream
-			// that ends abruptly still yields the chunks it did carry.
-			flush()
-			break
+			teeErr = frame.Data
 		}
 	}
 
