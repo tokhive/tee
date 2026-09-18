@@ -41,6 +41,7 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/alicloud"
@@ -272,6 +273,12 @@ func main() {
 		log.Fatal(err)
 	}
 	if *serveAddr != "" {
+		if *drop != 0 {
+			log.Fatal("serve mode refuses -drop (withholding a settled receipt from the store is a test hook, not a deployment mode)")
+		}
+		if *tenantKeys == "" {
+			log.Printf("warning: serve mode without -tenant-keys runs open mode, where the presented key is the tenant: quota, inflight and budget limits then apply per self-chosen name, so set -tenant-keys in production")
+		}
 		runServe(h, serveCfg)
 		return
 	}
@@ -487,7 +494,7 @@ func buildTEEClientTLS(opts teeChannelConfig) (*tls.Config, error) {
 		if err != nil {
 			return nil, err
 		}
-		return shared.ClientMTLSConfig(opts.CAFile, certFile, keyFile)
+		return mtls.ClientMTLSConfig(opts.CAFile, certFile, keyFile)
 
 	case teeVerifyAttestation:
 		if opts.CAFile != "" {
@@ -500,23 +507,15 @@ func buildTEEClientTLS(opts teeChannelConfig) (*tls.Config, error) {
 		if err != nil {
 			return nil, err
 		}
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-		if err != nil {
-			return nil, err
-		}
-		return &tls.Config{
-			// The attested key is the identity, exactly as in pin mode: RA-TLS
-			// certificates are not DNS names, so there is nothing to match against
-			// a hostname. Failing closed is the verifier's job, and it runs before
-			// the handshake completes.
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS12,
-			Certificates:       []tls.Certificate{cert},
-			VerifyPeerCertificate: rootShared.VerifyRATLSPeer(rootShared.RATLSVerifyOptions{
+		// The attested key is the identity, exactly as in pin mode: RA-TLS
+		// certificates are not DNS names, so there is nothing to match against
+		// a hostname. Failing closed is the verifier's job, and it runs before
+		// the handshake completes.
+		return mtls.ClientTLSConfigWithVerifier(certFile, keyFile,
+			rootShared.VerifyRATLSPeer(rootShared.RATLSVerifyOptions{
 				ExpectedImageDigest: opts.ExpectedApp,
 				Logger:              rootShared.NewNopLogger(),
-			}),
-		}, nil
+			}))
 	}
 	return nil, fmt.Errorf("-tee-verify %q is not a mode: want %s or %s", opts.Mode, teeVerifyPin, teeVerifyAttestation)
 }

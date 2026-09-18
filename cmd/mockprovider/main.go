@@ -34,6 +34,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
 )
 
 // connStats tallies TCP connections seen by the HTTP server. newConns is
@@ -220,7 +221,7 @@ func main() {
 			log.Printf("mockprovider (TLS) listening on https://%s", *addr)
 			log.Fatal(srv.ListenAndServeTLS("", ""))
 		}
-		cfg, caPEM, err := shared.GenCerts()
+		cfg, caPEM, err := mtls.GenLoopbackServerCerts()
 		if err != nil {
 			log.Fatalf("gen certs: %v", err)
 		}

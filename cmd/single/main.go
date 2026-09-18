@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 )
 
@@ -77,10 +78,10 @@ func main() {
 		execTee()
 	}
 
-	simDir = env("TOKENHIVE_SIM_DIR", "/tmp/tee")
-	initToken = env("TEE_INIT_TOKEN", "")
-	agentKey = env("TOKENHIVE_AGENT_KEY", "xhost-single-key")
-	relayKey = env("TOKENHIVE_RELAY_KEY", "xhost-relay-key")
+	simDir = rootShared.GetEnvOrDefault("TOKENHIVE_SIM_DIR", "/tmp/tee")
+	initToken = rootShared.GetEnvOrDefault("TEE_INIT_TOKEN", "")
+	agentKey = rootShared.GetEnvOrDefault("TOKENHIVE_AGENT_KEY", "xhost-single-key")
+	relayKey = rootShared.GetEnvOrDefault("TOKENHIVE_RELAY_KEY", "xhost-relay-key")
 	teeCert = filepath.Join(simDir, "tee-cert.pem")
 	if err := os.MkdirAll(simDir, 0o755); err != nil {
 		logf("mkdir simdir: %v", err)
@@ -324,14 +325,6 @@ func withEnv(kv ...string) []string {
 	}
 	return append(out, kv...)
 }
-
-func env(k, d string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return d
-}
-
 func logf(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, time.Now().Format("15:04:05")+" [single] "+format+"\n", a...)
 }

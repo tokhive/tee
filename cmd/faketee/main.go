@@ -16,6 +16,7 @@ import (
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
@@ -133,14 +134,14 @@ func queryParam(query, key string) string {
 func main() {
 	addr := flag.String("addr", "127.0.0.1:18091", "listen address")
 	seqPath := flag.String("seq", "", "ProviderSeq store file (default <simdir>/seqstore.json)")
-	mtls := flag.Bool("mtls", false, "serve the Hub-facing API over mutual TLS (sim test certificate, demanding a Hub client certificate)")
+	serveMTLS := flag.Bool("mtls", false, "serve the Hub-facing API over mutual TLS (sim test certificate, demanding a Hub client certificate)")
 	mtlsClientCA := flag.String("mtls-client-ca", "", "PEM CA(s) that sign Hub client certificates; empty defaults to <simdir>/hub-ca.pem (required with -mtls)")
 	flag.Parse()
 
 	if err := shared.EnsureDefaults(); err != nil {
 		log.Fatalf("ensure defaults: %v", err)
 	}
-	if *mtls {
+	if *serveMTLS {
 		if err := shared.EnsureMTLSCerts(); err != nil {
 			log.Fatalf("ensure mtls fixtures: %v", err)
 		}
@@ -223,16 +224,16 @@ func main() {
 	}
 	evidence.NewHTTPServer(evStore, mux)
 
-	if *mtls {
+	if *serveMTLS {
 		clientCAPath := *mtlsClientCA
 		if clientCAPath == "" {
 			clientCAPath = filepath.Join(shared.ConfigDir(), shared.MTLSClientCAPath)
 		}
-		serverTLS := shared.PlatformServerTLS(epoch)
+		serverTLS := mtls.PlatformServerTLS(epoch)
 		if serverTLS == nil {
 			log.Fatalf("simulated platform provides no RA-TLS server certificate; cannot serve -mtls")
 		}
-		cfg, err := shared.ServerMTLSConfig(serverTLS, clientCAPath)
+		cfg, err := mtls.ServerMTLSConfig(serverTLS, clientCAPath)
 		if err != nil {
 			log.Fatalf("mtls server config: %v", err)
 		}

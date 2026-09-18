@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
+	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp"
 )
 
@@ -34,7 +34,7 @@ func buildEpoch(platformName string, policyHash [32]byte) (epochAssembly, error)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		adapter, err := sevsnp.NewAWS(ctx, sevsnp.Config{
-			Role: envOr("TOKENHIVE_TEE_ROLE", "tokenhive-tee"),
+			Role: rootShared.GetEnvOrDefault("TOKENHIVE_TEE_ROLE", "tokenhive-tee"),
 		})
 		if err != nil {
 			return epochAssembly{}, err
@@ -49,14 +49,7 @@ func buildEpoch(platformName string, policyHash [32]byte) (epochAssembly, error)
 			Refresher: adapter,
 		}, nil
 	case "simulated":
-		epoch, err := buildSimulatedEpoch(policyHash)
-		if err != nil {
-			return epochAssembly{}, err
-		}
-		return epochAssembly{
-			Epoch:     epoch,
-			ServerTLS: shared.PlatformServerTLS(epoch),
-		}, nil
+		return buildSimulatedAssembly(policyHash)
 	}
 	return epochAssembly{}, fmt.Errorf("unsupported platform %q: this build supports simulated and sevsnp", platformName)
 }

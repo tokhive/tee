@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
 )
@@ -18,4 +19,19 @@ func buildSimulatedEpoch(policyHash [32]byte) (platform.Epoch, error) {
 		return nil, fmt.Errorf("create sim epoch: %w", err)
 	}
 	return epoch, nil
+}
+
+// buildSimulatedAssembly is the full startup assembly for the simulated
+// platform: the software epoch plus the RA-TLS listener presenting its key.
+// The epoch is fixed for the process lifetime — software evidence has no
+// expiry to stay ahead of — so no Refresher travels with it.
+func buildSimulatedAssembly(policyHash [32]byte) (epochAssembly, error) {
+	epoch, err := buildSimulatedEpoch(policyHash)
+	if err != nil {
+		return epochAssembly{}, err
+	}
+	return epochAssembly{
+		Epoch:     epoch,
+		ServerTLS: mtls.PlatformServerTLS(epoch),
+	}, nil
 }

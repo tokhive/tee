@@ -4,8 +4,6 @@ package main
 
 import (
 	"fmt"
-
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
 )
 
 // buildEpoch assembles the attested signing epoch and its RA-TLS server TLS
@@ -24,12 +22,5 @@ func buildEpoch(platformName string, policyHash [32]byte) (epochAssembly, error)
 	if platformName != "simulated" {
 		return epochAssembly{}, fmt.Errorf("platform %q is not in this binary; only simulated is built by default (rebuild with `-tags sevsnp` for AWS SEV-SNP)", platformName)
 	}
-	epoch, err := buildSimulatedEpoch(policyHash)
-	if err != nil {
-		return epochAssembly{}, err
-	}
-	return epochAssembly{
-		Epoch:     epoch,
-		ServerTLS: shared.PlatformServerTLS(epoch),
-	}, nil
+	return buildSimulatedAssembly(policyHash)
 }

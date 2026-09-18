@@ -15,21 +15,13 @@ package shared
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
-	"math/big"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
@@ -442,110 +434,19 @@ func loadHubMTLSIdentity(caPath, certPath, keyPath string) error {
 	return nil
 }
 
-// LoadCAPath reads a PEM file into a certificate pool.
-func LoadCAPath(path string) (*x509.CertPool, error) {
-	return mtls.LoadCAPath(path)
-}
-
-// PlatformServerTLS returns the RA-TLS server configuration the platform epoch
-// provides, or nil when the platform has none.
-func PlatformServerTLS(epoch platform.Epoch) *tls.Config {
-	return mtls.PlatformServerTLS(epoch)
-}
-
-// ServerMTLSConfig assembles the TEE-side mTLS listener config.
-func ServerMTLSConfig(serverTLS *tls.Config, clientCAPath string) (*tls.Config, error) {
-	return mtls.ServerMTLSConfig(serverTLS, clientCAPath)
-}
-
-// ClientMTLSConfig assembles the Hub-side mTLS client config.
-func ClientMTLSConfig(caPEMPath, certPath, keyPath string) (*tls.Config, error) {
-	return mtls.ClientMTLSConfig(caPEMPath, certPath, keyPath)
-}
-
 // WriteTEECert publishes the leaf certificate a TEE listener presents.
 func WriteTEECert(cfg *tls.Config) error {
 	return mtls.WriteTEECert(cfg, filepath.Join(ConfigDir(), MTLSServerCertPath))
 }
 
-// GenCerts generates a throwaway CA and a server certificate for the loopback
-// interface, returning a TLS config for the mock provider and the CA PEM for
-// the TEE to trust. No external tooling required.
-func GenCerts() (*tls.Config, []byte, error) {
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, err
-	}
-	caTmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "tokenhive-sim-ca"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(mtls.FixtureCACertLifetime),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
-		BasicConstraintsValid: true,
-	}
-	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	caCert, err := x509.ParseCertificate(caDER)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	srvKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, err
-	}
-	srvTmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(2),
-		Subject:      pkix.Name{CommonName: "127.0.0.1"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(mtls.FixtureLeafCertLifetime),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
-	}
-	srvDER, err := x509.CreateCertificate(rand.Reader, srvTmpl, caCert, &srvKey.PublicKey, caKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	srvCert, err := tls.X509KeyPair(pemEncode("CERTIFICATE", srvDER), pemEncode("EC PRIVATE KEY",
-		mustMarshalEC(srvKey)))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	caPEM := pemEncode("CERTIFICATE", caDER)
-	return &tls.Config{Certificates: []tls.Certificate{srvCert}, MinVersion: tls.VersionTLS12}, caPEM, nil
-}
-
 // LoadCAPool reads the CA certificate mockprovider wrote, for the TEE's TLS
 // trust roots.
 func LoadCAPool() (*x509.CertPool, error) {
-	pemBytes, err := os.ReadFile(CAPEMPath())
+	pool, err := mtls.LoadCAPath(CAPEMPath())
 	if err != nil {
-		return nil, fmt.Errorf("read CA %s: %w (did mockprovider start with TLS?)", CAPEMPath(), err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pemBytes) {
-		return nil, fmt.Errorf("no certificates parsed from %s", CAPEMPath())
+		return nil, fmt.Errorf("%w (did mockprovider start with TLS?)", err)
 	}
 	return pool, nil
-}
-
-func pemEncode(typ string, der []byte) []byte {
-	return pem.EncodeToMemory(&pem.Block{Type: typ, Bytes: der})
-}
-
-func mustMarshalEC(k *ecdsa.PrivateKey) []byte {
-	b, err := x509.MarshalECPrivateKey(k)
-	if err != nil {
-		panic(err)
-	}
-	return b
 }
 
 func writeIfAbsent(path string, v any) error {

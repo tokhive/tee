@@ -66,6 +66,31 @@ func ServerMTLSConfig(serverTLS *tls.Config, clientCAPath string) (*tls.Config, 
 	return cfg, nil
 }
 
+// ClientTLSConfigWithVerifier assembles a Hub-side client config: it presents
+// the Hub's own certificate and checks the peer with verify, which is the whole
+// peer-authentication story. Hostname verification is always off — RA-TLS
+// certificates are attested keys, not DNS names — so callers differ only in
+// what their verifier accepts (a pinned leaf vs. attested evidence).
+func ClientTLSConfigWithVerifier(certFile, keyFile string, verify func([][]byte, [][]*x509.Certificate) error) (*tls.Config, error) {
+	cfg := &tls.Config{
+		InsecureSkipVerify:    true, // hostname check is irrelevant to RA-TLS
+		MinVersion:            tls.VersionTLS12,
+		VerifyPeerCertificate: verify,
+	}
+	if certFile == "" && keyFile == "" {
+		return cfg, nil
+	}
+	if certFile == "" || keyFile == "" {
+		return nil, errors.New("cert and key must be set together")
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Certificates = []tls.Certificate{cert}
+	return cfg, nil
+}
+
 // ClientMTLSConfig assembles the Hub-side client config for the Hub↔TEE
 // channel: it pins the TEE's RA-TLS certificate (or its signing CA) so the
 // handshake proves the peer is the attested TEE, and presents the Hub's own
@@ -86,49 +111,35 @@ func ClientMTLSConfig(caPEMPath, certPath, keyPath string) (*tls.Config, error) 
 	if err != nil {
 		return nil, err
 	}
-	cfg := &tls.Config{
-		InsecureSkipVerify: true, // hostname check is irrelevant to RA-TLS pinning
-		MinVersion:         tls.VersionTLS12,
-		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
-				return errors.New("tee presented no certificate")
-			}
-			leaf, err := x509.ParseCertificate(rawCerts[0])
-			if err != nil {
-				return fmt.Errorf("parse tee certificate: %w", err)
-			}
-			intermediates := x509.NewCertPool()
-			for _, raw := range rawCerts[1:] {
-				if c, err := x509.ParseCertificate(raw); err == nil {
-					intermediates.AddCert(c)
-				}
-			}
-			if _, err := leaf.Verify(x509.VerifyOptions{
-				Roots:         pool,
-				Intermediates: intermediates,
-				KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-			}); err != nil {
-				// A pin names one certificate, and an attested TEE that keeps its
-				// evidence fresh presents a new leaf on every rotation. So this is
-				// the failure that arrives hours into a run, on the first re-dial,
-				// and reads like an ordinary TLS problem. Say what it actually is,
-				// because the two causes need opposite operator actions.
-				return fmt.Errorf("tee certificate is not pinned: %w (a rotating attested TEE presents a new leaf each rotation, which no pin can name — authenticate that deployment by evidence with -tee-verify=attestation; a pin is for a peer whose epoch is fixed, such as the simulation)", err)
-			}
-			return nil
-		},
-	}
-	if certPath != "" || keyPath != "" {
-		if certPath == "" || keyPath == "" {
-			return nil, errors.New("cert and key must be set together")
+	verify := func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return errors.New("tee presented no certificate")
 		}
-		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		leaf, err := x509.ParseCertificate(rawCerts[0])
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("parse tee certificate: %w", err)
 		}
-		cfg.Certificates = []tls.Certificate{cert}
+		intermediates := x509.NewCertPool()
+		for _, raw := range rawCerts[1:] {
+			if c, err := x509.ParseCertificate(raw); err == nil {
+				intermediates.AddCert(c)
+			}
+		}
+		if _, err := leaf.Verify(x509.VerifyOptions{
+			Roots:         pool,
+			Intermediates: intermediates,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		}); err != nil {
+			// A pin names one certificate, and an attested TEE that keeps its
+			// evidence fresh presents a new leaf on every rotation. So this is
+			// the failure that arrives hours into a run, on the first re-dial,
+			// and reads like an ordinary TLS problem. Say what it actually is,
+			// because the two causes need opposite operator actions.
+			return fmt.Errorf("tee certificate is not pinned: %w (a rotating attested TEE presents a new leaf each rotation, which no pin can name — authenticate that deployment by evidence with -tee-verify=attestation; a pin is for a peer whose epoch is fixed, such as the simulation)", err)
+		}
+		return nil
 	}
-	return cfg, nil
+	return ClientTLSConfigWithVerifier(certPath, keyPath, verify)
 }
 
 // LeafCertificate returns the leaf certificate a server TLS config presents:
@@ -163,25 +174,32 @@ func LeafCertificate(cfg *tls.Config) (*x509.Certificate, error) {
 // produced: on sevsnp this is the attested RA-TLS leaf (its SPKI is the receipt
 // KeyID), on simulated it is the sim test certificate minted from the epoch key.
 func WriteTEECert(cfg *tls.Config, outPath string) error {
-	leaf, err := LeafCertificate(cfg)
+	leafPEM, err := LeafCertificatePEM(cfg)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(outPath, pemEncode("CERTIFICATE", leaf.Raw), 0o644); err != nil {
+	if err := os.WriteFile(outPath, leafPEM, 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", outPath, err)
 	}
 	return nil
+}
+
+// LeafCertificatePEM renders the leaf certificate a server TLS config presents
+// as PEM: the same bytes WriteTEECert writes to disk, for callers that hand
+// the leaf out directly (the diagnostic bootstrap endpoint).
+func LeafCertificatePEM(cfg *tls.Config) ([]byte, error) {
+	leaf, err := LeafCertificate(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return pemEncode("CERTIFICATE", leaf.Raw), nil
 }
 
 // GenHubClientCerts generates a throwaway CA and a Hub client certificate
 // signed by it. This is the Hub half of the local mTLS simulation: the TEE
 // trusts the CA and demands a client cert, the Hub presents the client cert.
 func GenHubClientCerts() (caPEM, certPEM, keyPEM []byte, err error) {
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	caTmpl := &x509.Certificate{
+	return mintCAAndLeaf(&x509.Certificate{
 		SerialNumber:          big.NewInt(101),
 		Subject:               pkix.Name{CommonName: "tokenhive-mtls-ca"},
 		NotBefore:             time.Now().Add(-time.Hour),
@@ -189,37 +207,14 @@ func GenHubClientCerts() (caPEM, certPEM, keyPEM []byte, err error) {
 		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
-	}
-	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	caCert, err := x509.ParseCertificate(caDER)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	cliKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	cliTmpl := &x509.Certificate{
+	}, &x509.Certificate{
 		SerialNumber: big.NewInt(102),
 		Subject:      pkix.Name{CommonName: "tokenhive-sim-hub"},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(FixtureLeafCertLifetime),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-	}
-	cliDER, err := x509.CreateCertificate(rand.Reader, cliTmpl, caCert, &cliKey.PublicKey, caKey)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	caPEM = pemEncode("CERTIFICATE", caDER)
-	certPEM = pemEncode("CERTIFICATE", cliDER)
-	keyPEM = pemEncode("EC PRIVATE KEY", mustMarshalEC(cliKey))
-	return caPEM, certPEM, keyPEM, nil
+	})
 }
 
 // GenMockProviderCerts generates a throwaway CA and a server certificate for
@@ -228,11 +223,7 @@ func GenHubClientCerts() (caPEM, certPEM, keyPEM []byte, err error) {
 // host can validate the provider without the CA crossing the no-sshd boundary
 // at runtime, while the cert/key deploy with the mock provider process.
 func GenMockProviderCerts() (caPEM, certPEM, keyPEM []byte, err error) {
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	caTmpl := &x509.Certificate{
+	return mintCAAndLeaf(&x509.Certificate{
 		SerialNumber:          big.NewInt(201),
 		Subject:               pkix.Name{CommonName: "tokenhive-sim-provider-ca"},
 		NotBefore:             time.Now().Add(-time.Hour),
@@ -240,6 +231,58 @@ func GenMockProviderCerts() (caPEM, certPEM, keyPEM []byte, err error) {
 		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
+	}, &x509.Certificate{
+		SerialNumber: big.NewInt(202),
+		Subject:      pkix.Name{CommonName: "tokenhive-sim-provider"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(FixtureLeafCertLifetime),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	})
+}
+
+// GenLoopbackServerCerts generates a throwaway CA and a server certificate for
+// the loopback interface, returning a TLS config for the mock provider to serve
+// with and the CA PEM for the TEE to trust.
+func GenLoopbackServerCerts() (*tls.Config, []byte, error) {
+	caPEM, certPEM, keyPEM, err := mintCAAndLeaf(&x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "tokenhive-sim-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(FixtureCACertLifetime),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}, &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(FixtureLeafCertLifetime),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}, caPEM, nil
+}
+
+// mintCAAndLeaf mints a throwaway self-signed CA and a leaf it signs, returning
+// all three as PEM. Every fixture certificate in this repository — the
+// simulation's provider and mTLS identities, the loopback server, the bundled
+// cross-host set — is this shape, so only the templates differ here.
+func mintCAAndLeaf(caTmpl, leafTmpl *x509.Certificate) (caPEM, certPEM, keyPEM []byte, err error) {
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
 	if err != nil {
@@ -249,30 +292,16 @@ func GenMockProviderCerts() (caPEM, certPEM, keyPEM []byte, err error) {
 	if err != nil {
 		return nil, nil, nil, err
 	}
-
-	srvKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	srvTmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(202),
-		Subject:      pkix.Name{CommonName: "tokenhive-sim-provider"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(FixtureLeafCertLifetime),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
-	}
-	srvDER, err := x509.CreateCertificate(rand.Reader, srvTmpl, caCert, &srvKey.PublicKey, caKey)
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, caKey)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-
-	caPEM = pemEncode("CERTIFICATE", caDER)
-	certPEM = pemEncode("CERTIFICATE", srvDER)
-	keyPEM = pemEncode("EC PRIVATE KEY", mustMarshalEC(srvKey))
-	return caPEM, certPEM, keyPEM, nil
+	return pemEncode("CERTIFICATE", caDER), pemEncode("CERTIFICATE", leafDER),
+		pemEncode("EC PRIVATE KEY", mustMarshalEC(leafKey)), nil
 }
 
 // LoadCAPath reads a PEM file into a certificate pool.
