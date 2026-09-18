@@ -26,6 +26,19 @@ import (
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
 )
 
+// Fixture certificate lifetimes. Every certificate this package mints is
+// throwaway material — the local simulation's identities, and the cross-host
+// cloudtest's fixture set (which gencerts bakes into the measured bundle and
+// deploys to the host processes). None of it is a production identity and none
+// of it is refreshed, so the windows are deliberately long: a fixture that
+// expires in the middle of an experiment turns into a TLS failure that says
+// nothing about the property under test. The CA outlives the leaves it signs,
+// so re-signing a leaf never disturbs a deployment that already pinned the CA.
+const (
+	FixtureCACertLifetime   = 10 * 365 * 24 * time.Hour
+	FixtureLeafCertLifetime = 5 * 365 * 24 * time.Hour
+)
+
 // PlatformServerTLS returns the RA-TLS server configuration the platform epoch
 // provides, or nil when the platform has none. On sevsnp the adapter hands the
 // attested RA-TLS config; on simulated the epoch mints a sim test certificate
@@ -149,7 +162,7 @@ func GenHubClientCerts() (caPEM, certPEM, keyPEM []byte, err error) {
 		SerialNumber:          big.NewInt(101),
 		Subject:               pkix.Name{CommonName: "tokenhive-mtls-ca"},
 		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
+		NotAfter:              time.Now().Add(FixtureCACertLifetime),
 		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
@@ -171,7 +184,7 @@ func GenHubClientCerts() (caPEM, certPEM, keyPEM []byte, err error) {
 		SerialNumber: big.NewInt(102),
 		Subject:      pkix.Name{CommonName: "tokenhive-sim-hub"},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
+		NotAfter:     time.Now().Add(FixtureLeafCertLifetime),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
@@ -200,7 +213,7 @@ func GenMockProviderCerts() (caPEM, certPEM, keyPEM []byte, err error) {
 		SerialNumber:          big.NewInt(201),
 		Subject:               pkix.Name{CommonName: "tokenhive-sim-provider-ca"},
 		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
+		NotAfter:              time.Now().Add(FixtureCACertLifetime),
 		IsCA:                  true,
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
@@ -222,7 +235,7 @@ func GenMockProviderCerts() (caPEM, certPEM, keyPEM []byte, err error) {
 		SerialNumber: big.NewInt(202),
 		Subject:      pkix.Name{CommonName: "tokenhive-sim-provider"},
 		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
+		NotAfter:     time.Now().Add(FixtureLeafCertLifetime),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		DNSNames:     []string{"localhost"},
