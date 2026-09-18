@@ -357,17 +357,42 @@ const (
 // Hub presents the latter with -mtls-cert/-mtls-key. Nothing here is
 // production material — it exists so the mTLS wiring can be exercised
 // end-to-end on a laptop.
+//
+// The three files are one identity, not three independent fixtures: a client
+// certificate means nothing next to a CA that did not sign it or a key that is
+// not its own. So they are treated as a set — all three present means reuse,
+// anything missing means regenerate all three. Topping up only the files that
+// are absent (what this used to do, one writePEMIfAbsent per file) can leave a
+// freshly generated CA and key beside a client certificate that survived, and
+// the mismatch then surfaces as "tls: private key does not match public key"
+// while the Hub loads its own identity — nowhere near the deletion that caused
+// it.
 func EnsureMTLSCerts() error {
+	dir := ConfigDir()
 	caPEM, certPEM, keyPEM, err := mtls.GenHubClientCerts()
 	if err != nil {
 		return err
 	}
-	for path, v := range map[string][]byte{
-		MTLSClientCAPath:   caPEM,
-		MTLSClientCertPath: certPEM,
-		MTLSClientKeyPath:  keyPEM,
-	} {
-		if err := writePEMIfAbsent(filepath.Join(ConfigDir(), path), v); err != nil {
+	files := []struct {
+		name string
+		pem  []byte
+	}{
+		{MTLSClientCAPath, caPEM},
+		{MTLSClientCertPath, certPEM},
+		{MTLSClientKeyPath, keyPEM},
+	}
+	complete := true
+	for _, f := range files {
+		if _, err := os.Stat(filepath.Join(dir, f.name)); err != nil {
+			complete = false
+			break
+		}
+	}
+	if complete {
+		return nil
+	}
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(dir, f.name), f.pem, 0o644); err != nil {
 			return err
 		}
 	}
@@ -485,16 +510,6 @@ func writeIfAbsent(path string, v any) error {
 		return nil
 	}
 	return writeJSON(path, v)
-}
-
-// writePEMIfAbsent writes raw PEM bytes — unlike writeIfAbsent, it must NOT
-// JSON-escape the payload (a quoted, \n-escaped string is not a parseable
-// certificate).
-func writePEMIfAbsent(path string, b []byte) error {
-	if _, err := os.Stat(path); err == nil {
-		return nil
-	}
-	return os.WriteFile(path, b, 0o644)
 }
 
 func writeJSON(path string, v any) error {

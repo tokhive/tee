@@ -1,11 +1,15 @@
 package shared
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 )
 
@@ -365,4 +369,93 @@ func defaultPolicy(t *testing.T) policy.Policy {
 		t.Fatalf("policy.Default: %v", err)
 	}
 	return p
+}
+
+// TestEnsureMTLSCertsWritesTheIdentityAsASet pins that the simulation's Hub
+// identity is one artifact, not three files. A client certificate means nothing
+// next to a CA that did not sign it or a key that is not its own, so a partial
+// directory must be rebuilt whole — topping up only the files that are missing
+// pairs a fresh CA and key with a surviving certificate, and the mismatch then
+// surfaces as "private key does not match public key" while the Hub loads its
+// own identity, nowhere near the deletion that caused it.
+func TestEnsureMTLSCertsWritesTheIdentityAsASet(t *testing.T) {
+	simDir := t.TempDir()
+	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
+
+	// What a partially wiped working directory leaves behind: a previous
+	// generation's certificate, with its CA and key gone.
+	_, staleCertPEM, _, err := mtls.GenHubClientCerts()
+	if err != nil {
+		t.Fatalf("GenHubClientCerts: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(simDir, MTLSClientCertPath), staleCertPEM, 0o644); err != nil {
+		t.Fatalf("write stale certificate: %v", err)
+	}
+
+	if err := EnsureMTLSCerts(); err != nil {
+		t.Fatalf("EnsureMTLSCerts: %v", err)
+	}
+
+	read := func(name string) []byte {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(simDir, name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return b
+	}
+
+	// The certificate that survived was replaced, so the CA on disk signs the
+	// certificate on disk...
+	caPEM := read(MTLSClientCAPath)
+	certPEM := read(MTLSClientCertPath)
+	if string(certPEM) == string(staleCertPEM) {
+		t.Fatal("the stale certificate was kept beside a freshly generated CA")
+	}
+	block, _ := pem.Decode(caPEM)
+	if block == nil {
+		t.Fatal("hub CA is not a PEM block")
+	}
+	ca, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse hub CA: %v", err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(ca)
+	block, _ = pem.Decode(certPEM)
+	if block == nil {
+		t.Fatal("hub certificate is not a PEM block")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse hub certificate: %v", err)
+	}
+	if _, err := cert.Verify(x509.VerifyOptions{
+		Roots:     pool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		t.Fatalf("hub certificate is not signed by the CA beside it: %v", err)
+	}
+	// ... and the key is the one that certificate belongs to.
+	if _, err := tls.LoadX509KeyPair(
+		filepath.Join(simDir, MTLSClientCertPath),
+		filepath.Join(simDir, MTLSClientKeyPath),
+	); err != nil {
+		t.Fatalf("certificate and key do not form a pair: %v", err)
+	}
+
+	// A complete set is reused, not rewritten: the TEE is already trusting this
+	// CA, and rotating it would break a running deployment.
+	before := map[string]string{}
+	for _, name := range []string{MTLSClientCAPath, MTLSClientCertPath, MTLSClientKeyPath} {
+		before[name] = string(read(name))
+	}
+	if err := EnsureMTLSCerts(); err != nil {
+		t.Fatalf("EnsureMTLSCerts (second call): %v", err)
+	}
+	for name, want := range before {
+		if got := string(read(name)); got != want {
+			t.Errorf("%s was rewritten although the set was already complete", name)
+		}
+	}
 }
