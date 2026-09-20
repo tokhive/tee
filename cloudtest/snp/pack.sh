@@ -23,6 +23,14 @@ set -euo pipefail
 # ./mtls/hub-ca.pem so the TEE accepts only that Hub CA. Runtime config (relay
 # URL, ports, bootstrap token) is injected per-launch via EC2 user-data, so the
 # measured bundle never needs a rebuild just to change routing.
+#
+# Every real-tee bundle also bakes a public root bundle as
+# ./etc/ssl/certs/ca-certificates.crt (bundle_cacerts) — the loader's sole
+# channel for giving the enclave system trust roots (SSL_CERT_FILE). Without it
+# a sevsnp TEE cannot verify any public provider. Source, in priority:
+# SNP_CA_BUNDLE (explicit PEM), else SNP_CA_IMAGE (digest-pinned alpine, default
+# matches deploy/snp-image/pins.env), else a host bundle. Build fails loudly if
+# none is reachable, so a broken TEE is never shipped silently.
 set -a; source ../.env 2>/dev/null || true; set +a
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)" 2>/dev/null || SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -110,6 +118,55 @@ bundle_policy() {
     fi
 }
 
+# bundle_cacerts bakes a real public-root bundle into the measured bundle as
+# ./etc/ssl/certs/ca-certificates.crt — the ONE channel the loader uses to give a
+# sevsnp TEE trust roots (deploy/snp-image/loader/main.go sets SSL_CERT_FILE to
+# this path). Without it the enclave has no system roots and every real provider
+# (OpenAI/Anthropic) fails upstream TLS verification — the "stream to
+# chatgpt.com:443 closed" symptom. The upstream build_bundle stages the same file
+# for its non-external bundles; cloudtest adopted its own external bundle and so
+# must bake it here or real-provider calls can never work.
+#
+# Sources, in priority: SNP_CA_BUNDLE (explicit PEM file) -> SNP_CA_IMAGE via
+# docker, defaulting to the same digest-pinned alpine as deploy/snp-image/pins.env
+# (ships the Mozilla bundle, which includes the Google Trust Services roots GTS
+# Root R1/R4 under which chatgpt.com and api.anthropic.com are issued by GTS WE1)
+# -> common host bundle paths. Digest-pinning keeps the extracted bytes (and thus
+# SNP_APP_HASH) reproducible across hosts. No reachable source leaves the bundle
+# without roots and prints a loud warning instead of silently building a TEE that
+# cannot reach any public provider.
+bundle_cacerts() {
+    local stage="$1" src="" clean=""
+    : "${SNP_CA_IMAGE:=alpine@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d}"
+    if [[ -n "${SNP_CA_BUNDLE:-}" && -f "${SNP_CA_BUNDLE}" ]]; then
+        src="${SNP_CA_BUNDLE}"
+    elif command -v docker >/dev/null 2>&1 && [[ -n "${SNP_CA_IMAGE:-}" ]]; then
+        clean="$(mktemp)"
+        if docker run --rm "${SNP_CA_IMAGE}" cat /etc/ssl/certs/ca-certificates.crt > "${clean}" 2>/dev/null \
+            && grep -q "BEGIN CERTIFICATE" "${clean}"; then
+            src="${clean}"
+        else
+            echo "[pack] warning: docker pull of ${SNP_CA_IMAGE} failed; trying host bundle"
+        fi
+    fi
+    if [[ -z "${src}" ]]; then
+        for p in /etc/ssl/certs/ca-certificates.crt \
+                 /opt/homebrew/etc/openssl@3/cert.pem \
+                 /usr/local/etc/openssl@3/cert.pem; do
+            [[ -f "${p}" && -s "${p}" ]] && { src="${p}"; break; }
+        done
+    fi
+    if [[ -z "${src}" ]]; then
+        echo "[pack] ERROR: no CA bundle source reachable (set SNP_CA_BUNDLE or SNP_CA_IMAGE); baked bundle will have NO system roots and cannot reach public providers"
+        return 1
+    fi
+    mkdir -p "${stage}/etc/ssl/certs"
+    cp "${src}" "${stage}/etc/ssl/certs/ca-certificates.crt"
+    chmod 0644 "${stage}/etc/ssl/certs/ca-certificates.crt"
+    echo "[pack] baked root CA bundle -> ./etc/ssl/certs/ca-certificates.crt"
+    [[ -n "${clean}" ]] && rm -f "${clean}"
+}
+
 build_single() {
     local stage="$1"
     echo "[pack] compiling supervisor ./app + svc/*"
@@ -120,6 +177,7 @@ build_single() {
     gobuild ./tokenhive/cmd/mockprovider "${stage}/svc/mockprovider"
     bundle_ca "${stage}"
     bundle_mp "${stage}"
+    bundle_cacerts "${stage}"
     if [[ -n "${SNP_HUB_CERT:-}" && -f "${SNP_HUB_CERT}" && -n "${SNP_HUB_KEY:-}" && -f "${SNP_HUB_KEY}" ]]; then
         cp "${SNP_HUB_CERT}" "${stage}/mtls/hub-cert.pem"
         cp "${SNP_HUB_KEY}"  "${stage}/mtls/hub-key.pem"
@@ -142,6 +200,7 @@ build() {
         gobuild ./tokenhive/cmd/tee "${stage}/app" 'sevsnp enclave osusergo netgo static_build'
         bundle_ca "${stage}"
         bundle_mp "${stage}"
+        bundle_cacerts "${stage}"
     fi
     # Stage the deployment whitelist into the measured bundle for every topology
     # so the policy covered by SNP_APP_HASH travels with the target image.
