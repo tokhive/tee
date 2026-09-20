@@ -14,10 +14,18 @@ loader from EC2 user-data, so this script encodes it as KEY=VAL lines:
     TEE_MTLS=1                         RA-TLS + demand a Hub client cert
     TEE_MTLS_CLIENT_CA=/run/bundle/mtls/hub-ca.pem
 
+The confidential instance also carries an IAM instance profile when
+TOKENHIVE_TEE_INSTANCE_PROFILE names one. That profile is what lets the TEE's
+structured logger authenticate to CloudWatch Logs on AWS; with none, the TEE
+still runs but has only its serial console to speak through, and a console is
+a few minutes deep. The profile is bound at RunInstances, so it is an input to
+launching rather than something a later call can add.
+
 Both instances share one VPC/subnet/SG. The SG additionally permits the
 cross-host ports (18085 hub relay, 18090 tee) between its own members
 (source = the SG itself), so they reach each other regardless of public IP.
 
+    TOKENHIVE_TEE_INSTANCE_PROFILE=<name> \
     python3 crosshost.py <snp-ami-id> [--host-ip <hub-public-ip>]
                           [--single] [--tee-only] [--dry-run]
 Writes crosshost.json {host:{...}, tee:{...}} and never deletes anything.
@@ -73,6 +81,19 @@ DEFAULT_RELAY_KEY = "xhost-relay-key"
 # needs a provider connection, and nothing dispatches jobs without a Hub. Pass
 # --host-ip (or edit this) to point TEE_RELAY at a real Hub.
 TEE_ONLY_RELAY_PLACEHOLDER = "ws://127.0.0.1:18085/v1/relay"
+
+# IAM instance profile for the confidential instance, by env name. On AWS the
+# TEE's structured logger ships to CloudWatch Logs through the instance role
+# (shared/logger_cloudwatch_linux.go), so an instance launched without a profile
+# cannot ship a log at all — and it cannot say so from inside the enclave, where
+# the AWS SDK builds its client happily and every ship is dropped. Naming a
+# profile here makes "the TEE's logs exist somewhere durable" a property of the
+# launch instead of something an operator has to remember separately.
+#
+# Empty (the default) launches exactly as before: no IamInstanceProfile, console
+# logs only. A name that does not exist needs no check here — RunInstances
+# rejects it outright, so there is no half-provisioned state to clean up.
+TEE_PROFILE_ENV = "TOKENHIVE_TEE_INSTANCE_PROFILE"
 
 
 def ensure_local_key() -> None:
@@ -137,7 +158,11 @@ def run_ordinary(ec2, cfg, ami_id, vpc_id, subnet_id, sg_id):
     )["Instances"][0]
 
 
-def run_confidential(ec2, cfg, ami_id, vpc_id, subnet_id, sg_id, userdata: str):
+def run_confidential(ec2, cfg, ami_id, vpc_id, subnet_id, sg_id, userdata: str, profile: str = ""):
+    # The instance profile rides in only when named: boto3 rejects
+    # IamInstanceProfile={"Name": ""}, and "no profile" has to stay the shape of
+    # a launch that never wanted one rather than a name that happens to be empty.
+    profile_arg = {"IamInstanceProfile": {"Name": profile}} if profile else {}
     return ec2.run_instances(
         ImageId=ami_id,
         InstanceType=cfg.instance_type,
@@ -156,6 +181,7 @@ def run_confidential(ec2, cfg, ami_id, vpc_id, subnet_id, sg_id, userdata: str):
         TagSpecifications=[
             {"ResourceType": "instance", "Tags": cfg.tags(name=cfg.name_prefix + "-tee")}
         ],
+        **profile_arg,
     )["Instances"][0]
 
 
@@ -267,6 +293,9 @@ def main() -> None:
     # single mode the supervisor reads TOKENHIVE_RELAY_KEY and hands it to both
     # its Hub and its tee child. Either way it matches crosshost.sh's Hub.
     relay_key = os.environ.get("TOKENHIVE_RELAY_KEY") or DEFAULT_RELAY_KEY
+    # Where the TEE's logs go on AWS. Read here rather than at the launch so the
+    # reuse branch below can compare it against what the reused instance carries.
+    tee_profile = os.environ.get(TEE_PROFILE_ENV, "").strip()
     if single:
         relay_url = ""
         relay = ""
@@ -302,9 +331,22 @@ def main() -> None:
     if tee.get("instance_id") and host_state(ec2, tee["instance_id"]) != "terminated":
         print(f"==> reusing confidential tee {tee['instance_id']} @ {tee.get('public_ip')}")
         print("  (N.B. user-data changes do not apply to a reused instance)")
+        # An instance profile is bound at RunInstances too, so a reused TEE keeps
+        # the one it launched with. Staying quiet here is how an operator adds
+        # TOKENHIVE_TEE_INSTANCE_PROFILE, watches `up` succeed, and still ends up
+        # with a TEE whose logs ship nowhere: say what it actually carries.
+        have = (describe(ec2, tee["instance_id"]).get("IamInstanceProfile") or {}).get(
+            "Arn", ""
+        ).rsplit("/", 1)[-1]
+        if have != tee_profile:
+            print(f"  (N.B. its instance profile is {have or '<none>'}, not "
+                  f"{tee_profile or '<none>'} — IamInstanceProfile is fixed at launch; "
+                  f"terminate and `up` again to change it)")
     else:
         print(f"==> launching confidential tee ({ami_id}) {cfg.instance_type} AmdSevSnp=enabled")
-        inst = run_confidential(ec2, cfg, ami_id, vpc_id, subnet_id, sg_id, userdata)
+        if tee_profile:
+            print(f"  -> IAM instance profile {tee_profile} (TEE logs -> CloudWatch)")
+        inst = run_confidential(ec2, cfg, ami_id, vpc_id, subnet_id, sg_id, userdata, tee_profile)
         inst = wait_running(ec2, inst["InstanceId"])
         tee = {
             "instance_id": inst["InstanceId"],
@@ -313,6 +355,10 @@ def main() -> None:
             "role": "tee",
             "ami_id": ami_id,
             "mode": "single" if single else ("tee-only" if tee_only else "cross-host"),
+            # Empty when the launch carried no profile. Recorded because "where
+            # does this instance's log go" is otherwise unrecoverable from the
+            # state file, and the answer differs per launch.
+            "instance_profile": tee_profile,
             # Where this tee will dial for a provider connection. Recorded so a
             # decoupled deploy is self-describing: with no ordinary host in this
             # state, nothing else on disk says which Hub address the tee aims at
