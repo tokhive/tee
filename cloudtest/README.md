@@ -109,6 +109,10 @@ hosts.json、delete_infra 只拆自己带双标签的资源（别人的/缺标�
 删除做短暂重试，避免 AWS 的异步终止导致脚手架残留（漏删）。`create` 失败时全流程
 也会尽力拆掉本轮刚建好的脚手架，不留下半成品基础设施。
 
-执行 `./run.sh` 时，远端套件会 `apt-get install ca-certificates curl`（TEE 的
-上游 TLS 走系统信任根需要 CA 证书；静态 Go 二进制本身无运行时依赖），运行结果
-以 `logs/<时间戳>/` 保留在本地。
+执行 `./run.sh` 时，远端套件会 `apt-get install ca-certificates curl`（`curl`/`apt`
+自身取包需要 CA 证书；静态 Go 二进制本身无运行时依赖）。注意这份**主机**证书包与 TEE
+的上游信任根无关：默认的 `simulated` 平台用 mockprovider 写在 `<simdir>/ca.pem` 的测试
+CA，`sevsnp` 平台用系统信任根——而那在被度量 bundle 的
+`./etc/ssl/certs/ca-certificates.crt` 里，由 loader 经 `SSL_CERT_FILE` 指给飞地；
+`-ca`/`TEE_CA` 只是在选定平台的根之上**追加**，不是替换。运行结果以
+`logs/<时间戳>/` 保留在本地。
