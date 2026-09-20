@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -467,6 +468,12 @@ func (m *ChannelManager) wrapTLS(ctx context.Context, conn net.Conn, host string
 	}
 	tconn := tls.Client(conn, tlsCfg)
 	if err := tconn.HandshakeContext(ctx); err != nil {
+		// Log the handshake failure here because nothing above it can: the
+		// error only becomes a receipt's CompletionFailed, and the Hub sees a
+		// closed relay stream and a byte count — never the reason. A trust-store
+		// mistake and a network drop are indistinguishable from outside without
+		// this line.
+		log.Printf("upstream TLS handshake to %s failed: %v", host, err)
 		_ = conn.Close()
 		return nil, err
 	}

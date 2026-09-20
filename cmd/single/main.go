@@ -190,8 +190,8 @@ func teeCmd() *exec.Cmd {
 
 func mpCmd(port int) *exec.Cmd {
 	// Serve the fixed mock-provider identity from the bundle (mp-ca.pem is also
-	// what the tee trusts via TEE_CA), republishing its CA at <simdir>/ca.pem
-	// for the agent's model-list fetch.
+	// what the tee ADDITIONALLY trusts via TEE_CA, on top of the system roots),
+	// republishing its CA at <simdir>/ca.pem for the agent's model-list fetch.
 	c := cmd("svc/mockprovider", "-addr", fmt.Sprintf("127.0.0.1:%d", port),
 		"-tls", "-stats-addr", "127.0.0.1:18081",
 		"-ca", filepath.Join(bundleDir, "mtls", "mp-ca.pem"),

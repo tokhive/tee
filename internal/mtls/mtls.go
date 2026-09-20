@@ -208,10 +208,12 @@ func GenHubClientCerts() (caPEM, certPEM, keyPEM []byte, err error) {
 }
 
 // GenMockProviderCerts generates a throwaway CA and a server certificate for
-// the mock AI provider. The CA is what the TEE must trust for the upstream TLS
-// leg; it is baked into the measured bundle (TEE_CA) so a real TEE on another
-// host can validate the provider without the CA crossing the no-sshd boundary
-// at runtime, while the cert/key deploy with the mock provider process.
+// the mock AI provider. The CA is baked into the measured bundle (TEE_CA) so a
+// real TEE on another host can validate the provider without the CA crossing
+// the no-sshd boundary at runtime, and it is added to the TEE's trust store
+// rather than substituted for it — a TEE that replaced its roots with this one
+// could not reach a real provider at all. The cert/key deploy with the mock
+// provider process.
 func GenMockProviderCerts() (caPEM, certPEM, keyPEM []byte, err error) {
 	return mintCAAndLeaf(&x509.Certificate{
 		SerialNumber:          big.NewInt(201),
@@ -296,11 +298,33 @@ func mintCAAndLeaf(caTmpl, leafTmpl *x509.Certificate) (caPEM, certPEM, keyPEM [
 
 // LoadCAPath reads a PEM file into a certificate pool.
 func LoadCAPath(path string) (*x509.CertPool, error) {
+	return AppendCAPath(x509.NewCertPool(), path)
+}
+
+// AppendCAPath adds the PEM bundle at path to pool and returns it, creating a
+// pool when pool is nil. An empty path leaves pool unchanged.
+//
+// It exists because a pool can only be EXTENDED from PEM bytes: CertPool
+// exposes no way to iterate its certificates (Subjects returns DER subject
+// names, not certificates), so merging two pools means re-reading their files.
+// Callers that hold a platform store — the system roots, say — and an extra
+// anchor to add need this; a caller that replaces instead is how a deployment
+// that names one extra CA silently loses every public root.
+//
+// A file that yields no certificate is an error rather than a no-op: a typo in
+// a trust-anchor path must not quietly leave a pool trusting something other
+// than what the operator wrote down.
+func AppendCAPath(pool *x509.CertPool, path string) (*x509.CertPool, error) {
+	if path == "" {
+		return pool, nil
+	}
 	pemBytes, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read CA %s: %w", path, err)
 	}
-	pool := x509.NewCertPool()
+	if pool == nil {
+		pool = x509.NewCertPool()
+	}
 	if !pool.AppendCertsFromPEM(pemBytes) {
 		return nil, fmt.Errorf("no certificates parsed from %s", path)
 	}

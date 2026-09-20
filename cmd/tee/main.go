@@ -17,11 +17,12 @@
 //	                      has no evidence cache to fetch from). Production sets
 //	                      false and resolves EvidenceHash via the evidence
 //	                      retrieval path (see the C4 checklist, §8).
-//	-ca <path>            root CA PEM for the upstream (provider) TLS; empty in
-//	                      sevsnp mode means the system trust store, which is
-//	                      what production wants for api.openai.com etc. The
-//	                      simulated default keeps loading the sim test CA so
-//	                      the harness stays hermetic.
+//	-ca <path>            extra root CA PEM for the upstream (provider) TLS,
+//	                      ADDED to the platform's own roots: the system trust
+//	                      store on sevsnp (what production wants for
+//	                      api.openai.com etc.), or the sim test CA on the
+//	                      simulated platform, which keeps the harness hermetic.
+//	                      Empty means the platform's roots alone.
 //
 // The Hub↔TEE channel is deliberately separate: local sims run plain HTTP, and
 // production enables mTLS at the listener using the platform adapter's
@@ -38,6 +39,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
@@ -93,7 +95,7 @@ func main() {
 	seqPath := flag.String("seq", os.Getenv("TEE_SEQ"), "ProviderSeq store file (default <simdir>/seqstore.json)")
 	platformName := flag.String("platform", rootShared.GetEnvOrDefault("TEE_PLATFORM", defaultPlatform), "attestation platform: simulated, sevsnp")
 	includeEvidence := flag.Bool("evidence", rootShared.GetEnvBoolOrDefault("TEE_EVIDENCE", true), "embed attestation evidence in every receipt (false = resolve EvidenceHash via evidence retrieval)")
-	caFile := flag.String("ca", os.Getenv("TEE_CA"), "root CA PEM for provider TLS; empty = sim test CA on simulated, system roots on sevsnp")
+	caFile := flag.String("ca", os.Getenv("TEE_CA"), "extra root CA PEM for provider TLS, added to the platform's roots (system store on sevsnp, sim test CA on simulated); empty = platform roots alone")
 	serveMTLS := flag.Bool("mtls", rootShared.GetEnvBoolOrDefault("TEE_MTLS", false), "serve the Hub-facing API over mutual TLS: the platform's RA-TLS server certificate (sevsnp) or the sim test certificate (simulated), demanding a Hub client certificate")
 	mtlsClientCA := flag.String("mtls-client-ca", rootShared.GetEnvOrDefault("TEE_MTLS_CLIENT_CA", ""), "PEM CA(s) that sign Hub client certificates; empty defaults to <simdir>/hub-ca.pem (required with -mtls)")
 	// On an SNP instance the deployment whitelist is baked inside the measured
@@ -351,29 +353,85 @@ func relayHeaders(key string) http.Header {
 
 // upstreamTLSConfig returns the TLS trust roots for provider connections.
 //
-// The simulated platform loads the throwaway test CA mockprovider generates,
-// keeping the local harness hermetic. sevsnp (production) uses the system
-// trust store — api.openai.com and friends sign with public CAs — unless an
-// explicit -ca file overrides it.
+// The store is always "the platform's roots, plus whatever -ca adds" — never
+// "whatever -ca names, and nothing else". crypto/tls gives a non-nil RootCAs
+// pool the place of the system store outright, so a replacement makes a
+// deployment that names one extra CA unable to validate any public provider.
+// The failure is invisible from either end: the handshake is a single flight
+// (ClientHello out, ServerHello + certificate back) that then dies in
+// certificate verification, so the far side observes only a closed stream with
+// an HTTP-request-sized hole in the byte count, which is exactly what the Hub
+// reports as "sent N bytes upstream, received M bytes".
+//
+// sevsnp (production) roots are the system trust store, which the SNP loader
+// points at the measured bundle's ca-certificates.crt via SSL_CERT_FILE (see
+// deploy/snp-image/loader). simulated roots are the throwaway CA mockprovider
+// generated, which keeps the local harness hermetic. -ca adds a PEM bundle on
+// top of either, which is what a deployment wants while a test provider and
+// real ones are both in play.
 func upstreamTLSConfig(platformName, caFile string) (*tls.Config, error) {
-	switch {
-	case caFile != "":
-		pool, err := mtls.LoadCAPath(caFile)
-		if err != nil {
-			return nil, err
-		}
-		return &tls.Config{RootCAs: pool}, nil
-
-	case platformName == "sevsnp":
-		// System trust store: the ChannelManager treats a nil TLSClientConfig
-		// as platform defaults, so nil is the explicit "system roots" choice.
-		return nil, nil
-
-	default:
-		pool, err := shared.LoadCAPool()
-		if err != nil {
-			return nil, err
-		}
-		return &tls.Config{RootCAs: pool}, nil
+	pool, source, err := baseRootPool(platformName)
+	if err != nil {
+		return nil, err
 	}
+	pool, err = mtls.AppendCAPath(pool, caFile)
+	if err != nil {
+		return nil, err
+	}
+	if caFile != "" {
+		source += " + " + caFile
+	}
+	logUpstreamRoots(source, pool)
+
+	// The pool is handed over even when -ca named nothing. Materialising the
+	// platform's roots is what lets the line above publish an anchor count, so a
+	// missing or empty trust store becomes a number this process names at
+	// startup instead of a handshake failure someone has to reverse-engineer
+	// from a byte count. A nil pool would mean the same store either way — it
+	// only costs the diagnosis.
+	return &tls.Config{RootCAs: pool}, nil
+}
+
+// baseRootPool returns the platform's own trust anchors plus a name for where
+// they came from. It never returns nil, so a merge always has something to
+// merge into and the anchor count above is always a real number.
+func baseRootPool(platformName string) (*x509.CertPool, string, error) {
+	if platformName == "sevsnp" {
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, "", fmt.Errorf("system trust store: %w", err)
+		}
+		// On Linux crypto/x509 reads exactly SSL_CERT_FILE when it is set, and
+		// the loader sets it to the measured bundle's ca-certificates.crt. Name
+		// it: when this path is missing, the pool is silently empty and every
+		// upstream handshake fails in verification.
+		return pool, "system roots (SSL_CERT_FILE=" + os.Getenv("SSL_CERT_FILE") + ")", nil
+	}
+	pool, err := shared.LoadCAPool()
+	if err != nil {
+		return nil, "", err
+	}
+	return pool, "simulated test CA (" + shared.CAPEMPath() + ")", nil
+}
+
+// logUpstreamRoots publishes the trust store provider certificates are
+// validated against, once, at startup.
+//
+// It is worth a permanent line because every other signal for getting this
+// wrong is silent: the failure reaches the Hub as a closed stream and a byte
+// count, the far side as a bare ClientHello, and the TEE's own transport error
+// only as a receipt's CompletionFailed. An anchor count is the one number that
+// separates "the roots are wrong" from "the network is wrong", and it is the
+// first thing to look at when an upstream connection dies mid-handshake.
+func logUpstreamRoots(source string, pool *x509.CertPool) {
+	anchors := 0
+	if pool != nil {
+		anchors = len(pool.Subjects())
+	}
+	if anchors == 0 {
+		log.Printf("upstream TLS trust: %s -> 0 anchors: no provider certificate can verify; "+
+			"every upstream connection will fail in the handshake after sending only a ClientHello", source)
+		return
+	}
+	log.Printf("upstream TLS trust: %s -> %d anchors", source, anchors)
 }

@@ -287,8 +287,12 @@ def main() -> None:
         "TEE_PLATFORM=sevsnp\n"
         "TEE_MTLS=1\n"
         "TEE_MTLS_CLIENT_CA=/run/bundle/mtls/hub-ca.pem\n"
-        # The mock provider's CA rides in the measured bundle: the TEE trusts it
-        # for the upstream TLS leg, which is otherwise system roots on sevsnp.
+        # The mock provider's CA rides in the measured bundle and is ADDED to the
+        # TEE's upstream trust store, which is the system roots on sevsnp. It is
+        # an addition, not a substitution: TEE_CA naming this CA must not stop
+        # the TEE validating a real provider (chatgpt.com/api.anthropic.com),
+        # which is what a replacing trust store would do — the handshake would
+        # die in certificate verification having sent only a ClientHello.
         "TEE_CA=/run/bundle/mtls/mp-ca.pem\n"
     )
     if single:
