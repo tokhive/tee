@@ -3,7 +3,10 @@ package hub
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -11,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
@@ -94,4 +98,144 @@ func TestCredentialKeyCoalescesAConnectingFleet(t *testing.T) {
 
 func sameKey(a, b tee.InboxPublic) bool {
 	return a.KeyID == b.KeyID && bytes.Equal(a.PublicKey, b.PublicKey)
+}
+
+// retiredRefusal is what the TEE's listener answers when a rotation retired the
+// connection a request arrived on. The body is the peer-facing half; the header
+// is the machine-readable one.
+const retiredRefusal = "connection belongs to a retired attestation epoch; reconnect"
+
+// requestCloseRecorder records, per attempt, whether the client asked for a
+// connection of its own rather than one out of its pool. The retry below must
+// set that flag: every pooled connection to a TEE that rotates is one the
+// rotation may have just retired, and the pool does not know it yet.
+type requestCloseRecorder struct {
+	base http.RoundTripper
+
+	mu         sync.Mutex
+	perAttempt []bool
+}
+
+func (r *requestCloseRecorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.mu.Lock()
+	r.perAttempt = append(r.perAttempt, req.Close)
+	r.mu.Unlock()
+	return r.base.RoundTrip(req)
+}
+
+func (r *requestCloseRecorder) attempts() []bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]bool(nil), r.perAttempt...)
+}
+
+// writeExecuteStream answers with a minimal well-formed execute response: one
+// response-start frame, one chunk, one receipt. That is everything
+// HTTPTEE.Execute reads before returning, and nothing here is verified — the
+// tests below are about the HTTP path, not about signatures.
+func writeExecuteStream(t *testing.T, w http.ResponseWriter, chunk []byte) {
+	t.Helper()
+	receipt, err := proof.SignedReceipt{}.EncodeCanonical()
+	if err != nil {
+		t.Errorf("encode receipt: %v", err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "event: %s\ndata: {\"status\":200}\n\n", tee.EventStart)
+	fmt.Fprintf(w, "data: %s\n\n", chunk)
+	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", tee.EventReceipt, base64.StdEncoding.EncodeToString(receipt))
+}
+
+// TestExecuteRetriesTheConnectionARotationRetired is the property that keeps a
+// rotation invisible to buyers. A healthy rotation retires the connections it
+// finds idle, and a Hub that reaches for one in that same instant is refused —
+// not because anything is wrong, but because the connection it was holding
+// belonged to the previous attested epoch. That refusal is safe to retry (the
+// TEE's guard answers before the service allocates a sequence number, spends a
+// credential, or reaches a provider), so the Hub must retry it rather than
+// surface a failure it can fix by itself.
+func TestExecuteRetriesTheConnectionARotationRetired(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			w.Header().Set(tee.EpochRetiredHeader, "1")
+			http.Error(w, retiredRefusal, http.StatusServiceUnavailable)
+			return
+		}
+		writeExecuteStream(t, w, []byte("hello"))
+	}))
+	defer srv.Close()
+
+	recorder := &requestCloseRecorder{base: srv.Client().Transport}
+	client := &HTTPTEE{URL: srv.URL, Client: &http.Client{Transport: recorder}}
+
+	relayed := 0
+	res, err := client.Execute(context.Background(), testSpec(testProvider, "m"), nil, func([]byte) error {
+		relayed++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("a retired connection reached the caller as a failure: %v", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("TEE saw %d attempts, want 2 (one refusal, one retry)", got)
+	}
+	if relayed != 1 {
+		t.Fatalf("onChunk ran %d times, want 1: a retry must not replay bytes the caller already took", relayed)
+	}
+	if len(res.Chunks) != 1 || string(res.Chunks[0]) != "hello" {
+		t.Fatalf("retry produced %q, want one \"hello\" chunk", res.Chunks)
+	}
+	if got := recorder.attempts(); len(got) != 2 || got[0] || !got[1] {
+		t.Fatalf("attempts asked for their own connection %v, want [false true]: the retry must leave the pool behind", got)
+	}
+}
+
+// TestExecuteDoesNotRetryARefusalItCannotAttribute is the boundary of the
+// retry. Only the rotation's own refusal carries the marker, and only the TEE's
+// listener can produce it before the service runs. An unmarked 503 might be
+// anything — including a refusal that was answered after the job had already
+// executed — so retrying it could execute and bill the same job twice.
+func TestExecuteDoesNotRetryARefusalItCannotAttribute(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		http.Error(w, "listen tcp: too many open files", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	client := &HTTPTEE{URL: srv.URL, Client: srv.Client()}
+	_, err := client.Execute(context.Background(), testSpec(testProvider, "m"), nil, nil)
+	if err == nil {
+		t.Fatal("an unmarked 503 was reported as success")
+	}
+	if errors.Is(err, errEpochRetired) {
+		t.Fatal("an unmarked 503 was mistaken for a retired connection")
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("an unattributable refusal was retried: %d attempts, want 1", got)
+	}
+}
+
+// TestExecuteRetriesARetiredConnectionOnce bounds the retry. A TEE that keeps
+// retiring connections has something else wrong with it, and the Hub's attempt
+// budget is the Hub's to spend — not the transport's to loop on.
+func TestExecuteRetriesARetiredConnectionOnce(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set(tee.EpochRetiredHeader, "1")
+		http.Error(w, retiredRefusal, http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	client := &HTTPTEE{URL: srv.URL, Client: srv.Client()}
+	_, err := client.Execute(context.Background(), testSpec(testProvider, "m"), nil, nil)
+	if !errors.Is(err, errEpochRetired) {
+		t.Fatalf("err = %v, want the retired-epoch refusal", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("TEE saw %d attempts, want exactly 2", got)
+	}
 }

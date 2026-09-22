@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
 )
 
 // epochConnections retires the connections a rotation leaves behind.
@@ -73,6 +75,13 @@ func (e *epochConnections) accept(ctx context.Context, c net.Conn) context.Conte
 // or an upstream exchange on a receipt the Hub would refuse anyway. Answering
 // 503 says what is true — this connection is retired, open another — and costs
 // the peer a reconnect rather than a request it was charged for.
+//
+// The 503 carries tee.EpochRetiredHeader so the Hub can tell this refusal from
+// any other 503 and retry it on a fresh connection. Without the marker a Hub
+// could only guess, and guessing wrong is expensive: retrying a refusal the
+// service had already acted on would execute — and bill — the same job twice.
+// The marker is what makes the retry safe to automate, because nothing behind
+// this handler has run for that request.
 func (e *epochConnections) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if epoch, stamped := r.Context().Value(acceptedEpoch{}).(int64); stamped && epoch != e.current.Load() {
@@ -81,6 +90,7 @@ func (e *epochConnections) guard(next http.Handler) http.Handler {
 			if r.ProtoMajor == 1 {
 				w.Header().Set("Connection", "close")
 			}
+			w.Header().Set(tee.EpochRetiredHeader, "1")
 			http.Error(w, "connection belongs to a retired attestation epoch; reconnect", http.StatusServiceUnavailable)
 			return
 		}

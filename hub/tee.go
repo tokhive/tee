@@ -27,6 +27,12 @@ var (
 	// ErrTEERefused means the TEE answered with an error frame: it declined
 	// the job before touching a credential.
 	ErrTEERefused = errors.New("tee refused the job")
+	// errEpochRetired marks the one 503 a rotating TEE sends on purpose: the
+	// connection this request arrived on was retired between its last use and
+	// this request. Execute consumes it and retries; no caller sees it. It is
+	// an error value rather than a status check so the retry cannot be lost
+	// inside a wrap.
+	errEpochRetired = errors.New("tee retired the attestation epoch this connection belongs to")
 )
 
 // Result is what one call to the TEE produced.
@@ -151,6 +157,21 @@ type credentialKeyCall struct {
 }
 
 // Execute implements TEE.
+//
+// A request the TEE refuses because a rotation retired the connection under it
+// is retried once, transparently, on a connection the client's pool cannot
+// have handed over. That refusal is the only failure a healthy rotation can
+// put in front of a buyer, and it is retryable by construction rather than by
+// judgement: epochConnections.guard answers before the service runs, so the
+// refused attempt allocated no sequence number, spent no credential, and never
+// reached a provider — and since the refusal is an HTTP status rather than a
+// stream, no byte ever reached onChunk. Retrying it is therefore exactly as
+// safe as the first attempt, and far cheaper than handing the buyer a failure
+// the TEE caused by keeping its own evidence fresh.
+//
+// Every other failure is returned as it was. In particular a transport error
+// on a connection that was already in flight is NOT retried: there the service
+// may well have executed and billed the job, and a retry would do it twice.
 func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onChunk func([]byte) error, onStart ...func(tee.Response)) (Result, error) {
 	if t.URL == "" {
 		return Result{}, errors.New("hub: TEE URL is empty")
@@ -159,11 +180,24 @@ func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onCh
 	if err != nil {
 		return Result{}, fmt.Errorf("encode execute request: %w", err)
 	}
+	res, err := t.execute(ctx, enc, false, onChunk, onStart...)
+	if !errors.Is(err, errEpochRetired) {
+		return res, err
+	}
+	return t.execute(ctx, enc, true, onChunk, onStart...)
+}
+
+// execute performs one dispatch. freshConnection routes this request around the
+// client's connection pool, which is what the retry above needs: every pooled
+// connection to a rotating TEE is one the rotation may have retired, and the
+// pool does not learn that until it tries to use them.
+func (t *HTTPTEE) execute(ctx context.Context, enc []byte, freshConnection bool, onChunk func([]byte) error, onStart ...func(tee.Response)) (Result, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.URL, bytes.NewReader(enc))
 	if err != nil {
 		return Result{}, err
 	}
 	req.Header.Set("Content-Type", tee.ExecuteContentType)
+	req.Close = freshConnection
 
 	client := t.Client
 	if client == nil {
@@ -177,7 +211,11 @@ func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onCh
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return Result{}, fmt.Errorf("tee http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		message := strings.TrimSpace(string(b))
+		if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(tee.EpochRetiredHeader) != "" {
+			return Result{}, fmt.Errorf("%w: %s", errEpochRetired, message)
+		}
+		return Result{}, fmt.Errorf("tee http %d: %s", resp.StatusCode, message)
 	}
 	return readSSE(resp.Body, onChunk, onStart...)
 }

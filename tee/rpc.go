@@ -48,6 +48,14 @@ const (
 	// case loses the reason; they are deliberately distinct.
 	EventError = "error"
 
+	// EpochRetiredHeader marks the one 503 a TEE sends on purpose: the request
+	// arrived over a connection whose attested epoch a rotation has already
+	// replaced. It exists so a Hub can tell that refusal from any other 503 and
+	// retry it — safely, because the listener answers it before the service
+	// allocates a sequence number, spends a credential, or reaches a provider,
+	// and before a single byte reaches an onChunk callback.
+	EpochRetiredHeader = "X-TokenHive-Epoch-Retired"
+
 	// MaxExecuteBody bounds the canonical-CBOR ExecuteRequest the TEE will
 	// read. A job spec plus its request body is small; a caller declaring a
 	// gigabyte is not submitting a job, it is attempting to exhaust the
