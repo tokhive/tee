@@ -118,4 +118,5 @@ Local tool check (no S3/VM import needed for this): `installed() { command -v %s
 - `launch.py` — idempotent infra + launch the confidential instance; writes `hosts.json`.
 - `snp.sh` — orchestrator (`build|up|status|verify|down|delete-infra`, `--dry-run`).
 - `iam/aws-snp-policy.json` — the precise EC2/S3/VM-import permissions.
-- `tests/` — local unit tests (no AWS): bundle determinism, tar layout, tag-deletion safety.
+- `tests/` — local unit tests (no AWS): bundle determinism, tar layout, tag-deletion safety,
+  and the swap wiring (`up --new` forwards the flag; `down --superseded` goes through `retire.py`).

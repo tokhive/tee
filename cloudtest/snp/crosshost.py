@@ -27,9 +27,9 @@ cross-host ports (18085 hub relay, 18090 tee) between its own members
 
     TOKENHIVE_TEE_INSTANCE_PROFILE=<name> \
     python3 crosshost.py <snp-ami-id> [--host-ip <hub-public-ip>]
-                          [--single] [--tee-only] [--dry-run]
-Writes crosshost.json {host:{...}, tee:{...}} and never deletes anything.
-Refuses to run without TOKENHIVE_USER.
+                          [--single] [--tee-only] [--new] [--dry-run]
+Writes crosshost.json {host:{...}, tee:{...}, superseded:[...]} and never
+deletes anything. Refuses to run without TOKENHIVE_USER.
 
 --single launches ONLY the confidential tee, running the whole loop (tee + Hub +
 agent + mockprovider) inside that one instance through the supervisor bundle
@@ -41,7 +41,21 @@ The tee still needs a Hub TeeRelay URL in TEE_RELAY, but with no Hub there is
 nothing to dial — the relay connection is lazy (dialed only when a provider
 connection is needed), so a placeholder is harmless at boot. Pass --host-ip to
 aim TEE_RELAY at a real Hub instead of the placeholder.
+
+--new launches a fresh confidential instance even when a live one is recorded,
+WITHOUT terminating the recorded one: the old record is moved to
+`superseded` in crosshost.json and the old instance keeps running. That is what
+makes a swap not block on instance termination — bring the new tee up, repoint
+the Hub at it, and retire the old one afterwards with `crosshost.sh down
+--superseded` (see retire.py). The reciprocal invariant is the important half:
+this script never terminates an instance on any path, so no `up` can destroy the
+machine it is replacing.
 """
+
+# Annotations stay unevaluated (as in aws.py): the operator-facing way to run
+# these scripts is a bare `python3`, and `dict | None` is a TypeError at import
+# time before 3.10 — a syntax-level trap rather than a graceful failure.
+from __future__ import annotations
 
 import base64
 import json
@@ -50,6 +64,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # cloudtest dir
 
@@ -94,6 +109,50 @@ TEE_ONLY_RELAY_PLACEHOLDER = "ws://127.0.0.1:18085/v1/relay"
 # logs only. A name that does not exist needs no check here — RunInstances
 # rejects it outright, so there is no half-provisioned state to clean up.
 TEE_PROFILE_ENV = "TOKENHIVE_TEE_INSTANCE_PROFILE"
+
+# The instance states a recorded instance may be ADOPTED in. Adoption is a
+# promise that the recorded machine can serve this run, so the only states that
+# qualify are the ones where it is on its way up or already up.
+#
+# "shutting-down" is deliberately absent, and that is the whole point: a record
+# written before a termination still names the dying instance, and adopting it
+# prints a reassuring "reusing confidential tee i-…", launches nothing, and
+# then stamps the NEW app digest onto a machine that is seconds from vanishing —
+# a state file that looks correct and points at nothing (observed 2026-09-22).
+# "stopping"/"stopped" are excluded for the same reason: neither is serving, and
+# neither will come back on its own.
+REUSABLE_STATES = ("pending", "running")
+
+
+def adoptable(record: dict, state: str) -> bool:
+    """Whether a recorded instance exists in a state this run may adopt."""
+    return bool((record or {}).get("instance_id")) and state in REUSABLE_STATES
+
+
+def recorded_state(ec2, record: dict) -> str:
+    """Instance state of a record, or "" when the record names no instance."""
+    iid = (record or {}).get("instance_id")
+    return host_state(ec2, iid) if iid else ""
+
+
+def supersede(state: dict, now: str) -> dict | None:
+    """Move the recorded tee under `superseded`, returning the old record.
+
+    A `--new` launch replaces the tee record, and the record is the ONLY thing
+    that names the instance the operator still has to terminate — so it moves
+    rather than disappears. Nothing is terminated here: launching and deleting
+    are separate programs on purpose (see retire.py), so no path through a
+    `up` can destroy the machine it is replacing.
+    """
+    old = state.pop("tee", None)
+    if not old or not old.get("instance_id"):
+        return None
+    state.setdefault("superseded", []).append(dict(old, superseded_at=now))
+    return old
+
+
+def save_state(state: dict) -> None:
+    HOSTS_FILE.write_text(json.dumps(state, indent=2) + "\n")
 
 
 def ensure_local_key() -> None:
@@ -189,12 +248,13 @@ def main() -> None:
     dry_run = "--dry-run" in sys.argv[1:]
     single = "--single" in sys.argv[1:]
     tee_only = "--tee-only" in sys.argv[1:]
+    fresh = "--new" in sys.argv[1:]
     if single and tee_only:
         sys.exit("--single and --tee-only are mutually exclusive")
     # "no ordinary host" covers both --single (whole loop in the tee) and
     # --tee-only (a bare cross-host tee, no Hub anywhere).
     no_host = single or tee_only
-    args = [a for a in sys.argv[1:] if a not in ("--dry-run", "--single", "--tee-only")]
+    args = [a for a in sys.argv[1:] if a not in ("--dry-run", "--single", "--tee-only", "--new")]
     host_ip = None
     ami_id = None
     i = 0
@@ -210,7 +270,8 @@ def main() -> None:
     # --host-ip is optional: the ordinary host is launched first and its public
     # ip feeds the tee's relay URL automatically when not supplied.
     if not ami_id:
-        sys.exit("usage: python3 crosshost.py <snp-ami-id> [--host-ip <hub-public-ip>] [--single] [--dry-run]")
+        sys.exit("usage: python3 crosshost.py <snp-ami-id> [--host-ip <hub-public-ip>] "
+                 "[--single] [--tee-only] [--new] [--dry-run]")
     cfg = load()
     if not cfg.user:
         sys.exit("TOKENHIVE_USER is empty; refusing to launch untagged instances")
@@ -228,7 +289,9 @@ def main() -> None:
         label = "confidential tee (single-mode)" if single else (
             "confidential tee only (tee-only, no ordinary host)" if tee_only
             else "ordinary-host + confidential-tee")
-        print(f"==> dry-run: would launch {label}; nothing launched")
+        print(f"==> dry-run: would launch {label}"
+              + (" (fresh, recorded tee kept running as `superseded`)" if fresh else "")
+              + "; nothing launched")
         return
 
     # Leftover from a previous interrupted run must not double-launch: load any
@@ -250,7 +313,7 @@ def main() -> None:
         host = {}
     else:
         host = state.get("host") or {}
-    if not no_host and host.get("instance_id") and host_state(ec2, host["instance_id"]) != "terminated":
+    if not no_host and adoptable(host, recorded_state(ec2, host)):
         print(f"==> reusing ordinary host {host['instance_id']} @ {host.get('public_ip')}")
     elif not no_host:
         host_ami = latest_ami(ec2, cfg)
@@ -265,7 +328,7 @@ def main() -> None:
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
         state["host"] = host
-        HOSTS_FILE.write_text(json.dumps(state, indent=2) + "\n")
+        save_state(state)
 
     host_ip = host_ip or host.get("public_ip", "")
     if not no_host:
@@ -328,7 +391,28 @@ def main() -> None:
         userdata += f"TOKENHIVE_RELAY_KEY={relay_key}\n"
         userdata += "TOKENHIVE_SUPERVISE=1\n"
         print("==> single-instance mode: whole loop inside the confidential tee")
-    if tee.get("instance_id") and host_state(ec2, tee["instance_id"]) != "terminated":
+    # --new, or a recorded tee that is on its way out, both mean the same thing
+    # to the branch below: there is no instance here to adopt, so launch one.
+    # Neither case terminates the old machine — it keeps running and keeps its
+    # record, which is what lets the operator repoint the Hub with no window in
+    # which the old tee is gone and the new one is not serving yet.
+    if fresh and tee.get("instance_id"):
+        old = supersede(state, time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        save_state(state)
+        print(f"==> --new: recorded tee {old['instance_id']} @ {old.get('private_ip')} "
+              f"stays RUNNING (moved to `superseded`; nothing was terminated)")
+        print("    it keeps serving the Hub until the Hub is repointed, so this launch and")
+        print("    the Hub's repoint do not have to wait for any termination; retire it after")
+        print("    the repoint with './crosshost.sh down --superseded'")
+        tee = {}
+    # One lookup, used for both the diagnosis and the decision: a recorded
+    # instance in any other state — most importantly shutting-down — is never
+    # adopted, and naming the state is how an operator sees why a fresh instance
+    # was launched instead of the one the state file names.
+    tee_state = recorded_state(ec2, tee)
+    if tee.get("instance_id") and tee_state not in REUSABLE_STATES:
+        print(f"==> recorded tee {tee['instance_id']} is {tee_state}; not adoptable, launching fresh")
+    if adoptable(tee, tee_state):
         print(f"==> reusing confidential tee {tee['instance_id']} @ {tee.get('public_ip')}")
         print("  (N.B. user-data changes do not apply to a reused instance)")
         # An instance profile is bound at RunInstances too, so a reused TEE keeps
@@ -342,6 +426,7 @@ def main() -> None:
             print(f"  (N.B. its instance profile is {have or '<none>'}, not "
                   f"{tee_profile or '<none>'} — IamInstanceProfile is fixed at launch; "
                   f"terminate and `up` again to change it)")
+        print("  (N.B. to launch a replacement while leaving this one running, use --new)")
     else:
         print(f"==> launching confidential tee ({ami_id}) {cfg.instance_type} AmdSevSnp=enabled")
         if tee_profile:
@@ -367,7 +452,7 @@ def main() -> None:
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
         state["tee"] = tee
-        HOSTS_FILE.write_text(json.dumps(state, indent=2) + "\n")
+        save_state(state)
 
     print("==> wrote crosshost.json")
     if single:
@@ -379,17 +464,35 @@ def main() -> None:
         print(f"==> host {host['instance_id']} @ {host['public_ip']}")
         print(f"==> tee  {tee['instance_id']} @ {tee.get('public_ip')}")
         print(f"==> tee relay {relay_url}; inspect the leaf over mTLS with ./crosshost.sh fetch")
+    superseded = state.get("superseded") or []
+    if superseded:
+        print("==> superseded, still RUNNING (nothing terminated): "
+              + ", ".join(e.get("instance_id", "?") for e in superseded))
+        print("    once the Hub points at the tee above: ./crosshost.sh down --superseded --dry-run")
+        print("    then: ./crosshost.sh down --superseded")
 
 
 def describe(ec2, iid: str) -> dict:
     """Describe one instance; {} when it no longer exists.
 
     A record in crosshost.json can outlive its instance (it was terminated, or
-    purged after the retention window). describe_instances then returns no
-    Reservations, so callers must treat "absent" as a first-class state instead
-    of indexing an empty list.
+    purged after the retention window). Past AWS' ~1h retention window
+    describe_instances does not return an empty Reservations list, it raises
+    InvalidInstanceID — so "absent" has two shapes and both must collapse to {}
+    here, or a caller that is deciding whether a recorded machine is still
+    adoptable gets a traceback instead of an answer.
+
+    Only InvalidInstanceID is absorbed. Auth/throttling failures still raise:
+    reading them as "absent" would launch a duplicate machine while the real one
+    is unreachable rather than gone.
     """
-    res = ec2.describe_instances(InstanceIds=[iid]).get("Reservations", [])
+    try:
+        res = ec2.describe_instances(InstanceIds=[iid]).get("Reservations", [])
+    except Exception as e:
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code not in ("InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed"):
+            raise
+        return {}
     for r in res:
         for i in r.get("Instances", []):
             return i
