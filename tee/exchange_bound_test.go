@@ -9,6 +9,8 @@ import (
 	"time"
 
 	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
 	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
 )
 
@@ -278,6 +280,182 @@ func TestExchangeIsRefusedWhenNoFresherEpochExists(t *testing.T) {
 	}
 	if len(transport.sent(t)) != 1 {
 		t.Fatal("the exchange did not reach the provider, so this test is not exercising the fail-safe")
+	}
+}
+
+// stallTransport delivers a prefix and then holds the exchange open until the
+// caller's context ends: a provider stream still in progress. It is the
+// exchange counterpart of blockingSessionConn — the difference between an
+// exchange the provider finished and one the TEE cut is visible only in whether
+// a receipt exists and what it says.
+type stallTransport struct {
+	prefix [][]byte
+}
+
+func (b *stallTransport) Do(ctx context.Context, req Request, onChunk func([]byte) error, onStart ...StartFunc) (Response, error) {
+	resp := Response{StatusCode: 200}
+	if len(onStart) > 0 && onStart[0] != nil {
+		onStart[0](resp)
+	}
+	for _, chunk := range b.prefix {
+		if onChunk == nil {
+			continue
+		}
+		if err := onChunk(chunk); err != nil {
+			return resp, err
+		}
+	}
+	<-ctx.Done()
+	return resp, ctx.Err()
+}
+
+// liveSpec builds a spec valid at the wall clock for tests that run on it:
+// the default helper pins expiry to baseTime, which ValidateAt with time.Now
+// would refuse before the exchange even reaches the transport.
+func liveSpec(t *testing.T, env *testEnv, body []byte) jobs.Spec {
+	t.Helper()
+	spec := env.spec(t, body)
+	spec.ExpiresAt = time.Now().Add(5 * time.Minute).Unix()
+	return spec
+}
+
+func livePolicy() envOption {
+	return withPolicy(func(p *policy.Policy) {
+		p.IssuedAt = time.Now().Add(-time.Hour).Unix()
+		p.ExpiresAt = time.Now().Add(time.Hour).Unix()
+	})
+}
+
+// TestExchangeCutWhenNoFresherEpochKeepsItBillable is the stop-loss: a provider
+// stream still running when the live signer's budget runs out with no rotation
+// behind it must end as a truncated receipt for the bytes that did arrive —
+// relayed, paid for upstream, priceable — not as the fail-closed refusal that
+// settles nothing. The cancel lands signingHandoff before the deadline, so the
+// receipt is signed under evidence verifiers still accept.
+//
+// It runs on the wall clock like the session deadline tests: the deadline is a
+// real instant and a pinned one would never arrive.
+func TestExchangeCutWhenNoFresherEpochKeepsItBillable(t *testing.T) {
+	transport := &stallTransport{prefix: [][]byte{[]byte("event: a\n\n")}}
+	epoch := epochWithNitroLeaf(t, time.Now().Add(rootShared.SNPSigningMargin+3*time.Second))
+	env := newTestEnv(t,
+		withSigner(epoch),
+		withTransport(transport),
+		withClock(time.Now),
+		livePolicy(),
+	)
+	body := []byte(`{"model":"m"}`)
+	spec := liveSpec(t, env, body)
+
+	start := time.Now()
+	result, err := env.service.Execute(context.Background(), Job{Spec: spec, Body: body}, nil)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("stalled exchange with no rotation = %v, want a truncated receipt", err)
+	}
+	if result == nil {
+		t.Fatal("no result for an exchange cut while the provider was streaming")
+	}
+	if !result.Truncated || result.Receipt.Receipt.Completion != proof.CompletionTruncated {
+		t.Fatalf("completion = %q truncated = %t, want the delivered prefix attested as truncated",
+			result.Receipt.Receipt.Completion, result.Truncated)
+	}
+	if string(result.Receipt.Receipt.Attestation.KeyID) != string(epoch.identity.KeyID[:]) {
+		t.Fatal("cut receipt is not signed under the epoch it was cut for")
+	}
+	if result.ResponseBytes == 0 {
+		t.Fatal("cut receipt attests zero bytes, want the delivered prefix")
+	}
+	if elapsed > 30*time.Second {
+		t.Fatalf("exchange ran %s, want the stop-loss near the ~2s budget", elapsed)
+	}
+}
+
+// TestExchangeCutFollowsTheRotation is the other half: a rotation landing
+// mid-exchange moves the deadline out, so the watcher must re-arm instead of
+// firing. The exchange runs past its opening epoch's deadline and is signed by
+// the live key, complete rather than truncated.
+func TestExchangeCutFollowsTheRotation(t *testing.T) {
+	cell := &atomic.Pointer[proof.Signer]{}
+	opening := epochWithNitroLeaf(t, time.Now().Add(rootShared.SNPSigningMargin+3*time.Second))
+	cell.Store(proof.NewSigner(opening))
+	transport := &stallTransport{prefix: [][]byte{[]byte("event: a\n\n")}}
+	// Provider ends the stream on its own terms, past the opening deadline.
+	done := make(chan struct{})
+	wrapped := &rotatingStallTransport{stall: transport, done: done}
+	env := newTestEnv(t,
+		withSigner(opening),
+		withSignerCell(cell),
+		withTransport(wrapped),
+		withClock(time.Now),
+		livePolicy(),
+	)
+	body := []byte(`{"model":"m"}`)
+	spec := liveSpec(t, env, body)
+
+	type outcome struct {
+		result *Result
+		err    error
+	}
+	out := make(chan outcome, 1)
+	go func() {
+		result, err := env.service.Execute(context.Background(), Job{Spec: spec, Body: body}, nil)
+		out <- outcome{result, err}
+	}()
+
+	// Rotation lands well before the opening budget runs out; the provider ends
+	// past the instant the opening epoch alone would have cut.
+	time.Sleep(500 * time.Millisecond)
+	rotated := epochWithNitroLeaf(t, time.Now().Add(3*time.Hour))
+	cell.Store(proof.NewSigner(rotated))
+	time.Sleep(3 * time.Second)
+	close(done)
+
+	select {
+	case got := <-out:
+		if got.err != nil {
+			t.Fatalf("exchange with a mid-flight rotation = %v, want success", got.err)
+		}
+		if got.result == nil {
+			t.Fatal("no result for an exchange a rotation carried past its opening deadline")
+		}
+		if got.result.Truncated || got.result.Receipt.Receipt.Completion != proof.CompletionComplete {
+			t.Fatalf("completion = %q truncated = %t, want complete: the cut should have re-armed",
+				got.result.Receipt.Receipt.Completion, got.result.Truncated)
+		}
+		if string(got.result.Receipt.Receipt.Attestation.KeyID) != string(rotated.identity.KeyID[:]) {
+			t.Fatal("receipt does not name the rotated epoch")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("exchange did not finish after the provider ended it")
+	}
+}
+
+// rotatingStallTransport is a stallTransport whose hold can be released by the
+// test closing done, modelling a provider that ends its stream on its own.
+type rotatingStallTransport struct {
+	stall *stallTransport
+	done  chan struct{}
+}
+
+func (b *rotatingStallTransport) Do(ctx context.Context, req Request, onChunk func([]byte) error, onStart ...StartFunc) (Response, error) {
+	resp := Response{StatusCode: 200}
+	if len(onStart) > 0 && onStart[0] != nil {
+		onStart[0](resp)
+	}
+	for _, chunk := range b.stall.prefix {
+		if onChunk == nil {
+			continue
+		}
+		if err := onChunk(chunk); err != nil {
+			return resp, err
+		}
+	}
+	select {
+	case <-b.done:
+		return resp, nil
+	case <-ctx.Done():
+		return resp, ctx.Err()
 	}
 }
 

@@ -317,12 +317,64 @@ func signingDeadline(signer *proof.Signer) (time.Time, bool) {
 // no receipt at all, so bytes already relayed to the buyer settled nothing. The
 // length of an exchange is bounded by its own RequestTimeout instead, and the
 // key it finally signs under is chosen at the end (see perform).
+//
+// The one exception is the stop-loss below: while the exchange runs, a watcher
+// tracks the live signer's budget and cancels the exchange when that budget
+// runs out with no fresher epoch behind it (see watchExchangeBudget). On a
+// healthy platform a rotation lands first, the watcher re-arms on the new
+// budget and never fires; only a platform that stopped reissuing still cuts,
+// and then into a truncated receipt that stays billable instead of a refusal
+// that settles nothing.
 func (s *Service) signingBudget(signer *proof.Signer) (budget time.Duration, bounded bool) {
 	deadline, tracked := signingDeadline(signer)
 	if !tracked {
 		return 0, false
 	}
 	return deadline.Sub(s.clock()) - signingHandoff, true
+}
+
+// watchExchangeBudget cancels the running exchange when the live signer runs
+// out of room with no fresher epoch to hand the signature to.
+//
+// It is the exchange counterpart of watchSigningDeadline, with one deliberate
+// asymmetry: a healthy rotation must not cut. So unlike a plain context
+// deadline, it re-reads the live signer every time it wakes. A rotation that
+// lands mid-exchange publishes an epoch expiring later, the budget moves out,
+// and the watcher re-arms instead of firing — the exchange runs on and is
+// signed by the live key at the end (see perform). Only when the wake finds
+// the same stale signer — the platform stopped reissuing — does it cancel,
+// turning an exchange that could never be signed into a truncated one that
+// still can: the cancel lands signingHandoff before the deadline, so the
+// receipt the pump then signs is under evidence verifiers still accept.
+//
+// Evidence with no readable leaf carries no deadline (tracked=false), so the
+// watcher waits the exchange out, exactly as Execute's admission does.
+func (s *Service) watchExchangeBudget(stop <-chan struct{}, parent context.Context, cancel context.CancelFunc) {
+	for {
+		budget, bounded := s.signingBudget(s.activeSigner())
+		if !bounded {
+			select {
+			case <-stop:
+				return
+			case <-parent.Done():
+				return
+			}
+		}
+		if budget <= 0 {
+			cancel()
+			return
+		}
+		timer := time.NewTimer(budget)
+		select {
+		case <-stop:
+			timer.Stop()
+			return
+		case <-parent.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
 }
 
 // watchSigningDeadline closes the returned channel when a session has to stop
@@ -525,7 +577,23 @@ func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onSta
 		Timeout:          s.requestTimeout,
 	}
 
-	return s.perform(ctx, request, job.Spec, specHash, decision, seq, onChunk, onStart)
+	// Stop-loss for a rotation that failed, invisible on a healthy platform.
+	// The watcher cancels the exchange only when the live signer's budget runs
+	// out with no fresher epoch behind it; a rotation landing first re-arms it
+	// and the exchange runs on to be signed by the live key. It is started
+	// after the sequence number is spent so a cancel that races admission
+	// cannot spend a number on work that never reaches the wire, and it uses a
+	// cancel without a deadline so the transport sees no deadline of its own
+	// (see TestExchangeIsGivenNoDeadlineOfItsOwn).
+	exchangeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan struct{})
+	defer close(done)
+	if _, bounded := s.signingBudget(signer); bounded {
+		go s.watchExchangeBudget(done, exchangeCtx, cancel)
+	}
+
+	return s.perform(exchangeCtx, request, job.Spec, specHash, decision, seq, onChunk, onStart)
 }
 
 // injectCredential decrypts the credential envelope carried on the job and
