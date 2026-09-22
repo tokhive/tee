@@ -155,10 +155,10 @@ func (r *serviceRuntime) adopt(epoch platform.Epoch) error {
 }
 
 // runEpochRefresh keeps the attested epoch inside its evidence's validity for as
-// long as the process runs, using the shared SEV-SNP cadence: rotate no later
-// than SNPRefreshMargin before the NitroTPM leaf's NotAfter, capped at
-// RATLSRefreshIntervalSNP so a long-lived leaf does not cause churn, and floored
-// at minRefreshFloor.
+// long as the process runs, using the shared SEV-SNP cadence: rotate when the
+// evidence's signing deadline comes due (SNPSigningMargin before the NitroTPM
+// leaf's NotAfter), capped at RATLSRefreshIntervalSNP so a long-lived leaf does
+// not cause churn, and floored at minRefreshFloor.
 //
 // The credential inbox key is deliberately untouched here. It is generated once
 // at startup and never persisted, so a restart — not a rotation — is what makes
@@ -194,10 +194,10 @@ func runEpochRefresh(ctx context.Context, refresher epochRefresher, runtime *ser
 // outside world can see about it, then the signer. Publishing precedes signing,
 // so the process never signs with an epoch whose evidence never landed — the
 // one half a verifier cannot work around. Whichever half fails, the previous
-// service keeps signing while its evidence is still inside the margin, so the
-// failure reads as a rotation that did not happen; past the margin the service
-// refuses new work outright (ErrAttestationStale) rather than signing receipts
-// no verifier would accept.
+// service keeps signing while its evidence is still outside its signing margin,
+// so the failure reads as a rotation that did not happen; inside the margin the
+// service refuses new work outright (ErrAttestationStale) rather than signing
+// receipts no verifier would accept.
 func publishEpoch(ctx context.Context, refresher epochRefresher, runtime *serviceRuntime) error {
 	snapshot, err := refresher.Snapshot(ctx)
 	if err != nil {
@@ -209,12 +209,19 @@ func publishEpoch(ctx context.Context, refresher epochRefresher, runtime *servic
 	return runtime.adopt(snapshot)
 }
 
-// nextRefreshDelay picks how long to wait before the next rotation. It reads
-// the expiry out of the evidence the TEE is currently presenting, so the cadence
+// nextRefreshDelay picks how long to wait before the next rotation. It reads the
+// deadline out of the evidence the TEE is currently presenting, so the cadence
 // tracks whatever TTL AWS actually issues rather than a hardcoded guess, and
 // clamps the result between the two published bounds: RATLSRefreshIntervalSNP
 // caps churn when the leaf is long-lived, and minRefreshFloor keeps a failed
 // rotation from waiting out the full ceiling before it retries.
+//
+// The deadline it aims at is the signing one, because that is the last instant a
+// receipt can still be issued under this evidence — and, on AWS, it is also the
+// earliest instant the platform is willing to hand out a newer leaf, since the
+// leaf is reissued only in the last minutes of its life. Rotating any earlier
+// asks for evidence that does not exist yet and comes back with what is already
+// in service.
 //
 // published says whether the last rotation completed. When it did not — the
 // refresh succeeded but the epoch never reached the service — the floor applies
@@ -227,10 +234,10 @@ func nextRefreshDelay(ctx context.Context, refresher epochRefresher, published b
 	snapshot, err := refresher.Snapshot(ctx)
 	if err != nil {
 		// The adapter admits nothing until a rotation succeeds, which is what
-		// happens once the epoch it is serving reaches its margin.
+		// happens once the epoch it is serving runs out of validity.
 		return minRefreshFloor
 	}
-	expiry, tracked := rootShared.SNPAttestationExpiryFromLeaf(snapshot.Identity().Evidence)
+	deadline, tracked := rootShared.SNPSigningDeadline(snapshot.Identity().Evidence)
 	if !tracked {
 		// The adaptive half of the cadence reads the NitroTPM leaf's NotAfter.
 		// When that read fails the loop silently falls back to the two-hour
@@ -239,5 +246,5 @@ func nextRefreshDelay(ctx context.Context, refresher epochRefresher, published b
 		// Say so, because there is no other trace of it until evidence goes stale.
 		logger.Warn("evidence carries no readable NitroTPM leaf expiry; refresh cadence falls back to the fixed two-hour ceiling")
 	}
-	return max(min(time.Until(expiry), rootShared.RATLSRefreshIntervalSNP), minRefreshFloor)
+	return max(min(time.Until(deadline), rootShared.RATLSRefreshIntervalSNP), minRefreshFloor)
 }

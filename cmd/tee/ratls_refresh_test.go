@@ -50,14 +50,23 @@ func TestNextRefreshDelayTracksTheNitroTPMLeaf(t *testing.T) {
 		{
 			name:     "short-lived leaf drives the cadence instead of the ceiling",
 			notAfter: time.Now().Add(time.Hour),
-			want:     func(d time.Duration) bool { return d > 25*time.Minute && d < 30*time.Minute },
-			wantWhy:  "refresh 30 minutes before the leaf expires, not at the two-hour mark",
+			want:     func(d time.Duration) bool { return d > 50*time.Minute && d < 55*time.Minute },
+			wantWhy:  "rotate a signing margin before the leaf expires, not at the two-hour mark",
 		},
 		{
 			name:     "an already-expired leaf retries on the floor",
 			notAfter: time.Now().Add(-2 * time.Hour),
 			want:     func(d time.Duration) bool { return d == minRefreshFloor },
 			wantWhy:  "a negative delay must not become a spin loop",
+		},
+		{
+			name: "a leaf inside its signing margin retries on the floor",
+			// The lease is still valid — the listener keeps admitting handshakes
+			// for another three minutes — but receipts under it would carry too
+			// little validity, so the rotation is retried until it lands.
+			notAfter: time.Now().Add(3 * time.Minute),
+			want:     func(d time.Duration) bool { return d == minRefreshFloor },
+			wantWhy:  "the signing margin has passed and only a rotation clears it",
 		},
 	}
 	for _, test := range tests {
@@ -90,17 +99,39 @@ func TestNextRefreshDelayTracksTheNitroTPMLeaf(t *testing.T) {
 	})
 }
 
-// TestAttestationExpiryReportsWhetherItTrackedTheLeaf pins the flag the
-// cadence logs on. An AWS evidence's deadline comes from its NitroTPM leaf and
-// is adaptive; anything else falls back to the fixed TTL, and the loop has to
-// be able to announce that instead of looking like a healthy schedule.
-func TestAttestationExpiryReportsWhetherItTrackedTheLeaf(t *testing.T) {
-	tracked := nitroAttestation(t, time.Now().Add(3*time.Hour))
-	if _, ok := rootShared.SNPAttestationExpiryFromLeaf(tracked); !ok {
-		t.Fatal("AWS evidence reported an untracked expiry")
+// TestDeadlinesReportWhetherTheyTrackedTheLeaf pins both deadlines and the flag
+// the cadence logs on. They are deliberately different instants: admission runs
+// to the leaf's own NotAfter, the instant a verifier stops accepting it, while
+// signing stops a margin earlier so a receipt still has validity left when a
+// verifier reads it. An AWS evidence's deadlines come from its NitroTPM leaf;
+// anything else falls back to the fixed TTL, and the loop has to be able to
+// announce that instead of looking like a healthy schedule.
+func TestDeadlinesReportWhetherTheyTrackedTheLeaf(t *testing.T) {
+	notAfter := time.Now().Add(3 * time.Hour).Truncate(time.Second)
+	tracked := nitroAttestation(t, notAfter)
+
+	admission, ok := rootShared.SNPAdmissionDeadline(tracked)
+	if !ok {
+		t.Fatal("AWS evidence reported an untracked admission deadline")
 	}
-	if _, ok := rootShared.SNPAttestationExpiryFromLeaf([]byte("not-an-aws-envelope")); ok {
-		t.Fatal("non-AWS evidence reported a tracked expiry")
+	if !admission.Equal(notAfter) {
+		t.Fatalf("admission deadline = %s, want the leaf's own NotAfter %s", admission, notAfter)
+	}
+	signing, ok := rootShared.SNPSigningDeadline(tracked)
+	if !ok {
+		t.Fatal("AWS evidence reported an untracked signing deadline")
+	}
+	if want := admission.Add(-rootShared.SNPSigningMargin); !signing.Equal(want) {
+		t.Fatalf("signing deadline = %s, want %s", signing, want)
+	}
+
+	for _, untracked := range [][]byte{[]byte("not-an-aws-envelope")} {
+		if _, ok := rootShared.SNPAdmissionDeadline(untracked); ok {
+			t.Fatal("non-AWS evidence reported a tracked admission deadline")
+		}
+		if _, ok := rootShared.SNPSigningDeadline(untracked); ok {
+			t.Fatal("non-AWS evidence reported a tracked signing deadline")
+		}
 	}
 }
 

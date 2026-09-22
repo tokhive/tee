@@ -3,17 +3,21 @@
 //	How much slack does the RA-TLS rotation schedule actually have?
 //
 // It reads the attested evidence out of a TEE's RA-TLS leaf — the certificate
-// its mTLS listener presents — and prints the arithmetic that decides whether a
-// single failed rotation takes the TEE out of service:
+// its mTLS listener presents — and prints the two deadlines that bound that
+// evidence, plus the arithmetic that decides whether a failed rotation stops the
+// TEE signing:
 //
-//	deadline   = NitroTPM leaf NotAfter - SNPRefreshMargin   (admission stops here)
-//	next try   = clamp(until(deadline), minRefreshFloor, RATLSRefreshIntervalSNP)
-//	slack      = until(deadline) - next try                  (time to absorb failures)
+//	admission  = NitroTPM leaf NotAfter          (handshakes stop here)
+//	signing    = admission - SNPSigningMargin    (refresh target; receipts stop here)
+//	next try   = clamp(until(signing), minRefreshFloor, RATLSRefreshIntervalSNP)
+//	slack      = until(signing) - next try       (time to absorb failures)
 //
-// slack == 0 means the rotation is scheduled exactly AT the deadline, so any
-// failure — one dropped HTTP fetch, one device hiccup — is an outage of at least
-// minRefreshFloor until a retry lands. Get the leaf over mTLS with the Hub client
-// identity (the TEE has no sshd):
+// slack == 0 means the rotation is scheduled exactly AT the signing deadline, so
+// any failure — one dropped HTTP fetch, one device hiccup — costs at least
+// minRefreshFloor of refused receipts until a retry lands. Handshakes survive it:
+// admission runs to the leaf's own NotAfter, so the listener keeps answering the
+// Hub even while the TEE will not sign. Get the leaf over mTLS with the Hub
+// client identity (the TEE has no sshd):
 //
 //	echo | openssl s_client -connect <tee-ip>:18090 \
 //	    -cert /etc/tokhive/hive-client.pem -key /etc/tokhive/hive-client-key.pem \
@@ -75,7 +79,15 @@ func main() {
 		fmt.Printf("  deadline   = now + AttestationCacheTTL = %s\n", now.Add(shared.AttestationCacheTTL()).Format(time.RFC3339))
 		return
 	}
-	deadline := notAfter.Add(-shared.SNPRefreshMargin)
+	// Two deadlines, and they are different instants. A handshake only has to be
+	// verifiable when it happens, so admission runs to the leaf's own NotAfter —
+	// exactly what the Hub's chain check compares. A receipt has to stay
+	// verifiable afterwards, so signing stops SNPSigningMargin earlier, and that
+	// earlier instant is what the rotation schedule aims at: it is the last
+	// moment a receipt can be issued, and on AWS it is also the first moment the
+	// platform is willing to hand out a newer leaf.
+	admission := notAfter.UTC()
+	deadline := admission.Add(-shared.SNPSigningMargin)
 	// The schedule is decided when the epoch is built, not now: the loop sees
 	// `until(deadline)` measured from that instant. Deriving the slack from
 	// "remaining now" would understate it by however long the epoch has already
@@ -85,23 +97,28 @@ func main() {
 	scheduled := clamp(untilDeadline)
 	slack := untilDeadline - scheduled
 
-	fmt.Printf("NitroTPM leaf    notAfter=%s\n", notAfter.UTC().Format(time.RFC3339))
-	fmt.Printf("deadline         %s  (= NotAfter - SNPRefreshMargin %s)\n",
-		deadline.Format(time.RFC3339), shared.SNPRefreshMargin)
-	fmt.Printf("now              %s   remaining=%s\n", now.Format(time.RFC3339), round(deadline.Sub(now)))
+	fmt.Printf("NitroTPM leaf    notAfter=%s\n", admission.Format(time.RFC3339))
+	fmt.Printf("admission        %s  (the leaf's own NotAfter: handshakes stop here)\n", admission.Format(time.RFC3339))
+	fmt.Printf("signing deadline %s  (= admission - SNPSigningMargin %s; receipts stop here)\n",
+		deadline.Format(time.RFC3339), shared.SNPSigningMargin)
+	fmt.Printf("now              %s   to-admission=%s  to-signing=%s\n",
+		now.Format(time.RFC3339), round(admission.Sub(now)), round(deadline.Sub(now)))
 	fmt.Println()
 	fmt.Printf("at generation    %s   lifetime-to-deadline=%s\n", generated.Format(time.RFC3339), round(untilDeadline))
 	fmt.Printf("next rotation    %s  (clamp(lifetime-to-deadline, floor %s, ceiling %s))\n",
 		round(scheduled), minRefreshFloor, shared.RATLSRefreshIntervalSNP)
 	fmt.Printf("slack            %s\n", round(slack))
 	switch {
+	case admission.Before(now):
+		fmt.Println("VERDICT          past the leaf's NotAfter: the listener is refusing every handshake right now")
 	case deadline.Before(now):
-		fmt.Println("VERDICT          past the deadline: the listener is refusing every handshake right now")
+		fmt.Printf("VERDICT          handshakes are admitted, receipts are not: the signing margin has passed\n"+
+			"                 with %s of leaf left and no rotation published\n", round(admission.Sub(now)))
 	case slack <= 0:
-		fmt.Printf("VERDICT          ZERO slack: the rotation is due exactly at the deadline, so one\n"+
-			"                 failure costs at least %s of refused handshakes\n", minRefreshFloor)
+		fmt.Printf("VERDICT          ZERO slack: the rotation is due exactly at the signing deadline, so one\n"+
+			"                 ask that comes back with the same leaf costs at least %s of refused receipts\n", minRefreshFloor)
 	default:
-		fmt.Printf("VERDICT          %d retr%s of slack before failures reach the deadline\n",
+		fmt.Printf("VERDICT          %d retr%s of slack before failures reach the signing deadline\n",
 			int(slack/minRefreshFloor), plural(int(slack/minRefreshFloor)))
 	}
 }

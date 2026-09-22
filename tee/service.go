@@ -11,8 +11,8 @@
 //
 // Execute runs its checks in a fixed order, and the order is the design:
 //
-//  0. epoch freshness — the signer must name evidence still inside its
-//     freshness margin (see Config.SignerCell)
+//  0. epoch freshness — the signer must name evidence still outside its
+//     signing margin (see Config.SignerCell)
 //  1. submitter identity (optional, see Config.SubmitterVerifier)
 //  2. spec structure and expiry
 //  3. body binding — the body must hash to the spec's committed digest
@@ -92,13 +92,13 @@ var ErrNoSessionSupport = errors.New("transport does not support streaming sessi
 var ErrSessionBody = errors.New("streaming session must carry an empty body")
 
 // ErrAttestationStale is a refusal: the receipt signer the service would use
-// names an epoch whose evidence has passed its freshness margin, so any
-// receipt it produced would fail verification. It is returned before any
-// sequence number is allocated and before anything is put on the wire —
-// unlike a mid-exchange failure, a stale epoch never spends provider work or
-// burns a ProviderSeq. The caller should retry once the platform has published
-// a fresh epoch.
-var ErrAttestationStale = errors.New("attested epoch past its freshness margin; rotation has not published")
+// names an epoch whose evidence is inside its signing margin, so any receipt it
+// produced would reach a verifier with too little validity left on the evidence
+// it cites. It is returned before any sequence number is allocated and before
+// anything is put on the wire — unlike a mid-exchange failure, a stale epoch
+// never spends provider work or burns a ProviderSeq. The caller should retry
+// once the platform has published a fresh epoch.
+var ErrAttestationStale = errors.New("attested epoch inside its signing margin; rotation has not published")
 
 // Job is a request to execute: the spec plus the body it commits to.
 //
@@ -262,11 +262,15 @@ func (s *Service) activeSigner() *proof.Signer {
 
 // signerStaleAt reports whether signing with signer at now would produce a
 // receipt no verifier accepts: its epoch carries a short-lived NitroTPM leaf
-// that has passed the freshness margin. Evidence without a readable leaf
-// (simulated epochs, test fakes) has no TEE-side expiry verdict and never
-// goes stale here — the fallback TTL in SNPAttestationExpiryFromLeaf exists
-// for refresh scheduling, not for refusing work, and comparing it against an
-// injected test clock would mistake every pinned clock for an outage.
+// that has passed SNPSigningMargin. The bound is deliberately narrower than
+// admission — a handshake only has to be valid when it happens, while a receipt
+// has to stay valid for a verifier that reads it later — so in the last minutes
+// of a leaf this refuses work while the listener keeps accepting connections.
+// Evidence without a readable leaf (simulated epochs, test fakes) has no
+// TEE-side expiry verdict and never goes stale here — the fallback TTL in
+// snpLeafDeadline exists for refresh scheduling, not for refusing work, and
+// comparing it against an injected test clock would mistake every pinned clock
+// for an outage.
 func signerStaleAt(signer *proof.Signer, now time.Time) bool {
 	if signer == nil {
 		return true
@@ -275,11 +279,11 @@ func signerStaleAt(signer *proof.Signer, now time.Time) bool {
 	if epoch == nil {
 		return true
 	}
-	expiry, tracked := rootShared.SNPAttestationExpiryFromLeaf(epoch.Identity().Evidence)
+	deadline, tracked := rootShared.SNPSigningDeadline(epoch.Identity().Evidence)
 	if !tracked {
 		return false
 	}
-	return !now.Before(expiry)
+	return !now.Before(deadline)
 }
 
 // Execute runs one job and returns its signed receipt.

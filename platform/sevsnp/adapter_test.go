@@ -132,11 +132,11 @@ func TestRefreshPublishesOneNewVerifiedEpoch(t *testing.T) {
 	}
 }
 
-// TestRefreshFailureKeepsServingAnEpochThatStillHasMargin: a rotation that fails
-// while the epoch it is replacing is still outside its margin keeps being
+// TestRefreshFailureKeepsServingAnEpochThatIsStillAdmissible: a rotation that
+// fails while the epoch it is replacing still has validity left keeps being
 // served. The failure is a rotation that did not happen; it must not become a
 // listener that refuses every new handshake until a retry succeeds.
-func TestRefreshFailureKeepsServingAnEpochThatStillHasMargin(t *testing.T) {
+func TestRefreshFailureKeepsServingAnEpochThatIsStillAdmissible(t *testing.T) {
 	manager := newFakeManager(t)
 	adapter, err := newAWS(context.Background(), Config{Role: "tokenhive_tee"}, testDependencies(manager))
 	if err != nil {
@@ -152,7 +152,7 @@ func TestRefreshFailureKeepsServingAnEpochThatStillHasMargin(t *testing.T) {
 		t.Fatal("Refresh succeeded")
 	}
 	if !adapter.Healthy() {
-		t.Fatal("adapter stopped admitting while the served epoch still had margin")
+		t.Fatal("adapter stopped admitting while the served epoch was still valid")
 	}
 	after, err := adapter.Snapshot(context.Background())
 	if err != nil {
@@ -166,19 +166,43 @@ func TestRefreshFailureKeepsServingAnEpochThatStillHasMargin(t *testing.T) {
 	}
 }
 
-// TestAdapterFailsClosedOnceTheServedEpochIsInItsMargin is the other half: the
-// adapter stops admitting exactly when the evidence it would present reaches
-// the refresh margin, which is the point a verifier stops accepting it.
-func TestAdapterFailsClosedOnceTheServedEpochIsInItsMargin(t *testing.T) {
+// TestAdapterAdmitsUntilTheLeafItselfExpires pins what admission is measured
+// against: the NitroTPM leaf's own NotAfter, which is the instant a verifier
+// stops accepting it and nothing earlier. A ten-minute-old leaf is admitted
+// here even though a rotation should have replaced it long before — refusing it
+// would drop handshakes the Hub would have verified, and on AWS, where the leaf
+// is reissued only in the last minutes of its life, such a refusal lasts as long
+// as the margin because no rotation can end it.
+func TestAdapterAdmitsUntilTheLeafItselfExpires(t *testing.T) {
 	manager := newFakeManager(t)
-	// A leaf expiring in ten minutes is already inside the thirty-minute margin.
 	manager.current = newFakeSnapshot(t, string(nitroLeafExpiringAt(t, time.Now().Add(10*time.Minute))))
 	adapter, err := newAWS(context.Background(), Config{Role: "tokenhive_tee"}, testDependencies(manager))
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !adapter.Healthy() {
+		t.Fatal("adapter refused an epoch whose leaf is still valid")
+	}
+	if _, err := adapter.Snapshot(context.Background()); err != nil {
+		t.Fatalf("Snapshot with a valid leaf = %v, want the served epoch", err)
+	}
+	if _, err := adapter.ServerTLSConfig().GetCertificate(nil); err != nil {
+		t.Fatalf("GetCertificate with a valid leaf = %v, want the served certificate", err)
+	}
+}
+
+// TestAdapterFailsClosedOnceTheLeafExpires is the other half: the adapter stops
+// admitting exactly when the evidence it would present stops being verifiable,
+// which is a leaf that has passed its own NotAfter.
+func TestAdapterFailsClosedOnceTheLeafExpires(t *testing.T) {
+	manager := newFakeManager(t)
+	manager.current = newFakeSnapshot(t, string(nitroLeafExpiringAt(t, time.Now().Add(-time.Minute))))
+	adapter, err := newAWS(context.Background(), Config{Role: "tokenhive_tee"}, testDependencies(manager))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if adapter.Healthy() {
-		t.Fatal("adapter admitted an epoch whose evidence is inside the refresh margin")
+		t.Fatal("adapter admitted an epoch whose leaf has expired")
 	}
 	if _, err := adapter.Snapshot(context.Background()); !errors.Is(err, platform.ErrNotReady) {
 		t.Fatalf("Snapshot error = %v, want ErrNotReady", err)

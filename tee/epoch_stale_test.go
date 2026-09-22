@@ -23,10 +23,10 @@ import (
 
 // nitroEnvelope builds the AWS-tagged combined envelope a real TEE's RA-TLS
 // leaf carries, with a NitroTPM document whose leaf expires at notAfter. The
-// document is never chain-verified here — SNPAttestationExpiryFromLeaf only
-// reads the expiry — so a synthetic one is a faithful input to the freshness
-// gate. Times are pinned to baseTime (the service clock in these tests), never
-// the wall clock, so the suite does not rot.
+// document is never chain-verified here — SNPNitroLeafNotAfter only reads the
+// expiry — so a synthetic one is a faithful input to the freshness gate. Times
+// are pinned to baseTime (the service clock in these tests), never the wall
+// clock, so the suite does not rot.
 func nitroEnvelope(t *testing.T, notAfter time.Time) []byte {
 	t.Helper()
 	notAfter = notAfter.Truncate(time.Second)
@@ -111,6 +111,41 @@ func TestExecuteAdmitsWhenSignerFresh(t *testing.T) {
 	}
 	if result == nil || string(result.Receipt.Receipt.Attestation.KeyID) != string(epoch.identity.KeyID[:]) {
 		t.Fatal("receipt is not signed under the fresh epoch")
+	}
+}
+
+// TestSigningMarginBoundsReceiptsNotHandshakes pins where the signing gate sits
+// now that admission is measured against the leaf's own NotAfter. Signing stops
+// SNPSigningMargin before that expiry, so a leaf with minutes left refuses work
+// while the listener still accepts the connection: the receipt is what has to
+// stay verifiable, and the certificate only has to be valid when it is
+// presented. The cases bracket the margin from both sides so the boundary
+// cannot drift a whole order of magnitude without a failure here.
+func TestSigningMarginBoundsReceiptsNotHandshakes(t *testing.T) {
+	tests := []struct {
+		name     string
+		notAfter time.Duration
+		stale    bool
+	}{
+		{name: "an hour of validity signs", notAfter: time.Hour},
+		{name: "one minute outside the margin signs", notAfter: 6 * time.Minute},
+		{name: "one minute inside the margin does not", notAfter: 4 * time.Minute, stale: true},
+		{name: "an expired leaf does not", notAfter: -time.Minute, stale: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newTestEnv(t, withSigner(epochWithNitroLeaf(t, baseTime.Add(test.notAfter))))
+			body := []byte(`{"model":"m"}`)
+			spec := env.spec(t, body)
+
+			_, err := env.service.Execute(context.Background(), Job{Spec: spec, Body: body}, nil)
+			switch {
+			case test.stale && !errors.Is(err, ErrAttestationStale):
+				t.Fatalf("Execute with a leaf %s from expiry = %v, want %v", test.notAfter, err, ErrAttestationStale)
+			case !test.stale && err != nil:
+				t.Fatalf("Execute with a leaf %s from expiry = %v, want success", test.notAfter, err)
+			}
+		})
 	}
 }
 
