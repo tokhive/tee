@@ -183,6 +183,70 @@ func TestPublishEpochAdoptsAndPublishesRotatedEpoch(t *testing.T) {
 	// verifies the evidence inside the leaf instead (see publish).
 }
 
+// TestPublishEpochIsANoOpForTheEpochAlreadyInService: the platform may have
+// nothing newer to give. AWS reissues its NitroTPM leaf only in the last minutes
+// of the leaf's life, so a tick that lands earlier asks, is handed back the
+// certificate already in service, and has nothing to publish. Such a tick must
+// leave the deployment exactly as it is: no rewritten identity, no rebuilt
+// service, and above all no retirement of the connections that are serving
+// traffic under an epoch that did not change.
+func TestPublishEpochIsANoOpForTheEpochAlreadyInService(t *testing.T) {
+	simDir := t.TempDir()
+	t.Setenv("TOKENHIVE_SIM_DIR", simDir)
+
+	startup := fakeEpoch([]byte("startup-evidence"))
+	runtime := newTestRuntime(t, startup, false)
+	service := runtime.get()
+	epochs := runtime.conns.current.Load()
+
+	// A rotation the adapter declined: it regenerated the key and was handed back
+	// the leaf it already serves, so the epoch reaching this half is unchanged.
+	if err := publishOnce(&fakeRefresher{snapshot: startup}, runtime); err != nil {
+		t.Fatalf("publish the epoch already in service: %v", err)
+	}
+
+	if runtime.get() != service {
+		t.Fatal("a tick that found no newer epoch rebuilt the service that signs receipts")
+	}
+	if got := runtime.conns.current.Load(); got != epochs {
+		t.Fatal("a tick that found no newer epoch retired the connections serving under it")
+	}
+	if got := readPersistedIdentity(t, simDir); got.KeyID != startup.Identity().KeyID {
+		t.Fatal("a tick that found no newer epoch rewrote the published identity")
+	}
+}
+
+// TestPublishEpochRetriesAPublicationThatDidNotLand is the other side of that
+// guard: skipping an epoch the runtime already serves must not skip one that
+// failed to land. The adapter swaps its epoch before this half runs, so a
+// publication that fails leaves the listener serving a key the signer does not
+// use — a state only a retry can correct, and the retry has to survive the
+// comparison that makes the no-op tick free.
+func TestPublishEpochRetriesAPublicationThatDidNotLand(t *testing.T) {
+	t.Setenv("TOKENHIVE_SIM_DIR", t.TempDir())
+
+	runtime := newTestRuntime(t, fakeEpoch([]byte("startup-evidence")), false)
+
+	// Evidence that does not hash to its own identity: the store refuses it, so
+	// this is the rotation that reaches the runtime and cannot be published.
+	unpublishable := fakeEpoch([]byte("startup-evidence"))
+	unpublishable.id.Evidence = []byte("rotated-evidence")
+	if err := publishOnce(&fakeRefresher{snapshot: unpublishable}, runtime); err == nil {
+		t.Fatal("published an epoch whose evidence could not be written")
+	}
+	if runtime.serving(unpublishable.Identity().KeyID) {
+		t.Fatal("a publication that failed left its epoch recorded as in service")
+	}
+
+	rotated := fakeEpoch(nitroAttestation(t, time.Now().Add(3*time.Hour)))
+	if err := publishOnce(&fakeRefresher{snapshot: rotated}, runtime); err != nil {
+		t.Fatalf("publish after a failed publication: %v", err)
+	}
+	if !runtime.serving(rotated.Identity().KeyID) {
+		t.Fatal("the retry did not install the epoch the adapter serves")
+	}
+}
+
 // TestPublishEpochSkipsTheStoreForInlineReceipts: an inline receipt carries its
 // own evidence, so a store entry would be a file nothing resolves. Only the
 // hash-only form — the one with a hash to look up — writes to it.

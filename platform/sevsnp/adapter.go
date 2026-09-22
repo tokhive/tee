@@ -175,11 +175,20 @@ func (a *Adapter) Snapshot(ctx context.Context) (platform.Epoch, error) {
 	return served, nil
 }
 
-// Refresh rotates the RA-TLS key and evidence and publishes the new epoch in
-// one step. The epoch it replaces keeps serving until then, because its own
-// evidence is still valid — the rotation is scheduled with room to spare — so
-// refusing new handshakes for the duration of an attestation call would drop
-// traffic to prove nothing.
+// Refresh rotates the RA-TLS key and evidence and publishes the new epoch if it
+// moves admission further out. The epoch being replaced keeps serving until
+// then, because its own evidence is still valid — the rotation is scheduled with
+// room to spare — so refusing new handshakes for the duration of an attestation
+// call would drop traffic to prove nothing.
+//
+// Publishing only newer evidence matters routinely, not just in principle: AWS
+// reissues the NitroTPM leaf only in the last minutes of its life, so a rotation
+// that lands earlier regenerates the key and is handed back the certificate
+// already in service. Installing that would swap evidence that still has hours
+// of validity for evidence that expires at the very same instant, and would
+// retire every live connection to do it. The epoch stays, and the tick returns
+// nil: it is a rotation the platform declined, not a failure, and the epoch it
+// declined to replace is still being served.
 //
 // A rotation that fails leaves the previous epoch in place and admits from it
 // until its own evidence expires; the failure reads as a rotation that did not
@@ -204,8 +213,11 @@ func (a *Adapter) Refresh(ctx context.Context) error {
 		return fmt.Errorf("verify refreshed AWS SEV-SNP epoch: %w", err)
 	}
 	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !next.supersedes(a.current) {
+		return nil
+	}
 	a.current = next
-	a.mu.Unlock()
 	return nil
 }
 

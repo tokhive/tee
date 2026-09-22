@@ -166,6 +166,67 @@ func TestRefreshFailureKeepsServingAnEpochThatIsStillAdmissible(t *testing.T) {
 	}
 }
 
+// TestRefreshPublishesOnlyNewerEvidence pins the direction of a rotation. On
+// AWS the NitroTPM leaf is reissued only in the last minutes of its life, so a
+// rotation that lands earlier regenerates the key and is handed back the leaf
+// already in service — same expiry, different key. Installing that would replace
+// evidence with hours of validity left by evidence expiring at the same instant,
+// and retire every live connection to do it. Evidence that expires no later than
+// what is being served must therefore leave the served epoch alone, and evidence
+// that genuinely moved admission out is the only thing that replaces it.
+func TestRefreshPublishesOnlyNewerEvidence(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	tests := []struct {
+		name    string
+		served  time.Time
+		rotated time.Time
+		newer   bool
+	}{
+		{
+			name:    "a leaf the platform has not reissued yet",
+			served:  now.Add(2 * time.Hour),
+			rotated: now.Add(2 * time.Hour),
+		},
+		{
+			name:    "a leaf already superseded by the one in service",
+			served:  now.Add(2 * time.Hour),
+			rotated: now.Add(time.Hour),
+		},
+		{
+			name:    "a reissued leaf",
+			served:  now.Add(2 * time.Hour),
+			rotated: now.Add(5 * time.Hour),
+			newer:   true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager := newFakeManager(t)
+			manager.current = newFakeSnapshot(t, string(nitroLeafExpiringAt(t, test.served)))
+			adapter, err := newAWS(context.Background(), Config{Role: "tokenhive_tee"}, testDependencies(manager))
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := adapter.Snapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			manager.next = newFakeSnapshot(t, string(nitroLeafExpiringAt(t, test.rotated)))
+			if err := adapter.Refresh(context.Background()); err != nil {
+				t.Fatalf("Refresh = %v, want success", err)
+			}
+			after, err := adapter.Snapshot(context.Background())
+			if err != nil {
+				t.Fatalf("Snapshot after refresh = %v", err)
+			}
+			if replaced := after.Identity().KeyID != before.Identity().KeyID; replaced != test.newer {
+				t.Fatalf("refresh replaced the served epoch = %t, want %t", replaced, test.newer)
+			}
+		})
+	}
+}
+
 // TestAdapterAdmitsUntilTheLeafItselfExpires pins what admission is measured
 // against: the NitroTPM leaf's own NotAfter, which is the instant a verifier
 // stops accepting it and nothing earlier. A ten-minute-old leaf is admitted

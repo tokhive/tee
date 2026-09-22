@@ -74,6 +74,12 @@ type serviceRuntime struct {
 
 	mu      sync.RWMutex
 	current *tee.Service
+	// adopted is the attested key current signs with. A refresh tick compares
+	// the epoch the platform serves against it to tell a rotation to install
+	// from the same evidence coming back: on AWS the NitroTPM leaf is reissued
+	// only in the last minutes of its life, so a tick that lands earlier asks,
+	// gets what is already in service, and has nothing to publish.
+	adopted [32]byte
 }
 
 // newServiceRuntime builds the runtime for the epoch the process boots on. That
@@ -117,6 +123,14 @@ func (r *serviceRuntime) get() *tee.Service {
 	return r.current
 }
 
+// serving reports whether the runtime is already signing with the epoch whose
+// attested key is keyID.
+func (r *serviceRuntime) serving(keyID [32]byte) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.adopted == keyID
+}
+
 // adopt binds the runtime to an epoch: it builds the service that signs with
 // that epoch's key and publishes it. Receipts signed from here on name the key
 // the TEE presents on its TLS listener, which is the pairing a verifier checks
@@ -132,6 +146,7 @@ func (r *serviceRuntime) adopt(epoch platform.Epoch) error {
 	// The template's signer is the startup one and is never rebound, so its
 	// options are this process's receipt-form configuration. A rotated key must
 	// not change the receipt form, so they carry over to the new signer.
+	identity := epoch.Identity()
 	signer := proof.NewSigner(epoch)
 	signer.IncludeEvidence = r.template.Signer.IncludeEvidence
 
@@ -146,6 +161,7 @@ func (r *serviceRuntime) adopt(epoch platform.Epoch) error {
 	}
 	r.mu.Lock()
 	r.current = next
+	r.adopted = identity.KeyID
 	r.mu.Unlock()
 	// Last, and only once the new service is the one handlers will reach: a
 	// connection retired before the swap could be replaced by one that still
@@ -198,10 +214,22 @@ func runEpochRefresh(ctx context.Context, refresher epochRefresher, runtime *ser
 // so the failure reads as a rotation that did not happen; inside the margin the
 // service refuses new work outright (ErrAttestationStale) rather than signing
 // receipts no verifier would accept.
+//
+// An epoch the runtime already serves is not published again. The platform can
+// hand back what it already gave — AWS reissues its NitroTPM leaf only in the
+// last minutes of the leaf's life, and the adapter declines to install anything
+// it is not newer — and re-adopting it would rewrite the identity and evidence
+// for unchanged evidence and retire every live connection to do it. Returning
+// early there is also what keeps a publication that failed the first time
+// retryable: that epoch differs from the one in service, so the next tick
+// installs it.
 func publishEpoch(ctx context.Context, refresher epochRefresher, runtime *serviceRuntime) error {
 	snapshot, err := refresher.Snapshot(ctx)
 	if err != nil {
 		return err
+	}
+	if runtime.serving(snapshot.Identity().KeyID) {
+		return nil
 	}
 	if err := runtime.publish(snapshot); err != nil {
 		return err
