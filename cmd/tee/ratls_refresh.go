@@ -48,23 +48,56 @@ type epochAssembly struct {
 	Refresher epochRefresher
 }
 
+// snpReissueWindow is how long before the NitroTPM leaf's own NotAfter AWS is
+// willing to hand out a newer one: ~9m48s, constant across the nine cycles
+// measured off a live deployment (±1s). Outside it a rotation is not refused —
+// it regenerates the RA-TLS key and is handed back the certificate already in
+// service, which the adapter declines to install (see sevsnp.Adapter.Refresh).
+//
+// Both constants below are derived from it, so it is written down once here
+// rather than repeated as prose in each of their comments.
+const snpReissueWindow = 9*time.Minute + 48*time.Second
+
 // minRefreshFloor bounds how soon the adaptive cadence may fire again. It earns
 // its keep once a rotation has failed for long enough that the epoch still being
 // served is inside its signing margin: the TEE then refuses work while the
 // listener keeps admitting handshakes, and only a rotation clears that state, so
 // the retry cannot wait out the two-hour ceiling.
 //
-// It also has to be shorter than the window in which the platform will hand out
-// newer evidence. On AWS that window is the last ~10 minutes of the NitroTPM
-// leaf's life (9m48s, constant across the nine cycles measured off a live
-// deployment), and a floor wider than the window can step over all of it: one
-// retry lands before the reissue point and the next lands after the epoch's own
-// deadline, so the rotation scheduled to keep evidence fresh misses it every
-// cycle. That is what a 10m floor did to a 30m margin. tee_k/tee_t keep their own
-// 10m floor and are not affected: their listener always presents the manager's
-// current certificate, so a rotation that misses the reissue window costs them
-// nothing.
+// It also has to be shorter than snpReissueWindow. A floor wider than the window
+// can step over all of it: one retry lands before the reissue point and the next
+// lands after the epoch's own deadline, so the rotation scheduled to keep
+// evidence fresh misses it every cycle. That is what a 10m floor did to a 30m
+// margin. tee_k/tee_t keep their own 10m floor and are not affected: their
+// listener always presents the manager's current certificate, so a rotation that
+// misses the reissue window costs them nothing.
 const minRefreshFloor = 2 * time.Minute
+
+// snpRotationLead is how far before the leaf's own NotAfter the adaptive cadence
+// aims a rotation. It is deliberately wider than SNPSigningMargin rather than
+// equal to it.
+//
+// Aiming at the signing deadline reads well and is wrong. That deadline is the
+// last instant a receipt can be signed under this evidence, and the platform
+// only reissues inside snpReissueWindow, so a rotation scheduled *for* the
+// deadline cannot have landed before it: every cycle then contains an interval,
+// as long as the attestation round trip, in which the epoch still being served
+// is past its deadline — new work refused, in-flight exchanges cut, sessions
+// ended — however healthy the platform is. Aiming a lead inside the reissue
+// window puts the rotation before the deadline instead, so the signer that
+// reaches the deadline is already the newer one and the interval never opens.
+// The deadline is not narrowed by this; it stops being reached at all.
+//
+// The lead has to sit inside snpReissueWindow with room to spare, not on its
+// edge, because the window is a mean over nine cycles at second granularity: the
+// first attempt is placed ~48s inside it. minRefreshFloor then produces retries
+// at 2m that stay inside the window and before the signing deadline, which is
+// what carries a rotation that fails the first time — two attempts land before
+// the deadline, and the ones after it are still inside the window. A lead wider
+// than the window is the failure this exists to prevent: the first attempt is
+// handed back the leaf already in service, and the retry grid can step over the
+// whole window.
+const snpRotationLead = 9 * time.Minute
 
 // serviceRuntime is the mutable half of this process. A receipt names the
 // attested key that signed it, so a rotation has to reach the service that
@@ -181,10 +214,11 @@ func (r *serviceRuntime) adopt(epoch platform.Epoch) error {
 }
 
 // runEpochRefresh keeps the attested epoch inside its evidence's validity for as
-// long as the process runs, using the shared SEV-SNP cadence: rotate when the
-// evidence's signing deadline comes due (SNPSigningMargin before the NitroTPM
-// leaf's NotAfter), capped at RATLSRefreshIntervalSNP so a long-lived leaf does
-// not cause churn, and floored at minRefreshFloor.
+// long as the process runs, using the shared SEV-SNP cadence: rotate a rotation
+// lead before the NitroTPM leaf's NotAfter (snpRotationLead, which places it
+// inside the window in which AWS will reissue rather than at the signing
+// deadline the reissue necessarily misses), capped at RATLSRefreshIntervalSNP so
+// a long-lived leaf does not cause churn, and floored at minRefreshFloor.
 //
 // The credential inbox key is deliberately untouched here. It is generated once
 // at startup and never persisted, so a restart — not a rotation — is what makes
@@ -254,12 +288,13 @@ func publishEpoch(ctx context.Context, refresher epochRefresher, runtime *servic
 // caps churn when the leaf is long-lived, and minRefreshFloor keeps a failed
 // rotation from waiting out the full ceiling before it retries.
 //
-// The deadline it aims at is the signing one, because that is the last instant a
-// receipt can still be issued under this evidence — and, on AWS, it is also the
-// earliest instant the platform is willing to hand out a newer leaf, since the
-// leaf is reissued only in the last minutes of its life. Rotating any earlier
-// asks for evidence that does not exist yet and comes back with what is already
-// in service.
+// It aims at snpRotationLead before the leaf's own NotAfter — the admission
+// deadline, not the signing one — because that is where the platform's reissue
+// window is. Aiming at the signing deadline is the mistake this avoids: a
+// rotation cannot land there any earlier than the deadline itself, so the old
+// epoch is still the live one when the deadline arrives and the deployment has
+// a scheduled interval per cycle in which it refuses work, cuts exchanges and
+// ends sessions. See snpRotationLead for the full reasoning.
 //
 // published says whether the last rotation completed. When it did not — the
 // refresh succeeded but the epoch never reached the service — the floor applies
@@ -275,7 +310,7 @@ func nextRefreshDelay(ctx context.Context, refresher epochRefresher, published b
 		// happens once the epoch it is serving runs out of validity.
 		return minRefreshFloor
 	}
-	deadline, tracked := rootShared.SNPSigningDeadline(snapshot.Identity().Evidence)
+	admission, tracked := rootShared.SNPAdmissionDeadline(snapshot.Identity().Evidence)
 	if !tracked {
 		// The adaptive half of the cadence reads the NitroTPM leaf's NotAfter.
 		// When that read fails the loop silently falls back to the two-hour
@@ -284,5 +319,5 @@ func nextRefreshDelay(ctx context.Context, refresher epochRefresher, published b
 		// Say so, because there is no other trace of it until evidence goes stale.
 		logger.Warn("evidence carries no readable NitroTPM leaf expiry; refresh cadence falls back to the fixed two-hour ceiling")
 	}
-	return max(min(time.Until(deadline), rootShared.RATLSRefreshIntervalSNP), minRefreshFloor)
+	return max(min(time.Until(admission.Add(-snpRotationLead)), rootShared.RATLSRefreshIntervalSNP), minRefreshFloor)
 }

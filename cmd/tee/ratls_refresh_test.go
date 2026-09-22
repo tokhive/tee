@@ -50,8 +50,8 @@ func TestNextRefreshDelayTracksTheNitroTPMLeaf(t *testing.T) {
 		{
 			name:     "short-lived leaf drives the cadence instead of the ceiling",
 			notAfter: time.Now().Add(time.Hour),
-			want:     func(d time.Duration) bool { return d > 50*time.Minute && d < 55*time.Minute },
-			wantWhy:  "rotate a signing margin before the leaf expires, not at the two-hour mark",
+			want:     func(d time.Duration) bool { return d > 50*time.Minute && d < 52*time.Minute },
+			wantWhy:  "rotate a rotation lead before the leaf expires, not at the two-hour mark and not at the signing deadline",
 		},
 		{
 			name:     "an already-expired leaf retries on the floor",
@@ -97,6 +97,69 @@ func TestNextRefreshDelayTracksTheNitroTPMLeaf(t *testing.T) {
 			t.Fatalf("nextRefreshDelay = %s, want %s after a publication that did not land", got, minRefreshFloor)
 		}
 	})
+}
+
+// TestRotationIsAimedInsideTheReissueWindow is the property the cadence exists
+// for, stated as relations between the three constants rather than as numbers,
+// and checked against a real snapshot's own leaf so the relations cannot drift
+// silently if any of the three is edited.
+//
+// Aiming at the signing deadline is what used to put a hole in every cycle: the
+// platform only reissues inside snpReissueWindow, so a rotation due at the
+// deadline cannot have landed before it, and the epoch still in service is past
+// the deadline by construction — new work refused, in-flight exchanges cut,
+// sessions ended, every 2h50m regardless of platform health. Aiming
+// snpRotationLead earlier makes the epoch that reaches the deadline the newer
+// one instead.
+func TestRotationIsAimedInsideTheReissueWindow(t *testing.T) {
+	// An hour, so the adaptive branch is what answers rather than the two-hour
+	// ceiling: a three-hour AWS leaf reaches the ceiling first and would hide the
+	// aim behind it.
+	notAfter := time.Now().Add(time.Hour)
+	refresher := &fakeRefresher{snapshot: fakeEpoch(nitroAttestation(t, notAfter))}
+	evidence := refresher.snapshot.Identity().Evidence
+
+	admission, ok := rootShared.SNPAdmissionDeadline(evidence)
+	if !ok {
+		t.Fatal("AWS evidence reported an untracked admission deadline")
+	}
+	signing, ok := rootShared.SNPSigningDeadline(evidence)
+	if !ok {
+		t.Fatal("AWS evidence reported an untracked signing deadline")
+	}
+
+	// The lead has to be inside the window the platform will reissue in:
+	// outside it, the first attempt is handed back the leaf already in service.
+	if snpRotationLead >= snpReissueWindow {
+		t.Fatalf("rotation lead %s is not inside the %s reissue window; the first attempt would be handed back the leaf already in service",
+			snpRotationLead, snpReissueWindow)
+	}
+	// And the retry floor has to be shorter than the window, or a retry grid
+	// lands once before it and once after the leaf is already gone.
+	if minRefreshFloor >= snpReissueWindow {
+		t.Fatalf("retry floor %s is not shorter than the %s reissue window; the retry grid can step over all of it",
+			minRefreshFloor, snpReissueWindow)
+	}
+	// The rotation must be due before the signing deadline. This is the relation
+	// that stops the deadline from ever being reached by the live signer.
+	aim := admission.Add(-snpRotationLead)
+	if !aim.Before(signing) {
+		t.Fatalf("rotation aimed at %s, at or after the signing deadline %s: the deadline would be reached before a newer epoch exists",
+			aim, signing)
+	}
+	// With room for at least one retry between the aim and the deadline, a
+	// rotation that fails the first time still lands in time.
+	if attempts := int(signing.Sub(aim) / minRefreshFloor); attempts < 1 {
+		t.Fatalf("only %d retries fit between the aim %s and the deadline %s", attempts, aim, signing)
+	}
+
+	// The cadence returns the wait until that aim, not until the deadline.
+	got := nextRefreshDelay(context.Background(), refresher, true, rootShared.NewNopLogger())
+	want := time.Until(aim)
+	if diff := got - want; diff > time.Second || diff < -time.Second {
+		t.Fatalf("next rotation in %s, want %s (i.e. until %s): the cadence must aim at the reissue window rather than at the signing deadline",
+			got, want, aim)
+	}
 }
 
 // TestDeadlinesReportWhetherTheyTrackedTheLeaf pins both deadlines and the flag
