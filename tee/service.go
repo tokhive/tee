@@ -319,6 +319,58 @@ func (s *Service) signingBudget(signer *proof.Signer) (budget time.Duration, bou
 	return deadline.Sub(s.clock()) - signingHandoff, true
 }
 
+// watchSigningDeadline closes the returned channel when a session has to stop
+// relaying for its terminal receipt to still be signed — the live signer is
+// within signingHandoff of its signing deadline — and stops watching when stop
+// is closed. The caller owns stop and must close it when the session is over.
+//
+// A session is deliberately unbounded (SessionIdleTimeout is a watchdog against
+// a peer that vanished, not a duration cap), so it can outlive the epoch it
+// opened under. An exchange cannot: Execute pushes its end inside the deadline
+// with a context, because the exchange is the service's own work. A session's
+// end is decided by the provider — it lasts exactly as long as the upstream
+// stream does — so the same deadline has to be enforced from outside the relay,
+// by cutting it. Left alone, a session still relaying when its epoch reached
+// the margin would end with Receipt's refusal rather than a receipt: the bytes
+// were relayed, the provider was paid for them upstream, and nothing can be
+// settled. Cutting first turns that into a truncated receipt for the bytes that
+// did arrive, which is a receipt the Hub can price.
+//
+// The watcher reads the live signer every time it wakes instead of latching the
+// one the session opened under, and that is not a detail: a rotation landing
+// mid-session publishes an epoch that expires later, so the deadline moves out,
+// and a session that could have run to its natural end under fresh evidence
+// must not be cut for having opened under an older one. Waking on the budget
+// the old signer left and re-arming is how that is expressed — which is also
+// why waking early costs nothing and needs no lock.
+//
+// Evidence with no readable leaf carries no deadline at all — the same
+// tracked=false that keeps Execute from inventing a bound for the simulation —
+// so such a signer is never stale and there is nothing here to cut for. The
+// watcher waits the session out instead.
+func (s *Service) watchSigningDeadline(stop <-chan struct{}) <-chan struct{} {
+	cutoff := make(chan struct{})
+	go func() {
+		for {
+			budget, bounded := s.signingBudget(s.activeSigner())
+			if !bounded {
+				<-stop
+				return
+			}
+			if budget <= 0 {
+				close(cutoff)
+				return
+			}
+			select {
+			case <-stop:
+				return
+			case <-time.After(budget):
+			}
+		}
+	}()
+	return cutoff
+}
+
 // signerStaleAt reports whether signing with signer at now would produce a
 // receipt no verifier accepts: its epoch carries a short-lived NitroTPM leaf
 // that has passed SNPSigningMargin. The bound is deliberately narrower than
@@ -982,9 +1034,16 @@ func (s *Session) Receipt() (*Result, error) {
 	}
 	// The session may have outlived the rotation it opened under: sign with
 	// whatever the process serves now, so a long session still finishes under
-	// fresh evidence instead of the expired key it started with. If even that
-	// is stale the pipeline is down past its margin, and an explicit error
-	// beats a receipt no verifier would accept.
+	// fresh evidence instead of the expired key it started with.
+	//
+	// This refusal is the fail-safe, not the mechanism. A session served over
+	// /v1/session stops relaying at the live signer's deadline whatever the
+	// provider is doing — relaySession cuts the tunnel while there is still
+	// room to sign, which turns an unattestable session into a truncated and
+	// priceable one (see watchSigningDeadline) — so arriving here means the cut
+	// did not happen: a caller driving a Session directly, or a deadline that
+	// passed between the cut and this line. An explicit error is still better
+	// than a receipt no verifier would accept.
 	signer := s.svc.activeSigner()
 	if signerStaleAt(signer, s.svc.clock()) {
 		return nil, ErrAttestationStale
