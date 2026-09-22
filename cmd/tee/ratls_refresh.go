@@ -48,13 +48,23 @@ type epochAssembly struct {
 	Refresher epochRefresher
 }
 
-// minRefreshFloor bounds how soon the adaptive cadence may fire again. It is
-// the floor tee_k/tee_t apply too, and it earns its keep once a rotation has
-// failed for long enough that the epoch still being served reaches its margin:
-// the adapter then stops admitting and Snapshot reports ErrNotReady, so without
-// the floor the retry would wait out the two-hour SNP ceiling while the TLS
-// listener has no evidence left worth presenting.
-const minRefreshFloor = 10 * time.Minute
+// minRefreshFloor bounds how soon the adaptive cadence may fire again. It earns
+// its keep once a rotation has failed for long enough that the epoch still being
+// served is inside its signing margin: the TEE then refuses work while the
+// listener keeps admitting handshakes, and only a rotation clears that state, so
+// the retry cannot wait out the two-hour ceiling.
+//
+// It also has to be shorter than the window in which the platform will hand out
+// newer evidence. On AWS that window is the last ~10 minutes of the NitroTPM
+// leaf's life (9m48s, constant across the nine cycles measured off a live
+// deployment), and a floor wider than the window can step over all of it: one
+// retry lands before the reissue point and the next lands after the epoch's own
+// deadline, so the rotation scheduled to keep evidence fresh misses it every
+// cycle. That is what a 10m floor did to a 30m margin. tee_k/tee_t keep their own
+// 10m floor and are not affected: their listener always presents the manager's
+// current certificate, so a rotation that misses the reissue window costs them
+// nothing.
+const minRefreshFloor = 2 * time.Minute
 
 // serviceRuntime is the mutable half of this process. A receipt names the
 // attested key that signed it, so a rotation has to reach the service that

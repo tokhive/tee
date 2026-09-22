@@ -38,7 +38,7 @@ import (
 // minRefreshFloor mirrors cmd/tee's floor on the retry cadence. Duplicated on
 // purpose: it is a constant of the rotation loop, and a probe that imported the
 // loop would have to import the whole TEE.
-const minRefreshFloor = 10 * time.Minute
+const minRefreshFloor = 2 * time.Minute
 
 func main() {
 	if len(os.Args) != 2 {
