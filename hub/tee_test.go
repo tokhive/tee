@@ -210,7 +210,7 @@ func TestExecuteDoesNotRetryARefusalItCannotAttribute(t *testing.T) {
 	if err == nil {
 		t.Fatal("an unmarked 503 was reported as success")
 	}
-	if errors.Is(err, errEpochRetired) {
+	if errors.Is(err, tee.ErrEpochRetired) {
 		t.Fatal("an unmarked 503 was mistaken for a retired connection")
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
@@ -232,7 +232,68 @@ func TestExecuteRetriesARetiredConnectionOnce(t *testing.T) {
 
 	client := &HTTPTEE{URL: srv.URL, Client: srv.Client()}
 	_, err := client.Execute(context.Background(), testSpec(testProvider, "m"), nil, nil)
-	if !errors.Is(err, errEpochRetired) {
+	if !errors.Is(err, tee.ErrEpochRetired) {
+		t.Fatalf("err = %v, want the retired-epoch refusal", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("TEE saw %d attempts, want exactly 2", got)
+	}
+}
+
+// TestCredentialKeyRetriesTheConnectionARotationRetired covers the retry on the
+// other request a rotation can refuse, and the one whose failure a buyer never
+// sees: /v1/credential-key. A provider agent fetches its TEE inbox key through
+// this path on every reconnect, so a rotation that made it fail would surface
+// as an agent registering a token for no visible reason — after a reconnect
+// wave, when the fleet is least able to explain itself.
+func TestCredentialKeyRetriesTheConnectionARotationRetired(t *testing.T) {
+	key, err := tee.GenerateInboxKey()
+	if err != nil {
+		t.Fatalf("generate inbox key: %v", err)
+	}
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			w.Header().Set(tee.EpochRetiredHeader, "1")
+			http.Error(w, retiredRefusal, http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(key.Public())
+	}))
+	defer srv.Close()
+
+	recorder := &requestCloseRecorder{base: srv.Client().Transport}
+	client := &HTTPTEE{BaseURL: srv.URL, Client: &http.Client{Transport: recorder}}
+
+	got, err := client.CredentialKey(context.Background())
+	if err != nil {
+		t.Fatalf("a retired connection reached the agent as a failure: %v", err)
+	}
+	if !sameKey(got, key.Public()) {
+		t.Fatal("the retry returned a key the TEE did not serve")
+	}
+	if n := atomic.LoadInt32(&hits); n != 2 {
+		t.Fatalf("TEE saw %d attempts, want 2 (one refusal, one retry)", n)
+	}
+	if got := recorder.attempts(); len(got) != 2 || got[0] || !got[1] {
+		t.Fatalf("attempts asked for their own connection %v, want [false true]: the retry must leave the pool behind", got)
+	}
+}
+
+// TestCredentialKeyRetriesARetiredConnectionOnce bounds it the same way the
+// execute retry is bounded: a TEE that keeps retiring connections has something
+// else wrong with it, and looping on it would turn one failure into a flood.
+func TestCredentialKeyRetriesARetiredConnectionOnce(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set(tee.EpochRetiredHeader, "1")
+		http.Error(w, retiredRefusal, http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	client := &HTTPTEE{BaseURL: srv.URL, Client: srv.Client()}
+	if _, err := client.CredentialKey(context.Background()); !errors.Is(err, tee.ErrEpochRetired) {
 		t.Fatalf("err = %v, want the retired-epoch refusal", err)
 	}
 	if got := atomic.LoadInt32(&hits); got != 2 {

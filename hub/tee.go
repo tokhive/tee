@@ -27,12 +27,6 @@ var (
 	// ErrTEERefused means the TEE answered with an error frame: it declined
 	// the job before touching a credential.
 	ErrTEERefused = errors.New("tee refused the job")
-	// errEpochRetired marks the one 503 a rotating TEE sends on purpose: the
-	// connection this request arrived on was retired between its last use and
-	// this request. Execute consumes it and retries; no caller sees it. It is
-	// an error value rather than a status check so the retry cannot be lost
-	// inside a wrap.
-	errEpochRetired = errors.New("tee retired the attestation epoch this connection belongs to")
 )
 
 // Result is what one call to the TEE produced.
@@ -181,7 +175,7 @@ func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onCh
 		return Result{}, fmt.Errorf("encode execute request: %w", err)
 	}
 	res, err := t.execute(ctx, enc, false, onChunk, onStart...)
-	if !errors.Is(err, errEpochRetired) {
+	if !errors.Is(err, tee.ErrEpochRetired) {
 		return res, err
 	}
 	return t.execute(ctx, enc, true, onChunk, onStart...)
@@ -213,7 +207,7 @@ func (t *HTTPTEE) execute(ctx context.Context, enc []byte, freshConnection bool,
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		message := strings.TrimSpace(string(b))
 		if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(tee.EpochRetiredHeader) != "" {
-			return Result{}, fmt.Errorf("%w: %s", errEpochRetired, message)
+			return Result{}, fmt.Errorf("%w: %s", tee.ErrEpochRetired, message)
 		}
 		return Result{}, fmt.Errorf("tee http %d: %s", resp.StatusCode, message)
 	}

@@ -296,7 +296,28 @@ func ServeCredentialKey(key *InboxKey, w http.ResponseWriter, _ *http.Request) {
 
 // CredentialKeyRequest is the helper a client (or agent) uses to fetch an
 // inbox public key over HTTP.
+//
+// The one refusal a rotation is allowed to cause is retried here, once, on a
+// connection the client's pool cannot supply. Covering it is not a convenience:
+// this key is what a provider agent seals its token to, so a rotation that made
+// it briefly unobtainable would surface as a registration failing for a reason
+// the agent can neither see nor fix. The retry is safe by the same construction
+// as /v1/execute's — the listener answers a retired connection before the
+// handler runs — and this request is a plain read besides, with no sequence
+// number, credential or provider exchange behind it.
 func CredentialKeyRequest(ctx context.Context, client *http.Client, url string) (InboxPublic, error) {
+	key, err := credentialKeyRequest(ctx, client, url, false)
+	if !errors.Is(err, ErrEpochRetired) {
+		return key, err
+	}
+	return credentialKeyRequest(ctx, client, url, true)
+}
+
+// credentialKeyRequest performs one fetch. freshConnection asks for a connection
+// the pool has not handed over, which is what the retry above needs: every
+// pooled connection to a rotating TEE is one a rotation may have retired, and
+// the pool does not learn that until it tries to use them.
+func credentialKeyRequest(ctx context.Context, client *http.Client, url string, freshConnection bool) (InboxPublic, error) {
 	if client == nil {
 		client = http.DefaultClient
 	}
@@ -304,6 +325,7 @@ func CredentialKeyRequest(ctx context.Context, client *http.Client, url string) 
 	if err != nil {
 		return InboxPublic{}, err
 	}
+	req.Close = freshConnection
 	resp, err := client.Do(req)
 	if err != nil {
 		return InboxPublic{}, err
@@ -311,7 +333,11 @@ func CredentialKeyRequest(ctx context.Context, client *http.Client, url string) 
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return InboxPublic{}, fmt.Errorf("credential key http %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		message := strings.TrimSpace(string(b))
+		if resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get(EpochRetiredHeader) != "" {
+			return InboxPublic{}, fmt.Errorf("%w: %s", ErrEpochRetired, message)
+		}
+		return InboxPublic{}, fmt.Errorf("credential key http %d: %s", resp.StatusCode, message)
 	}
 	var pub InboxPublic
 	if err := json.NewDecoder(resp.Body).Decode(&pub); err != nil {
