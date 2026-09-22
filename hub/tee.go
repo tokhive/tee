@@ -24,8 +24,10 @@ var (
 	// may still have been delivered, so this is not the same as a refusal: it
 	// is a job that happened and left nothing to settle against.
 	ErrNoReceipt = errors.New("tee stream ended without a receipt frame")
-	// ErrTEERefused means the TEE answered with an error frame: it declined
-	// the job before touching a credential.
+	// ErrTEERefused means the TEE answered with an error frame. It declines a
+	// job before touching a credential, and — in the one case that is not free
+	// — refuses to sign a receipt for an exchange whose evidence aged out while
+	// it ran. Either way there is no receipt to settle against.
 	ErrTEERefused = errors.New("tee refused the job")
 )
 

@@ -528,7 +528,10 @@ func (s *Service) injectCredential(spec jobs.Spec) (map[string]string, error) {
 // perform sends the request, digests the response as it arrives, and signs the
 // receipt. It is the only path that produces a receipt, which is why it is
 // separated from the checks above: everything before it can refuse a job
-// outright, everything inside it has already committed to executing.
+// outright, everything inside it has already committed to executing. The one
+// refusal it can still produce is the fail-safe at the signature — an epoch
+// that went past its signing deadline while the exchange ran — and that is a
+// refusal precisely because the alternative is a receipt no verifier accepts.
 func (s *Service) perform(
 	ctx context.Context,
 	request Request,

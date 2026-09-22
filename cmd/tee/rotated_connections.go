@@ -15,10 +15,18 @@ import (
 // A rotation replaces the key this process signs receipts with, but it does not
 // replace the certificate an already-established TLS connection presented: that
 // was fixed at its handshake. A verifier that binds a receipt to the connection
-// that carried it — which is the whole point of RA-TLS, and what the Hub does —
-// then sees a receipt naming the rotated key arrive over a certificate carrying
-// the previous one, and is right to refuse the pair. Nothing is wrong with
-// either half; they simply belong to different epochs.
+// that carried it — the pairing RA-TLS exists to make checkable — then sees a
+// receipt naming the rotated key arrive over a certificate carrying the
+// previous one, and is right to refuse the pair. Nothing is wrong with either
+// half; they simply belong to different epochs.
+//
+// This Hub pins the attested application on both halves rather than comparing
+// them to each other — the handshake under -tee-verify=attestation and the
+// receipt verifier both check -expected-app, so neither would notice a receipt
+// and a connection from different epochs. The retirement is therefore this
+// process keeping the invariant the evidence format promises, not one a
+// particular verifier demands today; a verifier that does compare the two is
+// the one it protects.
 //
 // The connection is the part that can be retired, so it is, in two steps that
 // cover each other:
