@@ -94,10 +94,17 @@ var ErrSessionBody = errors.New("streaming session must carry an empty body")
 // ErrAttestationStale is a refusal: the receipt signer the service would use
 // names an epoch whose evidence is inside its signing margin, so any receipt it
 // produced would reach a verifier with too little validity left on the evidence
-// it cites. It is returned before any sequence number is allocated and before
-// anything is put on the wire — unlike a mid-exchange failure, a stale epoch
-// never spends provider work or burns a ProviderSeq. The caller should retry
-// once the platform has published a fresh epoch.
+// it cites. The caller should retry once the platform has published a fresh
+// epoch.
+//
+// It is returned in two places and they do not cost the same. Before a job
+// starts it costs nothing at all: no sequence number is allocated, no
+// credential is opened, nothing is put on the wire, and the job never happened.
+// After an exchange has ended it is the fail-safe at the end of perform — the
+// receipt about to be signed would be refused by every verifier, so it is not
+// signed — and there the provider work has already been done and will not be
+// settled, because a receipt is what settlement is made of. The exchange bound
+// in perform exists to keep that second case from ever being reached.
 var ErrAttestationStale = errors.New("attested epoch inside its signing margin; rotation has not published")
 
 // Job is a request to execute: the spec plus the body it commits to.
@@ -260,28 +267,70 @@ func (s *Service) activeSigner() *proof.Signer {
 	return s.signer
 }
 
+// signingHandoff is the room an exchange leaves between its own end and the
+// signing deadline it has to fit inside.
+//
+// The deadline is what a receipt must be signed before; the exchange is what
+// has to happen first. Cutting the exchange exactly at the deadline would
+// therefore leave nothing in which to sign, and the receipt would land outside
+// the margin the whole mechanism exists to respect. The work in between —
+// hashing the transcript, building the receipt, one signature — takes
+// microseconds, so this is not a budget being spent but a floor against a
+// stalled scheduler or a coarse clock. A job that arrives with less room than
+// this is refused outright: no exchange started then could finish and still be
+// signed inside the margin, and refusing before the provider is touched beats
+// executing work whose receipt could never be issued.
+const signingHandoff = time.Second
+
+// signingDeadline reports when this signer must stop signing — SNPSigningMargin
+// before its epoch's NitroTPM leaf expires — and whether the epoch carried a
+// readable leaf at all.
+//
+// The flag is not decoration. Evidence without a leaf (simulated epochs, test
+// fakes) has no TEE-side expiry: the fallback TTL in snpLeafDeadline is a
+// refresh-scheduling aid, not a verdict on serving, and comparing it against an
+// injected test clock would mistake every pinned clock for an outage. tracked
+// = false is what keeps both the refusal below and the exchange bound in
+// perform from inventing a deadline that does not exist.
+func signingDeadline(signer *proof.Signer) (time.Time, bool) {
+	if signer == nil {
+		return time.Time{}, false
+	}
+	epoch := signer.Epoch()
+	if epoch == nil {
+		return time.Time{}, false
+	}
+	return rootShared.SNPSigningDeadline(epoch.Identity().Evidence)
+}
+
+// signingBudget is how long an exchange under signer may run and still end with
+// a receipt signed inside the margin: the time left until its signing deadline,
+// less signingHandoff. bounded is false for an epoch with no readable leaf, in
+// which case there is no deadline to bound against and the caller's own context
+// is the only bound — the same rule signerStaleAt applies to refusing.
+//
+// A budget at or below zero is not "run very briefly", it is "cannot be done":
+// the exchange would have to end before it started. Callers refuse.
+func (s *Service) signingBudget(signer *proof.Signer) (budget time.Duration, bounded bool) {
+	deadline, tracked := signingDeadline(signer)
+	if !tracked {
+		return 0, false
+	}
+	return deadline.Sub(s.clock()) - signingHandoff, true
+}
+
 // signerStaleAt reports whether signing with signer at now would produce a
 // receipt no verifier accepts: its epoch carries a short-lived NitroTPM leaf
 // that has passed SNPSigningMargin. The bound is deliberately narrower than
 // admission — a handshake only has to be valid when it happens, while a receipt
 // has to stay valid for a verifier that reads it later — so in the last minutes
 // of a leaf this refuses work while the listener keeps accepting connections.
-// Evidence without a readable leaf (simulated epochs, test fakes) has no
-// TEE-side expiry verdict and never goes stale here — the fallback TTL in
-// snpLeafDeadline exists for refresh scheduling, not for refusing work, and
-// comparing it against an injected test clock would mistake every pinned clock
-// for an outage.
 func signerStaleAt(signer *proof.Signer, now time.Time) bool {
-	if signer == nil {
-		return true
-	}
-	epoch := signer.Epoch()
-	if epoch == nil {
-		return true
-	}
-	deadline, tracked := rootShared.SNPSigningDeadline(epoch.Identity().Evidence)
+	deadline, tracked := signingDeadline(signer)
 	if !tracked {
-		return false
+		// A signer with no epoch is unusable, and one with untracked evidence
+		// has no TEE-side expiry to compare against; only the former is stale.
+		return signer == nil || signer.Epoch() == nil
 	}
 	return !now.Before(deadline)
 }
@@ -298,10 +347,17 @@ func signerStaleAt(signer *proof.Signer, now time.Time) bool {
 // byte, or that it is a 401/429 before it shows the user an error. The
 // receipt binds this start regardless of whether a callback is supplied.
 //
-// An error is returned only for refusals — jobs that were never put on the
-// wire. Once the request is sent, the outcome arrives as a Result whose
-// Receipt.Completion reports what happened, and the error is nil even when the
-// exchange failed.
+// An error is returned only for refusals and for a receipt that cannot be
+// issued at all. Once the request is sent, the outcome normally arrives as a
+// Result whose Receipt.Completion reports what happened, and the error is nil
+// even when the exchange failed.
+//
+// The exception is ErrAttestationStale from the end of an exchange: the epoch
+// went past its signing deadline while the provider was being called, so the
+// receipt that was due at this point would cite evidence no verifier would
+// accept. It is not signed, and the Result is nil with it — an event with
+// nothing to prove is better than evidence that fails when it is checked. Every
+// other error means the job never reached the provider.
 //
 // That inversion is deliberate. The receipt is worth most exactly when the
 // exchange went wrong: it is the evidence that lets a Hub avoid charging for a
@@ -311,11 +367,36 @@ func signerStaleAt(signer *proof.Signer, now time.Time) bool {
 // therefore that error is non-nil if and only if Result is nil.
 func (s *Service) Execute(ctx context.Context, job Job, onChunk ChunkFunc, onStart ...StartFunc) (*Result, error) {
 	now := s.clock()
+	signer := s.activeSigner()
 
 	// Freshness before everything: a stale epoch can attest nothing, so the
 	// job is refused before it can spend provider work or a sequence number.
-	if signerStaleAt(s.activeSigner(), now) {
+	if signerStaleAt(signer, now) {
 		return nil, ErrAttestationStale
+	}
+
+	// Room to finish, refused in the same place and for the same reason. An
+	// exchange cannot end whenever it likes: its receipt has to be signed
+	// SNPSigningMargin before the leaf expires, so the exchange has a hard edge
+	// of its own, and one admitted with less than signingHandoff left before it
+	// could not produce a signable receipt at all. RequestTimeout is not that
+	// edge — it is measured from the exchange's own start, and set to zero it
+	// is no edge at all. Refusing here rather than inside the exchange also
+	// keeps the provider's series whole: a sequence number spent on a job that
+	// never runs is a gap the provider cannot tell from a hidden execution.
+	//
+	// The bound is derived from the admission signer on purpose, and is applied
+	// to the whole execution rather than to the transport call: if a rotation
+	// lands between here and the exchange, the signer pinned there expires no
+	// earlier than this one, so this bound stays the tighter of the two and can
+	// never be the looser one.
+	if budget, bounded := s.signingBudget(signer); bounded {
+		if budget <= 0 {
+			return nil, ErrAttestationStale
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, budget)
+		defer cancel()
 	}
 
 	if s.submitterVerify != nil {
@@ -466,10 +547,17 @@ func (s *Service) perform(
 	// and that connection presented the epoch current when the request arrived;
 	// signing with whatever the process has rotated to since would hand the Hub
 	// a receipt and a certificate from two different epochs and nothing to tell
-	// them apart from a forgery. An execution is bounded by RequestTimeout,
-	// which is minutes against a rotation margin of half an hour, so the epoch
-	// it started under cannot go stale before it finishes. A session is not
-	// bounded, which is why Session.Receipt deliberately does the opposite.
+	// them apart from a forgery.
+	//
+	// Pinning is also what the caller's bound was computed against: the exchange
+	// has to end early enough that its receipt is still signed inside the margin
+	// SNPSigningMargin protects, and the pinned signer is the one the receipt
+	// will name. A rotation landing between the two can only replace it with a
+	// leaf that expires later, so the bound stays conservative.
+	//
+	// A session is not bounded this way. Unbounded work cannot be held to the
+	// epoch it opened under, so Session.Receipt deliberately does the opposite:
+	// it signs with whatever the process serves when the session ends.
 	signer := s.activeSigner()
 
 	// The response start: filter the upstream headers to the relay allowlist,
@@ -594,6 +682,22 @@ func (s *Service) perform(
 		ResponseHeadersHash: headerHash,
 	}
 
+	// Freshness is checked again here, at the point of no return, and not only
+	// before the exchange. The bound above is what normally keeps an execution
+	// inside the margin, but it is a deadline rather than a guarantee: a
+	// transport that ignores the context it was handed, or a clock that jumps
+	// forward, would still reach this line with the pinned epoch past its
+	// deadline. Signing then would produce a receipt every verifier refuses —
+	// which is worse than no receipt, because it looks like evidence and is
+	// billed like evidence until someone checks the leaf. So the exchange's work
+	// is abandoned rather than mis-attested.
+	//
+	// This is the one refusal that arrives after provider work has been done,
+	// and it is deliberately the last resort: it settles nothing, so the bound
+	// above has failed if this fires at all.
+	if signerStaleAt(signer, s.clock()) {
+		return nil, ErrAttestationStale
+	}
 	signed, err := signer.Sign(receipt)
 	if err != nil {
 		return nil, fmt.Errorf("sign receipt: %w", err)
