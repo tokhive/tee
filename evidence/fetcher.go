@@ -129,6 +129,12 @@ var errRefused = errors.New("evidence: peer refused the fetch")
 // has not handed over, which is what the retry above needs: every pooled
 // connection to a rotating TEE is one a rotation may have retired, and the pool
 // does not learn that until it tries to use them.
+//
+// That takes more than req.Close, which on HTTP/1 only decides whether the
+// connection may be kept once the response is back — the pool is consulted on
+// the way in without looking at it — so the pool is evicted as well. Eviction
+// is what makes the retry dial, and so complete a handshake that postdates the
+// rotation, on either protocol.
 func (f *HTTPFetcher) fetch(ctx context.Context, id platform.Identity, freshConnection bool) ([]byte, error) {
 	url := f.baseURL + "/v1/evidence/" + hex.EncodeToString(id.EvidenceHash[:])
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -136,6 +142,9 @@ func (f *HTTPFetcher) fetch(ctx context.Context, id platform.Identity, freshConn
 		return nil, err
 	}
 	req.Close = freshConnection
+	if freshConnection {
+		f.client.CloseIdleConnections()
+	}
 	resp, err := f.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("evidence: fetch %s: %w", url, err)

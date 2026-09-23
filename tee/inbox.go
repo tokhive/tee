@@ -317,6 +317,12 @@ func CredentialKeyRequest(ctx context.Context, client *http.Client, url string) 
 // the pool has not handed over, which is what the retry above needs: every
 // pooled connection to a rotating TEE is one a rotation may have retired, and
 // the pool does not learn that until it tries to use them.
+//
+// That takes more than req.Close, which on HTTP/1 only decides whether the
+// connection may be kept once the response is back — the pool is consulted on
+// the way in without looking at it — so the pool is evicted as well. Eviction
+// is what makes the retry dial, and so complete a handshake that postdates the
+// rotation, on either protocol.
 func credentialKeyRequest(ctx context.Context, client *http.Client, url string, freshConnection bool) (InboxPublic, error) {
 	if client == nil {
 		client = http.DefaultClient
@@ -326,6 +332,9 @@ func credentialKeyRequest(ctx context.Context, client *http.Client, url string, 
 		return InboxPublic{}, err
 	}
 	req.Close = freshConnection
+	if freshConnection {
+		client.CloseIdleConnections()
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return InboxPublic{}, err

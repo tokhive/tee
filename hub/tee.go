@@ -187,6 +187,16 @@ func (t *HTTPTEE) Execute(ctx context.Context, spec jobs.Spec, body []byte, onCh
 // client's connection pool, which is what the retry above needs: every pooled
 // connection to a rotating TEE is one the rotation may have retired, and the
 // pool does not learn that until it tries to use them.
+//
+// req.Close alone does not do that on HTTP/1. There the flag is read when the
+// response comes back, to decide whether the connection may be kept — the
+// transport's hunt for an existing connection never looks at it — so a retry
+// carrying it can still be handed a pooled connection, which after a rotation
+// is precisely the retired one it is trying to leave behind. (HTTP/2 reads it
+// on the way in instead: a request asking to close gets a connection of its
+// own.) The pool is therefore evicted explicitly, and that is the part which
+// makes the retry dial — and so complete a handshake — again on either
+// protocol.
 func (t *HTTPTEE) execute(ctx context.Context, enc []byte, freshConnection bool, onChunk func([]byte) error, onStart ...func(tee.Response)) (Result, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.URL, bytes.NewReader(enc))
 	if err != nil {
@@ -198,6 +208,9 @@ func (t *HTTPTEE) execute(ctx context.Context, enc []byte, freshConnection bool,
 	client := t.Client
 	if client == nil {
 		client = http.DefaultClient
+	}
+	if freshConnection {
+		client.CloseIdleConnections()
 	}
 	resp, err := client.Do(req)
 	if err != nil {

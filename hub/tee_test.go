@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -129,6 +131,16 @@ func (r *requestCloseRecorder) attempts() []bool {
 	return append([]bool(nil), r.perAttempt...)
 }
 
+// CloseIdleConnections forwards to the transport underneath, when it has one,
+// exactly as http.Client.CloseIdleConnections does. The retry evicts the pool
+// to get off a connection a rotation has retired, and a recorder that swallowed
+// that call would measure a client nobody deploys.
+func (r *requestCloseRecorder) CloseIdleConnections() {
+	if c, ok := r.base.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
+}
+
 // writeExecuteStream answers with a minimal well-formed execute response: one
 // response-start frame, one chunk, one receipt. That is everything
 // HTTPTEE.Execute reads before returning, and nothing here is verified — the
@@ -186,6 +198,116 @@ func TestExecuteRetriesTheConnectionARotationRetired(t *testing.T) {
 	}
 	if len(res.Chunks) != 1 || string(res.Chunks[0]) != "hello" {
 		t.Fatalf("retry produced %q, want one \"hello\" chunk", res.Chunks)
+	}
+	if got := recorder.attempts(); len(got) != 2 || got[0] || !got[1] {
+		t.Fatalf("attempts asked for their own connection %v, want [false true]: the retry must leave the pool behind", got)
+	}
+}
+
+// TestExecuteRetriesOnAConnectionTheRotationCannotHaveRetired measures the
+// retry's freshness the way the flag cannot be trusted to measure it: by asking
+// the server which connection each attempt arrived on.
+//
+// req.Close is read when a response comes back, to decide whether the
+// connection may be kept — the transport looks in its pool on the way in
+// without consulting it at all — so a retry carrying the flag can still be
+// handed the pooled connection a rotation has just retired, and would then meet
+// the refusal a second time. The stub below models exactly that: the connection
+// the Hub is holding is the retired one, so only a request on a connection the
+// retry opened itself can be served.
+//
+// The pool is warmed first, and the warming is confirmed by the transport
+// reporting the connection back in the pool (PutIdleConn, not a sleep): without
+// that the refusal would open a connection of its own and the test would prove
+// nothing about the retry picking one up.
+func TestExecuteRetriesOnAConnectionTheRotationCannotHaveRetired(t *testing.T) {
+	const probeHeader = "X-TokenHive-Test-Probe"
+	var retired atomic.Value // string: the one connection the rotation took out
+	var refusals, streams int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(probeHeader) != "" {
+			// The pooled connection the Hub will be refused on: everything the
+			// rotation leaves behind already, as far as this test is concerned.
+			retired.Store(r.RemoteAddr)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if probe, _ := retired.Load().(string); probe != "" && probe == r.RemoteAddr {
+			atomic.AddInt32(&refusals, 1)
+			w.Header().Set(tee.EpochRetiredHeader, "1")
+			http.Error(w, retiredRefusal, http.StatusServiceUnavailable)
+			return
+		}
+		atomic.AddInt32(&streams, 1)
+		writeExecuteStream(t, w, []byte("hello"))
+	}))
+	defer srv.Close()
+
+	base := srv.Client().Transport
+	recorder := &requestCloseRecorder{base: base}
+	api := &http.Client{Transport: recorder}
+	// The probe shares the transport, and so its pool, but not the recorder:
+	// the assertions below are about the attempts Execute made, and a probe
+	// counted among them would read as one more of its own.
+	warm := &http.Client{Transport: base}
+
+	// Warm the pool and wait until the transport itself says the connection is
+	// idle in it, which is the state the retry must not be handed.
+	pooled := make(chan struct{}, 1)
+	probe, err := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(),
+		&httptrace.ClientTrace{PutIdleConn: func(err error) {
+			if err == nil {
+				select {
+				case pooled <- struct{}{}:
+				default:
+				}
+			}
+		}}), http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe.Header.Set(probeHeader, "1")
+	resp, err := warm.Do(probe)
+	if err != nil {
+		t.Fatalf("warm the connection pool: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	select {
+	case <-pooled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the warmed connection never reached the idle pool")
+	}
+
+	var mu sync.Mutex
+	var reused []bool
+	ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			mu.Lock()
+			reused = append(reused, info.Reused)
+			mu.Unlock()
+		},
+	})
+
+	client := &HTTPTEE{URL: srv.URL, Client: api}
+	res, err := client.Execute(ctx, testSpec(testProvider, "m"), nil, nil)
+	if err != nil {
+		t.Fatalf("a retired connection reached the caller as a failure: %v", err)
+	}
+	if len(res.Chunks) != 1 || string(res.Chunks[0]) != "hello" {
+		t.Fatalf("retry produced %q, want one \"hello\" chunk", res.Chunks)
+	}
+	if got := atomic.LoadInt32(&refusals); got != 1 {
+		t.Fatalf("the TEE refused %d attempts, want 1: the retry came back to the retired connection", got)
+	}
+	if got := atomic.LoadInt32(&streams); got != 1 {
+		t.Fatalf("the TEE served %d attempts, want 1", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reused) != 2 || !reused[0] || reused[1] {
+		t.Fatalf("attempts ran on reused connections %v, want [true false]: the retry must open its own", reused)
 	}
 	if got := recorder.attempts(); len(got) != 2 || got[0] || !got[1] {
 		t.Fatalf("attempts asked for their own connection %v, want [false true]: the retry must leave the pool behind", got)
