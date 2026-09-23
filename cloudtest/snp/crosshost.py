@@ -50,6 +50,11 @@ the Hub at it, and retire the old one afterwards with `crosshost.sh down
 --superseded` (see retire.py). The reciprocal invariant is the important half:
 this script never terminates an instance on any path, so no `up` can destroy the
 machine it is replacing.
+
+A recorded tee that is no longer adoptable — stopped, terminated, shutting down —
+is replaced the same way, record and all: it moves to `superseded` before the
+launch overwrites `tee`, because a record dropped there would be an instance
+still in AWS that no reader of crosshost.json could name.
 """
 
 # Annotations stay unevaluated (as in aws.py): the operator-facing way to run
@@ -138,11 +143,12 @@ def recorded_state(ec2, record: dict) -> str:
 def supersede(state: dict, now: str) -> dict | None:
     """Move the recorded tee under `superseded`, returning the old record.
 
-    A `--new` launch replaces the tee record, and the record is the ONLY thing
-    that names the instance the operator still has to terminate — so it moves
-    rather than disappears. Nothing is terminated here: launching and deleting
-    are separate programs on purpose (see retire.py), so no path through a
-    `up` can destroy the machine it is replacing.
+    A launch that replaces the tee record moves it rather than drops it,
+    whatever the reason for replacing it — `--new`, or a record that can no
+    longer be adopted — because the record is the ONLY thing that names the
+    instance the operator still has to terminate. Nothing is terminated here:
+    launching and deleting are separate programs on purpose (see retire.py), so
+    no path through an `up` can destroy the machine it is replacing.
     """
     old = state.pop("tee", None)
     if not old or not old.get("instance_id"):
@@ -412,6 +418,21 @@ def main() -> None:
     tee_state = recorded_state(ec2, tee)
     if tee.get("instance_id") and tee_state not in REUSABLE_STATES:
         print(f"==> recorded tee {tee['instance_id']} is {tee_state}; not adoptable, launching fresh")
+        # The record moves to `superseded` rather than being dropped, for the
+        # same reason `--new` moves it: the launch below replaces state["tee"],
+        # and the record is the only thing naming the instance — so overwriting
+        # it would leave the old machine unreachable from `down --tee-only` and
+        # from retire.py, an instance sitting in AWS with nothing on disk
+        # pointing at it. Not adoptable is not the same as gone. Nothing is
+        # terminated here either: launching and deleting stay separate programs
+        # (see retire.py), so no path through an `up` can destroy what it
+        # replaces.
+        old = supersede(state, time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        if old:
+            print(f"    its record moves to `superseded` so it stays reachable: "
+                  f"./crosshost.sh down --superseded")
+        save_state(state)
+        tee = {}
     if adoptable(tee, tee_state):
         print(f"==> reusing confidential tee {tee['instance_id']} @ {tee.get('public_ip')}")
         print("  (N.B. user-data changes do not apply to a reused instance)")
@@ -466,7 +487,7 @@ def main() -> None:
         print(f"==> tee relay {relay_url}; inspect the leaf over mTLS with ./crosshost.sh fetch")
     superseded = state.get("superseded") or []
     if superseded:
-        print("==> superseded, still RUNNING (nothing terminated): "
+        print("==> superseded (nothing terminated): "
               + ", ".join(e.get("instance_id", "?") for e in superseded))
         print("    once the Hub points at the tee above: ./crosshost.sh down --superseded --dry-run")
         print("    then: ./crosshost.sh down --superseded")

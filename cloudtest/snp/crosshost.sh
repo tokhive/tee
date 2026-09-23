@@ -38,7 +38,7 @@
 #   ./crosshost.sh down      terminate BOTH instances strictly by tag
 #   ./crosshost.sh down --tee-only  terminate ONLY the recorded confidential tee,
 #               leaving a separately-provisioned Hub host untouched
-#   ./crosshost.sh down --superseded  terminate ONLY the instances `up --new`
+#   ./crosshost.sh down --superseded  terminate ONLY the instances `up`
 #               recorded as superseded, and only after checking the current tee
 #               is recorded and running. Never enumerates by tag.
 #   ./crosshost.sh down --dry-run   list what would be terminated, delete nothing
@@ -469,7 +469,7 @@ EOF
 # --tee-only narrows teardown to the tee recorded in crosshost.json. The record
 # is never trusted on its own: the instance is re-checked for both tags before
 # it is terminated, so a stale or hand-edited entry cannot widen the match.
-# --superseded narrows it further still: only the instances an `up --new`
+# --superseded narrows it further still: only the instances an `up`
 # recorded as superseded (retire.py), which is how a swap disposes of the old
 # tee after the Hub has been repointed at the new one.
 cmd_down() {
@@ -487,7 +487,7 @@ cmd_down() {
     exit 2
   fi
   if [[ -n "${superseded}" ]]; then
-    log "step: down --superseded (terminate only the instances recorded by 'up --new')"
+    log "step: down --superseded (terminate only the instances recorded by 'up')"
     ( cd "${HERE}" && "${PY}" retire.py --state "${HOSTS}" ${dry_run} ) | tee -a "${LOG_DIR}/run.log"
     return
   fi

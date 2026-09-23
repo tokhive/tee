@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Terminate the TEE instances that `crosshost.sh up --new` superseded.
+"""Terminate the TEE instances that `crosshost.sh up` superseded.
 
 The swap it serves: bring a new confidential instance up while the old one
 still runs, repoint the Hub at the new one, and only then retire the old one.
