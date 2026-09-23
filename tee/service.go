@@ -928,10 +928,26 @@ type Session struct {
 // sees them.
 func (s *Service) OpenSession(ctx context.Context, job Job) (*Session, error) {
 	now := s.clock()
+	signer := s.activeSigner()
 
 	// Same freshness refusal as Execute, before the sequence or the provider
 	// handshake is spent.
-	if signerStaleAt(s.activeSigner(), now) {
+	if signerStaleAt(signer, now) {
+		return nil, ErrAttestationStale
+	}
+
+	// And the same refusal of an admission with no room left to sign behind it.
+	// A session is not held to the exchange's rule — it is signed by whatever
+	// the process serves when it ends, so a rotation landing mid-session is
+	// fine — but its terminal receipt still has to be signed, and the opening
+	// handshake sits between here and the relay loop that watches the deadline:
+	// a provider connect is not bounded by the signing budget the way an
+	// exchange's own work is, so a session admitted into the last signingHandoff
+	// can spend a sequence number and a provider session and then have no room
+	// left to sign the receipt that would have paid for them. Refusing here is
+	// the trade Execute already makes, in the same place and for the same
+	// reason.
+	if budget, bounded := s.signingBudget(signer); bounded && budget <= 0 {
 		return nil, ErrAttestationStale
 	}
 

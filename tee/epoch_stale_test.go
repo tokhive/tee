@@ -165,6 +165,50 @@ func TestOpenSessionRefusesWhenSignerStale(t *testing.T) {
 	}
 }
 
+// TestOpenSessionRefusesWithoutRoomToSign pins the second freshness gate on the
+// session path, the one that is measured against signingHandoff rather than the
+// signing deadline. A session opened with less than a round of signing left
+// would spend a sequence number and a provider handshake — the connect is not
+// bounded by the budget — and then reach its receipt with no room to sign it,
+// which is provider work bought for nothing. The pair below brackets the gate
+// from both sides at the leaf expiry, where "just stale" and "no room" are one
+// second apart; the admitting case walks past the gate into the later refusals
+// this test is not about, which is what shows the gate let it through.
+func TestOpenSessionRefusesWithoutRoomToSign(t *testing.T) {
+	tests := []struct {
+		name     string
+		notAfter time.Duration
+		refused  bool
+	}{
+		{name: "one second of leaf left has no room to sign", notAfter: 5*time.Minute + time.Second, refused: true},
+		{name: "two seconds of leaf left has room", notAfter: 5*time.Minute + 2*time.Second},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newTestEnv(t, withSigner(epochWithNitroLeaf(t, baseTime.Add(test.notAfter))))
+			spec := env.spec(t, nil)
+			spec.Session = true
+			spec.Method = "GET"
+
+			_, err := env.service.OpenSession(context.Background(), Job{Spec: spec})
+			switch {
+			case test.refused && !errors.Is(err, ErrAttestationStale):
+				t.Fatalf("OpenSession with a leaf %s from expiry = %v, want %v", test.notAfter, err, ErrAttestationStale)
+			case !test.refused && errors.Is(err, ErrAttestationStale):
+				t.Fatalf("OpenSession with a leaf %s from expiry was refused as stale: %v", test.notAfter, err)
+			}
+			if test.refused {
+				if seq, err := env.service.seq.Next([]byte("openai")); err != nil || seq != 1 {
+					t.Fatalf("refused session consumed sequence (next = %d, err = %v)", seq, err)
+				}
+				if len(env.transport.sent()) != 0 {
+					t.Fatal("a refused session reached the provider transport")
+				}
+			}
+		})
+	}
+}
+
 // TestSessionReceiptFollowsTheLiveSigner: a session opened under one epoch
 // finishes under whatever the process serves when it ends. A rotation landing
 // mid-session must move the final receipt to the fresh key, not leave it on
