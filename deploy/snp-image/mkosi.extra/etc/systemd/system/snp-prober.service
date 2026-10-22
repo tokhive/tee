@@ -1,0 +1,14 @@
+[Unit]
+Description=SNP probe (reads PCR 11 + PCR 8 + SEV-SNP report to console)
+After=basic.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/snp-prober
+StandardOutput=journal+console
+StandardError=journal+console
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

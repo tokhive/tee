@@ -1,0 +1,8 @@
+*.raw
+*.efi
+*.zst
+*.blob
+app-bundle.tar
+prober/
+loader/
+mkosi.extra/
