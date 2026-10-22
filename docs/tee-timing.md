@@ -109,9 +109,9 @@ stall 行：`job` `provider` `host` `method` `stream` `cold` `stage` `waited_ms`
 | `tee/service.go` | `Config.Timing`、`newTimings`、`reportTiming`、`watchStall`，以及 `gate`/`cred`/`hash`/`seq`/`sign` 打点 |
 | `tee/rpc.go` | 记录的生命周期、`read`/`emit` 打点、`egress_ms` 累计、拒绝路径也上报 |
 | `tee/transport.go` | `Request.JobID`，以及「transport 可以往 ctx 里的记录打点」这条约定 |
-| `tokenhive/transport/channel.go` | `acquire`/`dial`/`tls` 打点、`SetCold`、握手失败行带上 job |
-| `tokenhive/transport/channelpool.go` | `write`/`ttfb`/`body` 打点 |
-| `tokenhive/metrics/` | 新增。留存环加 `GET /timing` 拉取端点 |
+| `transport/channel.go` | `acquire`/`dial`/`tls` 打点、`SetCold`、握手失败行带上 job |
+| `transport/channelpool.go` | `write`/`ttfb`/`body` 打点 |
+| `metrics/` | 新增。留存环加 `GET /timing` 拉取端点 |
 | `cmd/tee/main.go` | 三个 timing 旗标、metrics 监听、结构化 logger sink（zap 字段来自 `Flat`） |
 | `cloudtest/snp/crosshost.py` | `TEE_METRICS_ADDR=0.0.0.0:18092`、`TOKENHIVE_TEE_TIMING`、安全组放开 18092 |
 

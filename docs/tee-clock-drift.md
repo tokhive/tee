@@ -70,7 +70,7 @@ tsc: Detected 2650.000 MHz                                    ← 未校准的�
 
 漂移本身不可怕。可怕的是它吃掉了一个具体的预算。
 
-轮换节奏由三个常量决定（`tokenhive/cmd/tee/ratls_refresh.go`）：
+轮换节奏由三个常量决定（`cmd/tee/ratls_refresh.go`）：
 
 | 常量 | 值 | 作用 |
 |---|---|---|
@@ -225,6 +225,10 @@ docker run --rm --platform=linux/amd64 -v /tmp/shared_linux.test:/t:ro <alpine p
 tar -xf app-bundle.tar -C /tmp/x && go version -m /tmp/x/app | grep vcs.revision
 ```
 
+2026-10-22 注：迁仓时删掉了 `snp-build.sh` 里按 `BUILD_COMMIT` 干净 clone 的那段
+（连同它读的 `deploy/image-history.json`，该文件不再存在），`record_digest_env` 现在记的是
+产出 bundle 的工作树 HEAD，上面这条警告不再适用。核对手段仍以 `go version -m` 为准。
+
 ### 5.3 真机确认
 
 新 TEE `i-01406dfaa4272363d`（私网 10.0.1.189，AMI `ami-03ca62b0d44017ba6`，
@@ -245,7 +249,7 @@ broker pid=88、app pid=89 uid=65532 都正常。console 时钟与本地 `date -
 
 ```bash
 # 1) 起新 TEE，--new 不终止旧机，旧记录挪到 superseded
-cd tokenhive/cloudtest/snp
+cd cloudtest/snp
 ./crosshost.sh up --tee-only --new --host-ip 10.0.1.151
 
 # 2) 改 Hub 的 hive.env 三行，然后重启 Hub

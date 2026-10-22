@@ -5,8 +5,8 @@
 > 是准的，之后随代码增删会漂移——定位请以函数名为准。
 >
 > **对象**：Hub `52.215.235.214`（`i-018b872fa8ecdefc8`, priv `10.0.1.151`）——一台**独立主机**，上面跑的是另一个
-> 仓库 `tokhive-mvp` 的 `bin/hive`（本文凡说"Hive"都是它）；TEE 是 `tokenhive/cloudtest` 起的 SEV-SNP 实例，
-> **每次重建 AMI 都会换**，当前值以 `tokenhive/cloudtest/crosshost.json` 为准（本文 §3、§6 里抓到的
+> 仓库 `tokhive-mvp` 的 `bin/hive`（本文凡说"Hive"都是它）；TEE 是 `cloudtest` 起的 SEV-SNP 实例，
+> **每次重建 AMI 都会换**，当前值以 `cloudtest/crosshost.json` 为准（本文 §3、§6 里抓到的
 > `10.0.1.63` / `i-0393503927c542557` 是当时的实例，早已终止，仅作证据保留）。region `eu-west-1`。
 
 ---
@@ -84,7 +84,7 @@ Hive 启动
 
 | 文件 | 主体 | 有效期 | 评价 |
 |---|---|---|---|
-| `tokenhive/cloudtest/snp/.certs/hub-ca.pem` | `CN=tokenhive-mtls-ca` | 09-17 → **2036-09** | 10y ✅ |
+| `cloudtest/snp/.certs/hub-ca.pem` | `CN=tokenhive-mtls-ca` | 09-17 → **2036-09** | 10y ✅ |
 | `.certs/hub-cert.pem` | `CN=tokenhive-sim-hub` | 09-17 → **2031-09** | 5y ✅ |
 | `.certs/mp-ca.pem` | `CN=tokenhive-sim-provider-ca` | 09-17 → **2036-09** | 10y ✅ |
 | `.certs/mp-cert.pem` | `CN=tokenhive-sim-provider` | 09-17 → **2031-09** | 5y ✅ |
@@ -117,12 +117,12 @@ Hive 启动
 
 1. **AWS 侧不可控**：NitroTPM 出证时，AWS NSM 签发的叶证书 **TTL 仅 3 小时**（本次实测 3h00m03s；中间 CA 也都是 24h/6d/20d 级别）。
 2. **TEE 侧可修**：`shared.NewRATLSManager` 在**进程启动时**签一张 24h 的自签 RA-TLS 叶，并把**那一刻**的出证证据（含那张 3h 的 NitroTPM 叶）塞进证书扩展 `.2`。之后：
-   - `tokenhive/platform/sevsnp/adapter.go` 的 `GetCertificate` 返回**启动时钉住的**快照；
-   - `Adapter.Refresh()` / `sharedManager.Refresh()` **存在但没有任何生产调用者**（`tokenhive/` 内除了测试，无人调用）。
+   - `platform/sevsnp/adapter.go` 的 `GetCertificate` 返回**启动时钉住的**快照；
+   - `Adapter.Refresh()` / `sharedManager.Refresh()` **存在但没有任何生产调用者**（本仓库内除了测试，无人调用）。
 
    → **TEE 启动 3 小时后，证书里的 NitroTPM 叶过期，Hive 验签开始失败，直到 TEE 重启。**
 
-**已经写好的正确机制（reclaim-tee 侧在用，tokenhive 侧当时没用）**：
+**已经写好的正确机制（共享运行时侧在用，tokenhive 侧当时没用）**：
 
 - `shared/router_runtime.go` 的 `SNPAdmissionDeadline()` / `SNPSigningDeadline()`：两者都取自 NitroTPM 叶的
   `NotAfter` —— 前者就是 `NotAfter` 本身（验证方停收的时刻），后者是 `NotAfter − SNPSigningMargin`（5 分钟）。
@@ -147,11 +147,11 @@ Hive 启动
 | 已建立的 TLS 连接 | — | 只在握手时校验 | **不中断**，可跨过 24h |
 | 其它标准客户端（`curl --cacert` 不带 `-k` 等） | 标准校验 | 查 | 被拒 |
 
-当前部署里唯一的此类客户端 = `tokenhive/cloudtest/snp/crosshost.sh:383-384` 给 `./tee/hub` 的
+当前部署里唯一的此类客户端 = `cloudtest/snp/crosshost.sh:383-384` 给 `./tee/hub` 的
 `-mtls-ca mtls/tee-cert.pem`（hub 作为 client 调 TEE 的 `/v1/execute`、`/v1/receipts` 等）。
 
 **⚠️ 连带风险（比 24h 更容易踩到）**：这个 pin 是 `buildTEEClientTLS()` → `LoadCAPath()`
-（`tokenhive/cmd/hub/main.go:411-427`）**启动时读一次**的静态锚。
+（`cmd/hub/main.go:411-427`）**启动时读一次**的静态锚。
 → TEE 一旦**重启或轮换 RA-TLS 密钥**，pin 立即失效（`not pinned`），**早于** 24h。
 → 反之：**TEE 换叶后，hub 必须重抓 `tee-cert.pem` 并重启**。这一点与 §5 方案 A 直接冲突（见该处 caveat）。
 
@@ -185,7 +185,7 @@ Hive 启动
 ## 5. 部署与操作方案
 
 ### 方案 A（推荐，唯一的根治）：给 tokenhive 的 TEE 接上 RA-TLS 刷新
-- 在 `tokenhive/cmd/tee` 里，参照 `shared/router_runtime.go` 的循环调用 `adapter.Refresh(ctx)`：
+- 在 `cmd/tee` 里，参照 `shared/router_runtime.go` 的循环调用 `adapter.Refresh(ctx)`：
   - 间隔 = `min(RATLSRefreshIntervalSNP(2h), SNPNitroLeafNotAfter(证书)−SNPRefreshMargin(30min))`。
     <br>（2026-09-22 起：瞄准 `SNPSigningDeadline = NotAfter − 5min`，下限 2min —— 见 §7.2 与 §10。）
   - 由于 NitroTPM 叶是 3h，实际节奏 ≈ **每 2h 或 ~2.5h 一次**，远早于 3h 悬崖。
@@ -339,14 +339,14 @@ cfg := &tls.Config{
 
 | 文件 | 改动 |
 |---|---|
-| `tokenhive/cmd/tee/ratls_refresh.go`（新） | epoch 刷新循环：`epochRefresher` 接口、`epochAssembly`、`serviceRuntime`（可热替换的 `*tee.Service`）、`nextRefreshDelay`、`runEpochRefresh` |
-| `tokenhive/cmd/tee/main.go` | `buildEpoch` 改为返回 assembly；handler 经 `svcRuntime.get()` 取当前 service；`-mtls` 之外新增：sevsnp 平台启动刷新 goroutine |
-| `tokenhive/cmd/tee/epoch_sevsnp.go` | 把 `*sevsnp.Adapter` 作为 `Refresher` 一并返回（simulated 返回 nil） |
-| `tokenhive/cmd/tee/epoch_default.go` | 同上，`Refresher` 恒为 nil（软件证据不过期） |
+| `cmd/tee/ratls_refresh.go`（新） | epoch 刷新循环：`epochRefresher` 接口、`epochAssembly`、`serviceRuntime`（可热替换的 `*tee.Service`）、`nextRefreshDelay`、`runEpochRefresh` |
+| `cmd/tee/main.go` | `buildEpoch` 改为返回 assembly；handler 经 `svcRuntime.get()` 取当前 service；`-mtls` 之外新增：sevsnp 平台启动刷新 goroutine |
+| `cmd/tee/epoch_sevsnp.go` | 把 `*sevsnp.Adapter` 作为 `Refresher` 一并返回（simulated 返回 nil） |
+| `cmd/tee/epoch_default.go` | 同上，`Refresher` 恒为 nil（软件证据不过期） |
 | `shared/router_runtime.go` | `RunRATLSRefresh` 的第一个参数由 `*RATLSManager` 放宽为 `RATLSRefresher` 接口（`Refresh(context.Context) error`），使 tokenhive 的 adapter 能复用同一条循环/节奏/失败策略；tee_k/tee_t 的调用点不变 |
-| `tokenhive/cmd/hub/main.go` | 新增 `-tee-verify=pin\|attestation`（默认 `pin`）；attestation 分支用 `shared.VerifyRATLSPeer`（证据 + SPKI 绑定 + `-expected-app`），仍出示 hub client 证书；`validateApplicationPin` 抽成唯一一处 pin 形状校验（receipt 校验器与握手共用） |
-| `tokenhive/cmd/tee/ratls_refresh_test.go`（新） | 节奏 + 轮换落地的测试 |
-| `tokenhive/cmd/hub/main_test.go` | `-tee-verify` 两种模式的测试 |
+| `cmd/hub/main.go` | 新增 `-tee-verify=pin\|attestation`（默认 `pin`）；attestation 分支用 `shared.VerifyRATLSPeer`（证据 + SPKI 绑定 + `-expected-app`），仍出示 hub client 证书；`validateApplicationPin` 抽成唯一一处 pin 形状校验（receipt 校验器与握手共用） |
+| `cmd/tee/ratls_refresh_test.go`（新） | 节奏 + 轮换落地的测试 |
+| `cmd/hub/main_test.go` | `-tee-verify` 两种模式的测试 |
 
 ### 7.2 节奏（`nextRefreshDelay`）
 
@@ -375,12 +375,12 @@ SNPSigningDeadline = NitroTPM 叶 NotAfter − SNPSigningMargin(5min)
 | 验证 | 结果 |
 |---|---|
 | `go build ./...`、`go build -tags sevsnp ./...` | 通过（`demo_lib` 的 cgo 链接失败是缺 `bin/libreclaim` 的既有环境问题，与本次无关） |
-| `go vet ./shared/... ./tokenhive/...` | 干净 |
-| `go test ./shared/... ./tokenhive/...` | 全绿 |
+| `go vet ./shared/... ./...` | 干净 |
+| `go test ./shared/... ./...` | 全绿 |
 | `ratls_refresh_test.go`：合成 AWS-tagged 证据（含自造的 NitroTPM 叶 `NotAfter`）驱动节奏 | 长寿命叶→2h 上限；1h 叶→~30min（证明节奏真的跟随 AWS，而不是固定上限）；已过期叶→10min 下限；`Snapshot` 失败→10min |
 | `ratls_refresh_test.go`：一次真实循环迭代（预取消 ctx） | 轮换后 service 实例被替换、`tee_identity.json` 指向新 key、证据进 store；证据不可发布时**拒绝轮换**且旧 service 继续签 |
 | `main_test.go`：`-tee-verify` 两模式 | pin 模式无 CA ⇒ 返回 nil（明文通道）；pin 模式仍能对钉住的 CA 做链校验；**attestation 模式对"无 attestation 扩展的合法证书"必须拒绝**（fail-closed，而不是退化成只跳主机名校验）；`-mtls-ca` 与 attestation 同时给 ⇒ 报错；缺/坏 `-expected-app` ⇒ 报错 |
-| `tokenhive/harness/harness.sh` | ✅ 0 FAIL（场景 1–18）。第一次运行出现过 4 处 FAIL，**全部**是本机删除护栏导致 `.sim` 清理失效，与本次改动无关；已用四组对照实验确认，见 7.5 |
+| `harness/harness.sh` | ✅ 0 FAIL（场景 1–18）。第一次运行出现过 4 处 FAIL，**全部**是本机删除护栏导致 `.sim` 清理失效，与本次改动无关；已用四组对照实验确认，见 7.5 |
 
 ### 7.5 第一次 harness 运行那 4 处 FAIL 的归因（已实验确认）
 
@@ -408,10 +408,10 @@ SNPSigningDeadline = NitroTPM 叶 NotAfter − SNPSigningMargin(5min)
 
   | 位置 | 现状 | 建议 |
   |---|---|---|
-  | `tokenhive/cloudtest/snp/crosshost.sh:383`（跨机 AWS，现行主路径） | `-mtls-ca mtls/tee-cert.pem` | 换成 `-tee-verify attestation`（同行组里已有 `-allowed-platforms aws-sev-snp -expected-app 'snp-app:${app_hash}'`，无需另加；`-mtls-cert/-mtls-key` 保留） |
-  | `tokenhive/cmd/single/main.go:219`（单机密实例） | `-mtls-ca, teeCert` | 换成 `"-tee-verify", "attestation"`。但这样 `fetchTEECert()`/`teeCert` 与 tee 的 `-init-addr` 自举就失去消费者，属于一次额外的清理，建议单独一步做 |
-  | `tokenhive/cloudtest/remote/run-all.sh:76`（同一脚本跑 simulated 与 sevsnp） | 恒 `-mtls-ca` | 需按 `TEE_PLATFORM` 分支：sevsnp ⇒ `-tee-verify attestation`，simulated ⇒ 保持 pin（sim 证书没有 attestation 扩展，attestation 模式必然拒绝） |
-  | `tokenhive/harness/harness.sh:804/814` | `-mtls-ca` | **保持 pin**：faketee 是 simulated |
+  | `cloudtest/snp/crosshost.sh:383`（跨机 AWS，现行主路径） | `-mtls-ca mtls/tee-cert.pem` | 换成 `-tee-verify attestation`（同行组里已有 `-allowed-platforms aws-sev-snp -expected-app 'snp-app:${app_hash}'`，无需另加；`-mtls-cert/-mtls-key` 保留） |
+  | `cmd/single/main.go:219`（单机密实例） | `-mtls-ca, teeCert` | 换成 `"-tee-verify", "attestation"`。但这样 `fetchTEECert()`/`teeCert` 与 tee 的 `-init-addr` 自举就失去消费者，属于一次额外的清理，建议单独一步做 |
+  | `cloudtest/remote/run-all.sh:76`（同一脚本跑 simulated 与 sevsnp） | 恒 `-mtls-ca` | 需按 `TEE_PLATFORM` 分支：sevsnp ⇒ `-tee-verify attestation`，simulated ⇒ 保持 pin（sim 证书没有 attestation 扩展，attestation 模式必然拒绝） |
+  | `harness/harness.sh:804/814` | `-mtls-ca` | **保持 pin**：faketee 是 simulated |
 
 - 切到 attestation 后，`fetch`（TOFU `/v1/init-cert`）与 `tee-cert.pem` 的分发不再是信任链的一部分，可作为后续简化（也可留作人工核对）。
 - `docs/TokenHive 真实 TEE 部署与测试手册（AWS SEV-SNP）.md` §393/§406/§426 把 TOFU→`-mtls-ca` 写成信任建立主路径，切换后需同步改写。
@@ -450,7 +450,7 @@ RA-TLS 的**新鲜度**由证据负责（AWS 侧 hours 级）与刷新节奏负�
 | commit | 内容 |
 |---|---|
 | `0994c8f` | （amend 自 `2245fee`）方案 A + 选项 (ii)。本文撤出提交、文件保留在工作区（untracked）；提交信息里对本文的引用改成自述，避免指向一棵不含它的树 |
-| `eb8a029` | 证书有效期：`shared/ratls_manager.go` 自签 RA-TLS 叶 24h → 5y；`tokenhive/internal/mtls/mtls.go` 新增 `FixtureCACertLifetime=10y` / `FixtureLeafCertLifetime=5y` 并用于两组 fixtures；`shared.GenCerts()` 复用同一对常量 |
+| `eb8a029` | 证书有效期：`shared/ratls_manager.go` 自签 RA-TLS 叶 24h → 5y；`internal/mtls/mtls.go` 新增 `FixtureCACertLifetime=10y` / `FixtureLeafCertLifetime=5y` 并用于两组 fixtures；`shared.GenCerts()` 复用同一对常量 |
 | `df0c1a1` | `EnsureMTLSCerts` 改成"三件套要么全部复用、要么全部重生成"，并删掉已无调用者的 `writePEMIfAbsent` |
 
 CA 比它签的叶活得久，是为了"重签叶不动已 pin 该 CA 的部署"；这也是磁盘上 `.certs`（`hub-ca` 2036 / `hub-cert` 2031）一直在用的划分 —— 这次是把代码对齐到它。
@@ -459,14 +459,14 @@ CA 比它签的叶活得久，是为了"重签叶不动已 pin 该 CA 的部署"
 
 | 验证 | 结果 |
 |---|---|
-| `go build ./tokenhive/... ./shared/...`（含 `-tags sevsnp`） | 通过 |
-| `go vet ./shared/... ./tokenhive/...` | 干净 |
-| `go test ./shared/... ./tokenhive/...` | 全绿 |
-| `go run ./tokenhive/cloudtest/snp/gencerts <tmp>` + `openssl x509` | `hub-ca`/`mp-ca` → **2036-09**（10y）、`hub-cert`/`mp-cert` → **2031-09**（5y），与磁盘 `.certs` 一致 |
+| `go build ./... ./shared/...`（含 `-tags sevsnp`） | 通过 |
+| `go vet ./shared/... ./...` | 干净 |
+| `go test ./shared/... ./...` | 全绿 |
+| `go run ./cloudtest/snp/gencerts <tmp>` + `openssl x509` | `hub-ca`/`mp-ca` → **2036-09**（10y）、`hub-cert`/`mp-cert` → **2031-09**（5y），与磁盘 `.certs` 一致 |
 | harness 环境里的 `.sim/hub-ca.pem` / `hub-client.pem` | 2036 / 2031 —— `EnsureMTLSCerts` 路径也确认了 |
 | `TestEnsureMTLSCertsWritesTheIdentityAsASet` | 新测试；**在旧实现上会失败**（`the stale certificate was kept beside a freshly generated CA`），新实现通过 —— 已用 `git stash` 实测旧实现确认非空转 |
 | `TestFixtureCertsAreLongLivedAndChain` / `TestRATLSLeafWindowIsLongLived` | 新测试：fixtures "多年 + 真的链到旁边的 CA"、RA-TLS 叶窗口 > 1 年 |
-| `bash tokenhive/harness/harness.sh`（`/tmp` git worktree @ `df0c1a1`） | **0 FAIL**（场景 1–18） |
+| `bash harness/harness.sh`（`/tmp` git worktree @ `df0c1a1`） | **0 FAIL**（场景 1–18） |
 
 ### 8.5 你之前要我定的"两件后续"：一件纯部署，一件是代码 bug（已修）
 
@@ -500,7 +500,7 @@ CA 比它签的叶活得久，是为了"重签叶不动已 pin 该 CA 的部署"
 | ② | 中 | TOFU 的两条导出路径都是**启动快照**：`/v1/init-cert` 缓存启动时的 `tls.Config`；`WriteTEECert` 只在启动时写一次 | 两条都改为跟随轮换（§9.3） |
 | ③ | 中 | **发布失败不缩短重试**：`Refresh` 已经成功、但 epoch 没落到 service 时，节奏仍按证据的新鲜度退到 2h 上限 | `nextRefreshDelay` 增加 `published` 形参，未落地即返回 `minRefreshFloor` |
 | ④ | 低 | `EnsureMTLSCerts` 只判断"三个文件都在"，**看不出错配**（丢了其中一个文件的目录、或两个进程竞争创建的目录会带着一套从未属于彼此的证书通过检查） | 改为"整套是否还能用"：CA 能解析、私钥属于证书、证书是 CA 签的 client 证书；否则整套重建，并写回后复核（§9.4） |
-| ⑤ | — | ~~`crosshost.sh` 给 agent 传的 `-ca "$SIM/ca.pem"` 在部署链里无人创建，起不来~~ | **误报，已撤回**：`mockprovider` 即使收到显式 `-ca/-cert/-key`，也会把 CA 复写到 `shared.CAPEMPath()`（`tokenhive/cmd/mockprovider/main.go:216`），该文件必然存在 |
+| ⑤ | — | ~~`crosshost.sh` 给 agent 传的 `-ca "$SIM/ca.pem"` 在部署链里无人创建，起不来~~ | **误报，已撤回**：`mockprovider` 即使收到显式 `-ca/-cert/-key`，也会把 CA 复写到 `shared.CAPEMPath()`（`cmd/mockprovider/main.go:216`），该文件必然存在 |
 | ⑥ | 低 | 刷新 goroutine 用 `context.Background()`，不可取消 | **不改代码，判定为设计取舍并写明理由**（§9.5） |
 | 简化 | — | `serviceRuntime.includeEvidence` 与 `template.Signer.IncludeEvidence` 是同一事实的副本 | 删掉字段，`adopt` 直接从 template 读 |
 | 简化 | — | hub 身份路径在 `hubClientIdentity` 与 `EnsureMTLSCerts` 里各写了一遍 | 新增 `shared.HubIdentityPaths()` 作为唯一出处 |
@@ -509,10 +509,10 @@ CA 比它签的叶活得久，是为了"重签叶不动已 pin 该 CA 的部署"
 
 | 位置 | 改前 | 改后 |
 |---|---|---|
-| `tokenhive/cloudtest/snp/crosshost.sh`（跨机 AWS，主路径） | `-mtls-ca mtls/tee-cert.pem`，并把 `.certs/tee-cert.pem` 推到主机 | `-tee-verify attestation`（同行已有 `-allowed-platforms aws-sev-snp -expected-app 'snp-app:${app_hash}'`、`-mtls-cert/-mtls-key` 保留）；**不再分发 `tee-cert.pem`** |
-| `tokenhive/cloudtest/remote/run-all.sh` | 恒 `-mtls-ca "$SIM/tee-cert.pem"` | 按 `TEE_PLATFORM` 分支：sevsnp ⇒ `-tee-verify attestation`；simulated ⇒ 保持 pin（sim 叶没有 attestation 扩展，attestation 模式必然拒绝） |
-| `tokenhive/cmd/single/main.go`（单机密实例） | `-mtls-ca teeCert`，且 supervisor 先经 `/v1/init-cert` 把叶拉回本地再交给 hub 固定 | `-tee-verify attestation`；删掉 `fetchTEECert()`，改为等 tee 自己写出的 `tee-cert.pem`（§9.3 末） |
-| `tokenhive/harness/harness.sh:804/814` | `-mtls-ca` | **不动**：faketee 是 simulated，epoch 固定，pin 就是完整信任声明 |
+| `cloudtest/snp/crosshost.sh`（跨机 AWS，主路径） | `-mtls-ca mtls/tee-cert.pem`，并把 `.certs/tee-cert.pem` 推到主机 | `-tee-verify attestation`（同行已有 `-allowed-platforms aws-sev-snp -expected-app 'snp-app:${app_hash}'`、`-mtls-cert/-mtls-key` 保留）；**不再分发 `tee-cert.pem`** |
+| `cloudtest/remote/run-all.sh` | 恒 `-mtls-ca "$SIM/tee-cert.pem"` | 按 `TEE_PLATFORM` 分支：sevsnp ⇒ `-tee-verify attestation`；simulated ⇒ 保持 pin（sim 叶没有 attestation 扩展，attestation 模式必然拒绝） |
+| `cmd/single/main.go`（单机密实例） | `-mtls-ca teeCert`，且 supervisor 先经 `/v1/init-cert` 把叶拉回本地再交给 hub 固定 | `-tee-verify attestation`；删掉 `fetchTEECert()`，改为等 tee 自己写出的 `tee-cert.pem`（§9.3 末） |
+| `harness/harness.sh:804/814` | `-mtls-ca` | **不动**：faketee 是 simulated，epoch 固定，pin 就是完整信任声明 |
 
 `crosshost.sh fetch` 保留，但语义从"建立信任"变成"人工核对"：hub 不再固定它取回的证书，端点返回什么都不会改变 hub 的判定。`TEE_INIT_ADDR`/`TEE_INIT_TOKEN` 因此从信任链降级为无 sshd 实例上的只读窗口。
 
@@ -545,14 +545,14 @@ CA 比它签的叶活得久，是为了"重签叶不动已 pin 该 CA 的部署"
 
 | 验证 | 结果 |
 |---|---|
-| `gofmt -l tokenhive/cmd/` | 干净（本次触及的文件均不在列表内） |
-| `go build ./tokenhive/...` / `go build -tags sevsnp ./tokenhive/...` | 均通过 |
-| `go vet ./tokenhive/...` | 干净 |
-| `go test ./tokenhive/...` | 全绿（含 `cmd/tee`、`cmd/hub`、`cmd/internal/shared`、`internal/mtls`） |
+| `gofmt -l cmd/` | 干净（本次触及的文件均不在列表内） |
+| `go build ./...` / `go build -tags sevsnp ./...` | 均通过 |
+| `go vet ./...` | 干净 |
+| `go test ./...` | 全绿（含 `cmd/tee`、`cmd/hub`、`cmd/internal/shared`、`internal/mtls`） |
 | 新增 `TestRunEpochRefreshAdoptsAndPublishesRotatedEpoch` 的叶断言 | 通过；**在临时移除发布逻辑的实现上会失败**（实测 `read published RA-TLS leaf: ... no such file or directory`），非空转 |
 | 新增 `TestRunEpochRefreshRefusesARotationItCannotPublishATleafFor` | 通过；同一实验下失败（`runtime adopted an epoch whose RA-TLS leaf could not be published`） |
 | `TestEnsureMTLSCertsRebuildsAMismatchedSet` | 通过（`staleCA + freshCert + freshKey` 被整体重建） |
-| `bash tokenhive/harness/harness.sh`（`/tmp` git worktree @ `d5aa723`，场景 1–18） | **0 FAIL**，exit 0（45 项 OK 断言；在 `/tmp` 跑以绕开本机删除护栏导致的 `.sim` 清理失效，见 §7.5） |
+| `bash harness/harness.sh`（`/tmp` git worktree @ `d5aa723`，场景 1–18） | **0 FAIL**，exit 0（45 项 OK 断言；在 `/tmp` 跑以绕开本机删除护栏导致的 `.sim` 清理失效，见 §7.5） |
 | `grep -c FAIL` on 完整 harness 输出 | 0 |
 
 ### 9.7 仍未做
@@ -591,7 +591,7 @@ TEE 实例没有 sshd，现场通道只有两条，这次两条都用上了：
        -CAfile /etc/tokhive/hub-ca.pem -showcerts 2>/dev/null \
      | awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' > leaf.pem
    ```
-   交给 `tokenhive/cloudtest/probe_ratls` 读出叶里 NitroTPM 证据的 `notBefore`/`notAfter`。
+   交给 `cloudtest/probe_ratls` 读出叶里 NitroTPM 证据的 `notBefore`/`notAfter`。
    实测：**叶子寿命正好 3h**，且 `notBefore` 恰好等于上一次轮换成功的时刻 —— 说明 AWS 是**按需**签发的，
    只是在到期前约 **9m48s** 才肯换新（两次重签间隔恒为 2h50m13s）。
 3. **对照代码**：TEE 侧准入判据（`sevsnp.Adapter` 的 epoch 截止时刻）与 Hub 侧的校验（`internal/mtls`）逐行对照，
@@ -648,9 +648,9 @@ TEE 实例没有 sshd，现场通道只有两条，这次两条都用上了：
 
 - 新增/反转的测试：10 分钟到期的叶**应当被准入**（旧断言是"必须拒绝"，已按新语义反转）；叶真过期才 fail-closed；
   签名边界用 6m / 4m 夹住 5m；同叶与更旧叶不替换、更远叶替换；空转 tick 断言**没有** retire 连接。
-- `go build ./...` + `go vet` + `go test ./shared/... ./tee_k/... ./tee_t/... ./tokenhive/...` 全绿，
+- `go build ./...` + `go vet` + `go test ./shared/... ./tee_k/... ./tee_t/... ./...` 全绿，
   且**逐个提交**单独验证过（每个提交自身可编译、测试通过）。
-- `bash tokenhive/harness/harness.sh` 在 `/tmp` 的干净 worktree 里 A/B（基线 `tokhive` vs 本分支尖）：
+- `bash harness/harness.sh` 在 `/tmp` 的干净 worktree 里 A/B（基线 `tokhive` vs 本分支尖）：
   **18 场景 / 45 OK / 0 FAIL，断言逐行相同**。
 
 ## 11. 实施记录（六）：证书轮换的影响面 —— 买家与卖家分别会看到什么（2026-09-22）
@@ -672,11 +672,11 @@ TEE 实例没有 sshd，现场通道只有两条，这次两条都用上了：
 
 | 身份 | 轮换时 | 代码位置 |
 |---|---|---|
-| TEE 服务端 RA-TLS 叶（Hub→TEE 握手用） | **换** | `tokenhive/platform/sevsnp/adapter.go`（`Refresh` 换 epoch） |
-| receipt 签名 key（`KeyID`） | **换** | `tokenhive/cmd/tee/ratls_refresh.go`（`adopt`） |
-| credential inbox key | **不换**：进程启动生成一次，注释写明 deliberately untouched | `ratls_refresh.go:189-192`、`tokenhive/cmd/tee/main.go`（`GenerateInboxKey`） |
-| relay 通道（TEE 拨 Hub 去接 provider） | **不换**：WebSocket + `RelayKeyHeader` 共享密钥，不用客户端证书 | `tokenhive/cmd/tee/main.go:87-92`、`relayHeaders()` |
-| Hub 侧信任根 | **不换**：AWS NitroTPM root 在 measured bundle 里 | `tokenhive/internal/mtls`（`LoadCAPath`） |
+| TEE 服务端 RA-TLS 叶（Hub→TEE 握手用） | **换** | `platform/sevsnp/adapter.go`（`Refresh` 换 epoch） |
+| receipt 签名 key（`KeyID`） | **换** | `cmd/tee/ratls_refresh.go`（`adopt`） |
+| credential inbox key | **不换**：进程启动生成一次，注释写明 deliberately untouched | `ratls_refresh.go:189-192`、`cmd/tee/main.go`（`GenerateInboxKey`） |
+| relay 通道（TEE 拨 Hub 去接 provider） | **不换**：WebSocket + `RelayKeyHeader` 共享密钥，不用客户端证书 | `cmd/tee/main.go:87-92`、`relayHeaders()` |
+| Hub 侧信任根 | **不换**：AWS NitroTPM root 在 measured bundle 里 | `internal/mtls`（`LoadCAPath`） |
 
 结论：**凭据平面（卖家的一切）与证书轮换完全解耦**；唯一会让 provider 重新注册 token 的是 **TEE 进程重启**
 （inbox key 换），不是轮换。
@@ -685,7 +685,7 @@ TEE 实例没有 sshd，现场通道只有两条，这次两条都用上了：
 
 **卖家：无影响。** 卖家的在线通道是 agent ↔ Hub（Hub 自己的 WS），不经 TEE TLS；与 TEE 的唯一接触是
 注册/续期时经 Hub 取 inbox key（`CredentialKey` → `/v1/credential-key`，Hub→TEE mTLS）。inbox key 不变，
-已经封给它的 envelope 继续可用（`tokenhive/hub/tee.go` 的 `CredentialKey` 每次现取、不缓存，正是为了不吃旧 key）。
+已经封给它的 envelope 继续可用（`hub/tee.go` 的 `CredentialKey` 每次现取、不缓存，正是为了不吃旧 key）。
 
 **买家：三条窗口，前两条无感，第三条才是"毫秒级"的那一个。**
 
@@ -836,7 +836,7 @@ provider。差别只在"能不能证明这一点"：`/v1/execute` 上必须靠�
 
 ### 12.7 验证
 
-- `go vet ./shared/... ./tokenhive/...`：无输出。`go test ./shared/... ./tokenhive/...`：全绿。
+- `go vet ./shared/... ./...`：无输出。`go test ./shared/... ./...`：全绿。
 - harness A/B（`/tmp` 干净 worktree，基线 `f774d23`）：`d4d8fb2` 与 `865cd2c` 都是
   **18 场景 / 31 OK / 0 FAIL，断言逐行相同**。
 - 新增测试：`tee/exchange_bound_test.go` 5 个（bound 的取值与 `RequestTimeout` 并存；被切断仍出可结算的
@@ -900,7 +900,7 @@ context」实现，只能**从外面把它切断**。
 
 ### 13.5 验证
 
-- `go vet` 无输出；`go test ./shared/... ./tokenhive/...` 全绿；`go test -race ./tokenhive/tee/` 干净。
+- `go vet` 无输出；`go test ./shared/... ./...` 全绿；`go test -race ./tee/` 干净。
 - 新增 `tee/session_deadline_test.go` 3 个：
   - provider **永不停流**时会话在 deadline 内被切断，并送出**可解码**的 truncated 收据，KeyID 指向被切的那个
     epoch，`ResponseBytes` 等于已交付字节。「能解码」本身就是「签得及时」的证明——`Receipt` 在 margin 内会拒绝；
@@ -1068,7 +1068,7 @@ context」实现，只能**从外面把它切断**。
 
 ## 15. 换 TEE 的标准流程（双机拓扑实测，2026-09-22）
 
-滚动记录，不是提案。拓扑：TEE 是 `tokenhive/cloudtest` 起的 SEV-SNP 实例（无 sshd），Hub 在**另一台普通主机**
+滚动记录，不是提案。拓扑：TEE 是 `cloudtest` 起的 SEV-SNP 实例（无 sshd），Hub 在**另一台普通主机**
 上跑 `tokhive-mvp` 的 `bin/hive`（tmux 会话 `tokhive`）。Hub 侧**不改代码**，只改 `/etc/tokhive/hive.env`。
 
 ```bash
@@ -1076,7 +1076,7 @@ context」实现，只能**从外面把它切断**。
 docker info >/dev/null || open -a Docker
 
 # 1. 从当前工作树重建 AMI（约 13–17 分钟）
-cd tokenhive/cloudtest/snp && ./crosshost.sh build
+cd cloudtest/snp && ./crosshost.sh build
 
 # 2. 读新 digest —— 必须每次重新读，不能沿用上一次的值
 grep SNP_T_DIGEST ../../../deploy/snp-digests.env
@@ -1143,6 +1143,9 @@ WARN Relay serves plaintext address=…:18085 sources=<新私网 IP>/32
    **无关**（本次它写着 `COMMIT=cfe3720`，而 bundle 里明明是 `cfe3720` 之后 7 个提交的代码）。
    ⇒ **判断"代码有没有进包"只能靠 `strings <bundle>/app | grep <符号名>`**，digest 与 COMMIT 都不行。
    （`SNP_T_DIGEST` 本身是可信的：它是从 AMI 的 `snp-app` tag 读回来的。）
+   **2026-10-22 注**：迁仓时删掉了 `snp-build.sh` 的 `BUILD_COMMIT` / `image-history.json` 分支，
+   `record_digest_env` 现在记的是产出 bundle 的那个工作树 HEAD，本条关于 `COMMIT=` 不可信的判断
+   已不成立。核对手段仍以 `go version -m` 看 `vcs.revision` 为准。
 
 ### 15.2 换 TEE 的连带影响（必读）
 
@@ -1417,7 +1420,7 @@ WARN Relay serves plaintext address=…:18085 sources=<新私网 IP>/32
 ## 19. 实施记录（十）：方案 B —— 把轮换挪进重签窗口，并在签名处换手（2026-09-22）
 
 > 本节是**实施记录**，对应提交见 `git log` 本条消息。改动只落在两个文件：
-> `tokenhive/cmd/tee/ratls_refresh.go`（节奏）与 `tokenhive/tee/service.go`（受理门与签名）。
+> `cmd/tee/ratls_refresh.go`（节奏）与 `tee/service.go`（受理门与签名）。
 > 计费口径、Hub、Policy 一律未动。
 
 ### 19.1 三条改动
@@ -1474,7 +1477,7 @@ WARN Relay serves plaintext address=…:18085 sources=<新私网 IP>/32
    ——**结构上拿不到连接**，所以"配对"不是没人想查，是没人能查。
 2. Hub 对**握手**与**收据**用的是同一个 `-expected-app` pin（`cmd/hub/main.go` 的 `buildTEEClientTLS` 与
    `buildVerifier`）：比的是"这是不是那个被度量的镜像"，不是"这与连接是不是同一个 epoch"。
-3. `tokenhive/hub/` 与 `tokenhive/cmd/hub/` 全目录里**没有一处**出现 `KeyID`、`PeerCertificates`、
+3. `hub/` 与 `cmd/hub/` 全目录里**没有一处**出现 `KeyID`、`PeerCertificates`、
    `ConnectionState` 或 `SPKI`（`grep -rniE` 复核，唯一命中的 `epoch` 是 `ErrEpochRetired` 与 `-tee-verify` 的
    帮助文本，都与配对无关）。
 
@@ -1523,7 +1526,7 @@ WARN Relay serves plaintext address=…:18085 sources=<新私网 IP>/32
 
 ### 19.6 测试与未验证项
 
-**单测**：`go test ./tokenhive/... ./shared/...` 全绿（`-count=1`）。
+**单测**：`go test ./... ./shared/...` 全绿（`-count=1`）。
 
 - 新增 `TestRotationIsAimedInsideTheReissueWindow`：把三个常数之间的**关系**钉住——lead 在 `snpReissueWindow`
   之内（否则第一次尝试会被交回正在服务的那张叶）、floor 短于窗口（否则重试网格会整窗跨过）、

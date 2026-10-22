@@ -14,7 +14,7 @@
 | 项 | 是否需要动 |
 | --- | --- |
 | `hive/internal/teeclient/client.go` | **要改**（把「收据 key == 连接证书 SPKI」换成「验收据自带的报告」） |
-| `TEE_REVISION` / `.cache/reclaim-tee` | **不用动**。当前 pin 的 `c6a0980` 里 `platform/sevsnp.Verifier`、`platform.EvidenceVerifier`、`proof.Receipt.Identity()` 都已存在 |
+| `TEE_REVISION` / `.cache/tee` | **不用动**。当前 pin 的 `c6a0980` 里 `platform/sevsnp.Verifier`、`platform.EvidenceVerifier`、`proof.Receipt.Identity()` 都已存在 |
 | `go.mod` | 不用动（`sevsnp` 与已有依赖同一个 module） |
 | TEE 侧 | 不用动 |
 
@@ -70,7 +70,7 @@ func (c *Client) attested(a *proof.AttestationRef, channel *tls.ConnectionState)
 | `(*Client).verify` | 去掉 `channel` 参数；改为 `c.attested(r)`；删掉 `c.recycleNow()` |
 | `(*Client).recycleNow` | 删除（它只服务于那条配对失败） |
 | `ExecuteStream` | `c.verify(...)` 不再传 `response.TLS` |
-| 导入 | 去掉 `crypto/tls`、`crypto/x509`，加 `tokenhive/platform/sevsnp` |
+| 导入 | 去掉 `crypto/tls`、`crypto/x509`，加 `platform/sevsnp` |
 | `connectionLifetime` 注释、`New` 注释、`attested` 注释 | 改写为「收据绑 enclave，不绑连接」 |
 | `client_test.go` | 把 `TestReceiptsAreHeldToTheServingConnection` 换成 `TestReceiptsAreHeldToTheirEnclaveNotTheirConnection`；`channelCertificate` → `epochSPKI`；删掉 cadence 测试里 `recycleNow` 那一段；加 `evidenceStub`（单测造不出真 SEV-SNP 报告，sevsnp 自己的包测试负责真验证据） |
 

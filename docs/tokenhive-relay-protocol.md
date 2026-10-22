@@ -2,7 +2,7 @@
 
 本文面向需要在自己的服务中实现 Relay 服务端、与 TokenHive TEE 对接的开发者。
 
-实现基准：[PR #2](https://github.com/openweb3/reclaim-tee/pull/2)，提交 `0b23c71d60614830da1ef2532c8e67de164b7684`。本文描述该版本的线上格式和行为，不表示当前检出分支已包含对应实现。
+实现基准：早期 PR #2，提交 `0b23c71d60614830da1ef2532c8e67de164b7684`。本文描述该版本的线上格式和行为，不表示当前检出分支已包含对应实现。
 
 ## 1. Relay 的作用与边界
 
@@ -213,16 +213,16 @@ sequenceDiagram
 
 ## 9. 实现位置
 
-下列链接固定到本文的基准提交，避免与其他分支的接口混淆：
+下列文件按本仓库当前路径列出。协议格式仍以基准提交为准，接口若已演进以代码为准：
 
 | 文件 | 作用 |
 |---|---|
-| [transport/relay.go](https://github.com/openweb3/reclaim-tee/blob/0b23c71d60614830da1ef2532c8e67de164b7684/tokenhive/transport/relay.go) | TEE 连接 Hub、发送 Open、包装为 net.Conn |
-| [tunnel/tunnel.go](https://github.com/openweb3/reclaim-tee/blob/0b23c71d60614830da1ef2532c8e67de164b7684/tokenhive/tunnel/tunnel.go) | 帧格式、Stream ID、读写分发、缓冲及关闭 |
-| [tunnel/ws.go](https://github.com/openweb3/reclaim-tee/blob/0b23c71d60614830da1ef2532c8e67de164b7684/tokenhive/tunnel/ws.go) | WebSocket 与连续字节流的适配 |
-| [hub/agenthttp.go](https://github.com/openweb3/reclaim-tee/blob/0b23c71d60614830da1ef2532c8e67de164b7684/tokenhive/hub/agenthttp.go) | TeeRelay 服务端和流桥接 |
-| [hub/agentnet.go](https://github.com/openweb3/reclaim-tee/blob/0b23c71d60614830da1ef2532c8e67de164b7684/tokenhive/hub/agentnet.go) | RelayOpen、UpstreamOpen 和 Agent 注册表 |
-| [provider/agent.go](https://github.com/openweb3/reclaim-tee/blob/0b23c71d60614830da1ef2532c8e67de164b7684/tokenhive/provider/agent.go) | Agent 检查目标并建立上游 TCP 通路 |
-| [transport/channel.go](https://github.com/openweb3/reclaim-tee/blob/0b23c71d60614830da1ef2532c8e67de164b7684/tokenhive/transport/channel.go) | TEE 在 Relay 流上建立 TLS，管理连接复用 |
+| [transport/relay.go](../transport/relay.go) | TEE 连接 Hub、发送 Open、包装为 net.Conn |
+| [tunnel/tunnel.go](../tunnel/tunnel.go) | 帧格式、Stream ID、读写分发、缓冲及关闭 |
+| [tunnel/ws.go](../tunnel/ws.go) | WebSocket 与连续字节流的适配 |
+| [hub/agenthttp.go](../hub/agenthttp.go) | TeeRelay 服务端和流桥接 |
+| [hub/agentnet.go](../hub/agentnet.go) | RelayOpen、UpstreamOpen 和 Agent 注册表 |
+| [provider/agent.go](../provider/agent.go) | Agent 检查目标并建立上游 TCP 通路 |
+| [transport/channel.go](../transport/channel.go) | TEE 在 Relay 流上建立 TLS，管理连接复用 |
 
 Go 服务可以复用 `tunnel` 包完成协议解析和多路复用；自己的 Hub 主要实现按 Provider 路由、打开对应 Agent 流、双向桥接及资源清理。

@@ -98,7 +98,7 @@ holds a few minutes. `crosshost.py` attaches one when
 aws iam create-role --role-name tokenhive-tee-logs \
   --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 aws iam put-role-policy --role-name tokenhive-tee-logs --policy-name ship-logs \
-  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:aws:logs:*:*:log-group:/reclaim-tee/snp:*"}]}'
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:aws:logs:*:*:log-group:/tokhive/tee/snp:*"}]}'
 aws iam create-instance-profile --instance-profile-name tokenhive-tee-logs
 aws iam add-role-to-instance-profile --instance-profile-name tokenhive-tee-logs --role-name tokenhive-tee-logs
 

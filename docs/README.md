@@ -18,10 +18,10 @@ the filenames and this index are in English so links and searches stay usable.
 | [`tee-clock-drift.md`](tee-clock-drift.md) | A guest clock that drifted out of the attestation window, how it was found, and the discipline that keeps it there. |
 | [`tokhive-security-audit.md`](tokhive-security-audit.md) | Security audit of the marketplace branch: trust boundaries, findings, and what was fixed. |
 
-`cert-lifetime-audit.md` and `tokhive-security-audit.md` were written before this
-repository was split out of `reclaim-tee`. Their `tokenhive/` path prefixes and
-commit hashes refer to that earlier layout and are left as written, because they
-are audit records, not current instructions.
+`cert-lifetime-audit.md` and `tokhive-security-audit.md` are audit records: what
+was found and when, not instructions to follow. The commit hashes in them were
+minted before this code moved to its own repository, so they do not resolve in
+this history; the findings still describe the code that is here.
 
 Ground truth for behaviour is the code and its tests. Where a document and the
 code disagree, the code wins, and the document should be corrected in the same

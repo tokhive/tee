@@ -1,6 +1,6 @@
 # TokenHive `tokhive` 分支安全审计报告
 
-- **审计对象**：`reclaim-tee` 仓库 `tokhive` 分支，`tokenhive/` 目录
+- **审计对象**：本仓库迁移前的原 TEE 代码，即旧仓库 `tokhive` 分支的 `` 目录（现已并入本仓库根）
 - **审计基线**：`6b9fd3400ee4512ec15b6f8ed42e957a3bbbbd82`（HEAD，2026-09-19）
 - **触发线索**：commit `ead770949b358226d313c8e6afd92142cc31c2d1`（tee: retire the connections a rotation leaves behind）——**RA-TLS 密钥轮换（epoch）与已建立连接的生命周期不匹配**，属于「状态跨 epoch / 生命周期 / 资源配对」这一类。本报告专门排查同类问题，以及 DoS、计费不公平/偷钱、常规安全漏洞。
 - **方法**：逐文件读源码（code-level verification），不依赖文档或记忆；所有结论附 `file:line`。**未改动任何代码**。
@@ -24,10 +24,10 @@
 ### H1 — 慢读者可无限期占用 Hub goroutine / in-flight 槽 / provider 连接（DoS）
 
 **位置**
-- `tokenhive/cmd/hub/serve.go:201-209`（`newHubServer`：`WriteTimeout` 故意为 0）
-- `tokenhive/cmd/hub/serve.go:228-387`（`userHandler`，SSE 路径）
-- `tokenhive/cmd/hub/serve.go:603-645`（`sessionHandler`，WebSocket 路径）
-- `tokenhive/hub/realtime.go:382-492`（`relaySession`，尤其 `475-491`）
+- `cmd/hub/serve.go:201-209`（`newHubServer`：`WriteTimeout` 故意为 0）
+- `cmd/hub/serve.go:228-387`（`userHandler`，SSE 路径）
+- `cmd/hub/serve.go:603-645`（`sessionHandler`，WebSocket 路径）
+- `hub/realtime.go:382-492`（`relaySession`，尤其 `475-491`）
 
 **问题**：两条用户路径都不对「写回客户端」设期限。
 - SSE：`onChunk` 直接 `w.Write(chunk)`（`serve.go:310`）。客户端停止读取后，TCP 发送窗口填满，`Write` 阻塞；`AttemptTimeout`（默认 3m，`main.go:88`）只作用于 TEE 派发上下文，**无法解除已经阻塞在客户端写上的 goroutine**。
@@ -42,13 +42,13 @@
 ### H2 — 默认配置的信任根不安全 + 反向 relay 默认无认证（安全）
 
 **位置**
-- `tokenhive/cmd/hub/main.go:96`：`-allowed-platforms` 默认 `"simulated"`
-- `tokenhive/cmd/hub/main.go:104`：`-tee-verify` 默认 `"pin"`
-- `tokenhive/cmd/hub/main.go:90`：`-relay-key` 默认 `""` → `RelaySecret` 为空
-- `tokenhive/cmd/hub/main.go:91`：`-tenant-keys` 默认 `""` → 开放模式
-- `tokenhive/cmd/hub/main.go:484-491`：`pin` 模式且未给 `-mtls-ca` 时返回 `nil` TLS 配置 → **明文 HTTP，完全不认证 TEE**
-- `tokenhive/platform/simulated/simulated.go:52,239-260`：`simulated` 的 `CheckEvidence` 只校验固定常量测量值 `...dead`；模拟签名器源码公开，**任何人都能伪造被接受的收据**
-- `tokenhive/hub/agenthttp.go:211-216`：`len(h.relaySecret) > 0` 才校验，空即放行
+- `cmd/hub/main.go:96`：`-allowed-platforms` 默认 `"simulated"`
+- `cmd/hub/main.go:104`：`-tee-verify` 默认 `"pin"`
+- `cmd/hub/main.go:90`：`-relay-key` 默认 `""` → `RelaySecret` 为空
+- `cmd/hub/main.go:91`：`-tenant-keys` 默认 `""` → 开放模式
+- `cmd/hub/main.go:484-491`：`pin` 模式且未给 `-mtls-ca` 时返回 `nil` TLS 配置 → **明文 HTTP，完全不认证 TEE**
+- `platform/simulated/simulated.go:52,239-260`：`simulated` 的 `CheckEvidence` 只校验固定常量测量值 `...dead`；模拟签名器源码公开，**任何人都能伪造被接受的收据**
+- `hub/agenthttp.go:211-216`：`len(h.relaySecret) > 0` 才校验，空即放行
 
 **问题**：出厂默认组合起来是「不认证 TEE + 接受可伪造的模拟 attestation + relay 端点开放」，即一台**无信任根**的 Hub。`/v1/relay` 一旦开放，任何能连到 Hub 的人都能把任意流桥进**任一在线 agent 的隧道**（`agenthttp.go:227-244`，`relayStream` 不校验 `req.Host`），形成经由卖家 IP 的出口代理。缓解仅来自卖家 agent 自己的 `AllowedTargets` 白名单（`provider/agent.go:502-518`，精确匹配）——即攻击者可命中卖家被允许的那些上游，并耗尽卖家 relay 容量（`DefaultMaxRelayConns = 64`）。
 
@@ -58,7 +58,7 @@
 
 ### H3 — 开放模式下租户级控制可被「换 key」绕过（DoS + 计费公平）
 
-**位置**：`tokenhive/cmd/hub/serve.go:95-112`（`tenantResolver.resolve`）；`hub/quota.go`、`hub/budget.go`、`hub/flight.go` 全部以 `tenant` 为键。
+**位置**：`cmd/hub/serve.go:95-112`（`tenantResolver.resolve`）；`hub/quota.go`、`hub/budget.go`、`hub/flight.go` 全部以 `tenant` 为键。
 
 **问题**：`keys` 为空时，`resolve` 直接把请求头 `X-TokenHive-Key` 当作 tenant 返回。于是 Quota（`quota.go`）、Budget（`budget.go`）、MaxInflightPerTenant（`flight.go`）这三个**唯一的租户级限制**，都可以通过每次换一个 key 来获得全新配额——等价于全部失效。默认（无 `-tenant-keys`）即如此。
 
@@ -74,7 +74,7 @@
 
 ### M1 — 报价与调度用「单 MB 底价」，低估按量费用，可能让买家付更多（计费公平）
 
-**位置**：`tokenhive/hub/schedule.go:144-154`（`bookPrice`）、`75-121`（`providersForModel` 排序）、`tokenhive/hub/pricing.go:79-122`（`Price`）、`tokenhive/cmd/hub/serve.go:407-427`（`/v1/models` 展示 `bookPrice`）
+**位置**：`hub/schedule.go:144-154`（`bookPrice`）、`75-121`（`providersForModel` 排序）、`hub/pricing.go:79-122`（`Price`）、`cmd/hub/serve.go:407-427`（`/v1/models` 展示 `bookPrice`）
 
 **问题**：`bookPrice = PerRequestMicros + Premium(model) + PerMegabyteMicros`（恰好 1 MiB 的底价）。而真实账单是 `ceil((RequestBytes+delivered)/1MiB)*PerMB + PerRequest + Premium`。对**大响应**，真实费用随 `PerMB` 线性增长，而报价与排序仍只看那 1 MiB 底价。举例：卖方 A（`per_request=0, per_mb=1`）底价 1，卖方 B（`per_request=2, per_mb=0`）底价 2 → 调度选 A；若响应 1 GiB，买家付 A ≈1024，而 B 只需 2。**买家既被调到了更贵的 provider，又被 `/v1/models` 展示了严重低估（甚至差数量级）的价格**，而买不到原始 rate card（per-MB 对买家不可见）。
 
@@ -86,7 +86,7 @@
 
 ### M2 — 单笔计费上限默认关闭（计费）
 
-**位置**：`tokenhive/cmd/hub/main.go:80`（`-max-job-micros` 默认 0）；`hub/hub.go:557-570` 的 `maxJob` 逻辑在其为 0 时不生效。
+**位置**：`cmd/hub/main.go:80`（`-max-job-micros` 默认 0）；`hub/hub.go:557-570` 的 `maxJob` 逻辑在其为 0 时不生效。
 
 **问题**：`MaxRateMicros = 1<<40`（`rates.go:24`），单组件报价上限约 1.1e6 单位；无 `MaxJobMicros` 时，一张恶意/失误的卡可产生巨额账单，`Budget` 只在**事后**按累计扣减（且是 check-then-record，见 `budget.go:28-32`，并发可超冲 `in-flight × MaxJobMicros`）。
 
@@ -94,7 +94,7 @@
 
 ### M3 — 反向隧道无心跳，半开连接被视为在线（可用性/DoS）
 
-**位置**：`tokenhive/tunnel/ws.go:28-31`（只设 `ReadLimit`，无 ping/pong、无 deadline）；`hub/agentnet.go:200-208`（`register`）、`cmd/hub/serve.go:101-184`（`serveAgentTunnel` 以控制流关闭作为下线依据）
+**位置**：`tunnel/ws.go:28-31`（只设 `ReadLimit`，无 ping/pong、无 deadline）；`hub/agentnet.go:200-208`（`register`）、`cmd/hub/serve.go:101-184`（`serveAgentTunnel` 以控制流关闭作为下线依据）
 
 **问题**：agent 断电/掉线但 TCP 未 RST 时，Hub 的读循环阻塞在 `ReadMessage`，agent 仍被视为 online（`onlineProviders`），新任务被路由到**死隧道** → 502/截断；credential 也不被撤销。检测只依赖 OS TCP keepalive（默认约 2 小时）。
 
@@ -102,7 +102,7 @@
 
 ### M4 — 配额/并发表满即拒绝新租户（DoS）
 
-**位置**：`tokenhive/hub/quota.go:136-142`（`admit` 满则拒绝）、`tokenhive/hub/flight.go:83-93`（同类）
+**位置**：`hub/quota.go:136-142`（`admit` 满则拒绝）、`hub/flight.go:83-93`（同类）
 
 **问题**：表满时拒绝**新**租户（有意不驱逐，见注释），于是一个能用大量不同 tenant 名（开放模式下即换 key）的调用方，可以在一个窗口内把表填满，从而**锁死所有新租户**。
 
@@ -110,7 +110,7 @@
 
 ### M5 — TEE 序号存储每个任务全量重写（吞吐 DoS / 性能）
 
-**位置**：`tokenhive/tee/seqstore.go:123-134`（`Next` → `flushLocked`）、`151-161`（marshal 整个 map + 写临时文件 + rename，无 fsync）
+**位置**：`tee/seqstore.go:123-134`（`Next` → `flushLocked`）、`151-161`（marshal 整个 map + 写临时文件 + rename，无 fsync）
 
 **问题**：每次 `Next` 都在单锁下把**整张计数表**序列化落盘。provider 多、并发高时串行化为瓶颈；同时 `rename` 无 fsync，掉电窗口内的持久性弱于其「必须先持久化再返回」的契约（`seqstore.go:32-36`）。
 
