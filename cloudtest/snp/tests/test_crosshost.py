@@ -25,7 +25,7 @@ from pathlib import Path
 
 _DIR = Path(__file__).resolve().parent          # snp/tests
 SNP = _DIR.parent                                # snp
-REPO = _DIR.parents[3]                           # reclaim-tee
+REPO = _DIR.parents[2]                           # repository root
 CROSSHOST = SNP / "crosshost.sh"
 SRC = CROSSHOST.read_text()
 

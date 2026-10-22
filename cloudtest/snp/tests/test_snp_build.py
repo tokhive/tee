@@ -30,7 +30,7 @@ import unittest
 from pathlib import Path
 
 _DIR = Path(__file__).resolve().parent          # snp/tests
-REPO = _DIR.parents[3]                           # reclaim-tee
+REPO = _DIR.parents[2]                           # repository root
 SNP_BUILD = REPO / "deploy" / "snp-build.sh"
 SRC = SNP_BUILD.read_text()
 
