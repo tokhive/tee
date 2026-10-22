@@ -3,12 +3,16 @@ set -euo pipefail
 
 # Build a SEV-SNP TEE image for one role x cloud and package it as a GCP image
 # or AWS AMI, ready for snp-pair.sh. One script for the whole pipeline:
-# compile (loader + tee binary) -> two-tier image in Docker (snp-image/tier-
+# compile the loader -> two-tier image in Docker (snp-image/tier-
 # build.sh) -> snp-tier.raw -> cloud image. The app-bundle sha256 IS the
 # cross-cloud snp-app: digest (printed at the end).
 #
 #   ./deploy/snp-build.sh <k|t> <gcp|aws> [TAG]   default TAG = tee<role>-<cloud>
 #   ./deploy/snp-build.sh clean
+#
+# Needs SNP_EXTERNAL_BUNDLE=<bundle from cloudtest/snp/pack.sh build>: the app
+# bytes are adopted verbatim (they are the measured identity) and this script
+# only assembles the boot chain around them.
 #
 # Run with the proxy SET (the AWS steps need it); go/docker/gcloud/gsutil steps
 # unset it themselves. Deployment-specific values come from deploy/.env.
@@ -17,17 +21,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "${SCRIPT_DIR}/.env" ]]; then set -a; source "${SCRIPT_DIR}/.env"; set +a; fi
 source "${SCRIPT_DIR}/_lib.sh"
 set -a; source "${SCRIPT_DIR}/snp-image/pins.env"; set +a
-source "${SCRIPT_DIR}/snp-image/app-pins.sh"
-source "${SCRIPT_DIR}/snp-image/source-commit.sh"
 
 : "${SNP_LOADER_GO_TOOLCHAIN:?set SNP_LOADER_GO_TOOLCHAIN in snp-image/pins.env}"
-: "${SNP_TEE_GO_TOOLCHAIN:?set SNP_TEE_GO_TOOLCHAIN in snp-image/pins.env}"
 : "${SNP_APT_SNAPSHOT:?set SNP_APT_SNAPSHOT in snp-image/pins.env}"
-
-# SNP_CA_IMAGE is an app-bundle input as well as the TLS bootstrap image for
-# the base builder. Preserve the current value for the base; historical app
-# reconstruction replaces only the app copy below.
-SNP_BASE_CA_IMAGE="${SNP_CA_IMAGE:?set SNP_CA_IMAGE in snp-image/pins.env}"
+: "${SNP_CA_IMAGE:?set SNP_CA_IMAGE in snp-image/pins.env}"
 
 GCP_PROJECT="${GCP_PROJECT:?set GCP_PROJECT in deploy/.env}"
 IMG_DIR="${SCRIPT_DIR}/snp-image"
@@ -68,40 +65,16 @@ build_loader() {
     echo "[build] loader sha256: $(sha256sum "${dst}" | cut -d' ' -f1)"
 }
 
-# build_bundle compiles tee_<role> + stages mpcl circuits + CA certs into the
-# deterministic app bundle (its sha256 is the cross-cloud snp-app: digest);
-# or, when SNP_EXTERNAL_BUNDLE is set, adopts an already-built app bundle
-# verbatim (used by cloudtest/snp/pack.sh whose app is its own loader
-# probe, not a tee_k/tee_t binary).
+# build_bundle adopts the app bundle cloudtest/snp/pack.sh already built. The
+# bundle — not this script — is the single source of the measured app: pack.sh
+# is what compiles ./cmd/tee with the sevsnp tags AND bakes the two things the
+# enclave refuses to run without (the root CA bundle and the whitelist policy).
+# Its sha256 is the cross-cloud snp-app: digest.
 build_bundle() {
     local role="$1"
-    if [[ -n "${SNP_EXTERNAL_BUNDLE:-}" ]]; then
-        cp "${SNP_EXTERNAL_BUNDLE}" "${BUNDLE_HOST}"
-        echo "[build] adopting external app bundle -- external-bundle=${SNP_EXTERNAL_BUNDLE}"
-        echo "[build] app bundle: $(du -h "${BUNDLE_HOST}" | cut -f1)  sha256: $(sha256sum "${BUNDLE_HOST}" | cut -d' ' -f1)"
-        return
-    fi
-    local dst="${IMG_DIR}/mkosi.extra/usr/local/bin/snp-tee${role}"
-    echo "[build] compiling tee_${role}..."
-    mkdir -p "$(dirname "${dst}")"
-    ( _np; cd "${REPO_ROOT}" && GOTOOLCHAIN="${SNP_TEE_GO_TOOLCHAIN}" GOFLAGS=-mod=readonly GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-        go build -trimpath -tags 'enclave osusergo netgo static_build' \
-        -ldflags "-s -w -buildid= -extldflags=-static" -o "${dst}" "./tee_${role}" )
-    chmod 0755 "${dst}"
-    local stage; stage="$(mktemp -d)"
-    cp "${dst}" "${stage}/app"
-    local mpcdir; mpcdir="$( _np; cd "${REPO_ROOT}" && GOTOOLCHAIN="${SNP_TEE_GO_TOOLCHAIN}" GOFLAGS=-mod=readonly go list -m -f '{{.Dir}}' github.com/markkurossi/mpc )"
-    mkdir -p "${stage}/mpcl"; cp -r "${mpcdir}/pkg" "${stage}/mpcl/pkg"
-    mkdir -p "${stage}/etc/ssl/certs"
-    ${DOCKER} run --rm "${SNP_CA_IMAGE}" cat /etc/ssl/certs/ca-certificates.crt > "${stage}/etc/ssl/certs/ca-certificates.crt"
-    # mpcl is copied from Go's read-only module cache (0444/0555), whose perms
-    # vary by host and block the rm below. Canonicalize modes so the tar (-> app
-    # digest) is reproducible cross-host AND the staging dir is removable.
-    find "${stage}" -type d -exec chmod 0755 {} +
-    find "${stage}" -type f -exec chmod 0644 {} +
-    chmod 0755 "${stage}/app"
-    tar --sort=name --format=gnu --mtime="@1735689600" --owner=0 --group=0 --numeric-owner -C "${stage}" -cf "${BUNDLE_HOST}" .
-    rm -rf "${stage}"
+    : "${SNP_EXTERNAL_BUNDLE:?set SNP_EXTERNAL_BUNDLE to the bundle from cloudtest/snp/pack.sh build}"
+    cp "${SNP_EXTERNAL_BUNDLE}" "${BUNDLE_HOST}"
+    echo "[build] adopting app bundle -- external-bundle=${SNP_EXTERNAL_BUNDLE}"
     echo "[build] app bundle: $(du -h "${BUNDLE_HOST}" | cut -f1)  sha256: $(sha256sum "${BUNDLE_HOST}" | cut -d' ' -f1)"
 }
 
@@ -113,7 +86,7 @@ build_raw() {
     local priv="--privileged -v /dev:/dev" idonly=""
     [[ "${SNP_BUILD_ONLY:-0}" == 1 ]] && { priv=""; idonly="-e SNP_IDENTITY_ONLY=1"; }
     ( _np; ${DOCKER} build --platform=linux/amd64 --build-arg KERNEL_PKG="$(kernel_for "$cloud")" \
-        --build-arg CA_IMAGE="${SNP_BASE_CA_IMAGE}" --build-arg APT_SNAPSHOT="${SNP_APT_SNAPSHOT}" \
+        --build-arg CA_IMAGE="${SNP_CA_IMAGE}" --build-arg APT_SNAPSHOT="${SNP_APT_SNAPSHOT}" \
         --build-arg APT_MIRROR="${SNP_APT_MIRROR:-snapshot}" \
         --build-arg UBUNTU_DIGEST="${SNP_UBUNTU_DIGEST}" \
         --build-arg SYSTEMD_BOOT_VER="${SNP_SYSTEMD_BOOT_VER}" --build-arg SYSTEMD_UKIFY_VER="${SNP_SYSTEMD_UKIFY_VER}" \
@@ -257,7 +230,7 @@ if [[ "${1:-}" == clean ]]; then
 fi
 
 # Persist the just-built digest to deploy/snp-digests.env (per-role, keyed on
-# COMMIT) so update-image-history.sh / snp-redeploy-fleet.sh read it, no hand-edit.
+# COMMIT) so the digest an image embeds is written down once, not retyped.
 record_digest_env() {
     local role="$1" digest="$2" f="${SCRIPT_DIR}/snp-digests.env"
     local commit kd="" td=""
@@ -282,51 +255,22 @@ TAG="${3:-tee${ROLE}-${CLOUD}}"
 # which would fail the build after the image was already registered.
 ROLE_UC="$(tr '[:lower:]' '[:upper:]' <<< "${ROLE}")"
 
-# Reproducible per-commit app build. The app is VCS-stamped, so its digest is
-# commit-specific AND a dirty tree taints it. Default to the latest app_images
-# commit recorded in image-history.json (i.e. what's allowlisted), override with
-# SNP_BUILD_COMMIT. Build the app from a clean clone at that commit (like
-# verify.sh — clone NOT worktree so buildvcs stamps the commit), sidestepping the
-# working tree entirely. The loader/base stay commit-independent.
-BUILD_COMMIT="${SNP_BUILD_COMMIT:-}"
-if [[ -z "${BUILD_COMMIT}" && -f "${SCRIPT_DIR}/image-history.json" ]]; then
-    BUILD_COMMIT="$(python3 -c "import json; a=[x for x in json.load(open('${SCRIPT_DIR}/image-history.json')).get('app_images',[]) if x.get('role')=='${ROLE}']; print(a[-1]['sourceCommit'] if a else '')" 2>/dev/null || true)"
-fi
-if [[ -n "${BUILD_COMMIT}" ]]; then
-    CLONE_DIR="$(mktemp -d)"; trap 'rm -rf "${CLONE_DIR}"' EXIT
-    echo "[build] app source: clean clone @ ${BUILD_COMMIT:0:12} (dirty-tree-immune)"
-    snp_checkout_source_commit "${REPO_ROOT}" "${BUILD_COMMIT}" "${CLONE_DIR}"
-    REPO_ROOT="${CLONE_DIR}"
-    # The app toolchain and CA bundle are part of the recorded app identity, so
-    # take them from the same source commit. Loader/base inputs remain the
-    # current values loaded before the clone.
-    snp_load_app_pins "${REPO_ROOT}/deploy/snp-image/pins.env"
-fi
+# The app is never compiled here: cloudtest/snp/pack.sh builds the bundle (app +
+# root CAs + whitelist policy) and its sha256 is the app identity. Require it up
+# front so a missing bundle fails before the 3-minute base-image Docker build.
+: "${SNP_EXTERNAL_BUNDLE:?set SNP_EXTERNAL_BUNDLE to the bundle built by cloudtest/snp/pack.sh build}"
+[[ -f "${SNP_EXTERNAL_BUNDLE}" ]] || { echo "[build] no bundle at ${SNP_EXTERNAL_BUNDLE}" >&2; exit 1; }
 
-# Check the selected app source, not only the deployment worktree. This rejects
-# an old SEV2-only commit or a verifier pinned to a different R before the image
-# is signed. Certificate reissuance remains safe because the SPKI file is stable.
-# Skipped when the app is adopted verbatim from an external bundle (the cloudtest
-# SNP probe): the app byte blob is already fixed, its source commit's R is moot,
-# and only the base loader/UKI (signed below with this R) carries the boot chain.
-if [[ -z "${SNP_EXTERNAL_BUNDLE:-}" ]]; then
-  cmp -s "${SECURE_BOOT_DIR}/R.pub.pem" "${REPO_ROOT}/shared/secure_boot_release_pub.pem" || {
-      echo "[build] selected app source does not contain the deployed Secure Boot R public key" >&2
-      exit 1
-  }
-fi
-
-# The app digest is VCS-stamped (tracks the commit), so a dirty tree yields a
-# vcs.modified artifact, not the clean-commit value. Refuse unless overridden.
-# (When BUILD_COMMIT cloned above, REPO_ROOT is the clean clone -> passes.)
+# A dirty worktree is only a bookkeeping problem now (the COMMIT recorded in
+# snp-digests.env and the image tag), not an app-identity one.
 if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain 2>/dev/null)" && "${SNP_ALLOW_DIRTY:-0}" != 1 ]]; then
-    echo "[build] working tree is dirty -> app digest would be a vcs.modified artifact." >&2
-    echo "[build] commit/stash first, set SNP_BUILD_COMMIT=<hash>, or SNP_ALLOW_DIRTY=1." >&2
+    echo "[build] working tree is dirty; the recorded COMMIT would not describe the image." >&2
+    echo "[build] commit/stash first, or SNP_ALLOW_DIRTY=1." >&2
     exit 1
 fi
 
 echo "[build] === tee_${ROLE}@${CLOUD} (tag ${TAG}) ==="
-echo "[build] app inputs: ${SNP_TEE_GO_TOOLCHAIN}, ${SNP_CA_IMAGE}"
+echo "[build] base inputs: loader ${SNP_LOADER_GO_TOOLCHAIN}, CA ${SNP_CA_IMAGE}"
 build_loader
 build_bundle "${ROLE}"
 build_raw "${CLOUD}"
@@ -343,7 +287,8 @@ if [[ -n "${SNP_EXPECT_DIGEST:-}" && "${SNP_EXPECT_DIGEST}" != "${DIGEST}" ]]; t
     echo "[build] base/toolchain/commit differ from the allowlisted build; do NOT deploy." >&2
     exit 1
 fi
-# SNP_BUILD_ONLY: identity verify (verify.sh) — emit digests, skip cloud packaging.
+# SNP_BUILD_ONLY: build the raw disk but skip cloud packaging (no qemu-img, no
+# VM import) — enough to inspect the two-tier layout or check reproducibility.
 if [[ "${SNP_BUILD_ONLY:-0}" != 1 ]]; then
     [[ "${CLOUD}" == gcp ]] && package_gcp "${TAG}" || package_aws "${TAG}"
     record_digest_env "${ROLE}" "${DIGEST}"
@@ -351,4 +296,4 @@ fi
 echo "[build] DONE tee_${ROLE}@${CLOUD}"
 echo "[build]   base UKI   = ${BASE_UKI}  (diagnostic only; trust root is Secure Boot R)"
 echo "[build]   app digest = ${DIGEST}  (commit $(git -C "${REPO_ROOT}" rev-parse --short HEAD))"
-echo "[build]   -> record in deploy/image-history.json + allowlist on the router; pass to snp-pair.sh via SNP_${ROLE_UC}_DIGEST"
+echo "[build]   -> the Hub pins this as -expected-app; cloudtest/snp/crosshost.sh reads it back from the AMI tag"

@@ -57,9 +57,8 @@ cmd_build() {
   bundle="${TOKENHIVE_OUT_BUNDLE:-${CLOUDTEST_DIR}/bin/tokenhive-app-bundle.tar}"
   digest="$("${SNP_DIR}/pack.sh" digest "${bundle}")"
   log "app bundle digest: ${digest}"
-  # Reuse the upstream two-tier loader chain: docker/qemu-img/VM-import. The
-  # external bundle is adopted verbatim by snp-build.sh's SNP_EXTERNAL_BUNDLE
-  # hook; role 't'/cloud 'aws' keep it on the unchanged tee_t path.
+  # The app bytes come from the bundle pack.sh just built; snp-build.sh only
+  # assembles the boot chain around them. Role 't' / cloud 'aws' name the image.
   ( cd "${DEPLOY_DIR}" && \
     SNP_EXTERNAL_BUNDLE="${bundle}" SNP_ALLOW_DIRTY=1 \
     ./snp-build.sh t aws tokenhive )
