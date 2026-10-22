@@ -301,7 +301,7 @@ func writePolicy(dir string, p policy.Policy) error {
 // travels inside the measured SNP bundle (covered by SNP_APP_HASH), and tests
 // use it to produce a policy directory to point -policy-dir at.
 //
-// It writes policy.Default — the document in tokenhive/policy/whitelist.json.
+// It writes policy.Default — the document in policy/whitelist.json.
 // Nothing here defines the whitelist: this only puts it on disk in the layout a
 // policy directory needs.
 func WritePolicyDir(dir string) error {

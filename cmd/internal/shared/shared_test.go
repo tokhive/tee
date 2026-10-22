@@ -367,7 +367,7 @@ func TestDefaultPolicyDoesNotLapse(t *testing.T) {
 
 // defaultPolicy is the shipped deployment whitelist, for the tests that need to
 // compare a loaded policy against it. It is policy.Default — the document in
-// tokenhive/policy/whitelist.json — reached through the same call the runtime
+// policy/whitelist.json — reached through the same call the runtime
 // makes, so a document that stopped parsing fails here rather than in a test
 // fixture that had its own copy.
 func defaultPolicy(t *testing.T) policy.Policy {

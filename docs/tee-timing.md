@@ -31,7 +31,7 @@
 | 改动前的数据面日志 | 只有上游握手失败一行 | `transport/channel.go` |
 | 应用输出去向 | `MultiWriter(os.Stdout, /dev/console)` | `deploy/snp-image/loader/main.go:638` |
 | 时钟 | `CLOCK_REALTIME` 被 SNTP 步进，`CLOCK_MONOTONIC` 不动 | `shared/clock_discipline_linux.go:103` |
-| 收据时间戳精度 | 整秒 | `tokenhive/tee/service.go` 的 StartedAt 赋值 |
+| 收据时间戳精度 | 整秒 | `tee/service.go` 的 StartedAt 赋值 |
 
 三条推论：
 
@@ -105,15 +105,15 @@ stall 行：`job` `provider` `host` `method` `stream` `cold` `stage` `waited_ms`
 
 | 文件 | 内容 |
 | --- | --- |
-| `tokenhive/tee/timing.go` | 新增。分段常量、`Timings` 记录器、`TimingReporter` 聚合器、`Flat` 字段渲染、`TimingSinks` 扇出 |
-| `tokenhive/tee/service.go` | `Config.Timing`、`newTimings`、`reportTiming`、`watchStall`，以及 `gate`/`cred`/`hash`/`seq`/`sign` 打点 |
-| `tokenhive/tee/rpc.go` | 记录的生命周期、`read`/`emit` 打点、`egress_ms` 累计、拒绝路径也上报 |
-| `tokenhive/tee/transport.go` | `Request.JobID`，以及「transport 可以往 ctx 里的记录打点」这条约定 |
+| `tee/timing.go` | 新增。分段常量、`Timings` 记录器、`TimingReporter` 聚合器、`Flat` 字段渲染、`TimingSinks` 扇出 |
+| `tee/service.go` | `Config.Timing`、`newTimings`、`reportTiming`、`watchStall`，以及 `gate`/`cred`/`hash`/`seq`/`sign` 打点 |
+| `tee/rpc.go` | 记录的生命周期、`read`/`emit` 打点、`egress_ms` 累计、拒绝路径也上报 |
+| `tee/transport.go` | `Request.JobID`，以及「transport 可以往 ctx 里的记录打点」这条约定 |
 | `tokenhive/transport/channel.go` | `acquire`/`dial`/`tls` 打点、`SetCold`、握手失败行带上 job |
 | `tokenhive/transport/channelpool.go` | `write`/`ttfb`/`body` 打点 |
 | `tokenhive/metrics/` | 新增。留存环加 `GET /timing` 拉取端点 |
-| `tokenhive/cmd/tee/main.go` | 三个 timing 旗标、metrics 监听、结构化 logger sink（zap 字段来自 `Flat`） |
-| `tokenhive/cloudtest/snp/crosshost.py` | `TEE_METRICS_ADDR=0.0.0.0:18092`、`TOKENHIVE_TEE_TIMING`、安全组放开 18092 |
+| `cmd/tee/main.go` | 三个 timing 旗标、metrics 监听、结构化 logger sink（zap 字段来自 `Flat`） |
+| `cloudtest/snp/crosshost.py` | `TEE_METRICS_ADDR=0.0.0.0:18092`、`TOKENHIVE_TEE_TIMING`、安全组放开 18092 |
 
 记录为什么走 ctx 而不是签名字段：打点的人分布在三层（handler 读体、service 准入、transport 换包），走签名就要改 `Service.Execute` 和 `Transport.Do`，而 `Execute` 有上百个调用点。`Request.JobID` 仍然加了，它是给 transport 自己的日志行用的。
 

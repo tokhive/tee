@@ -22,7 +22,7 @@
 //	echo | openssl s_client -connect <tee-ip>:18090 \
 //	    -cert /etc/tokhive/hive-client.pem -key /etc/tokhive/hive-client-key.pem \
 //	    -showcerts 2>/dev/null | awk '/BEGIN CERT/,/END CERT/' > leaf.pem
-//	go run ./tokenhive/cloudtest/probe_ratls leaf.pem
+//	go run ./cloudtest/probe_ratls leaf.pem
 package main
 
 import (

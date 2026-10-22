@@ -42,13 +42,13 @@ User ─HTTP/SSE 或 WS─► Hub ─┬─ /v1/execute（请求模式）─► 
 
 ## 2. 反向隧道的实现：多路复用隧道
 
-许多条并发的 TEE↔上游连接同时流经一条 Agent↔Hub 长连接，因此这条连接必须能多路复用。实现是 tokenhive/tunnel 包：一个自定的分帧协议，在单条全双工字节流上承载多条独立断开的双向字节流（Stream）。
+许多条并发的 TEE↔上游连接同时流经一条 Agent↔Hub 长连接，因此这条连接必须能多路复用。实现是 tunnel 包：一个自定的分帧协议，在单条全双工字节流上承载多条独立断开的双向字节流（Stream）。
 
 分帧为 13 字节头（kind 一字节、8 字节流 ID、4 字节长度）加载荷。三类 frame：KindOpen 打开一条新流（载荷为打开端携带的不透明元数据，接收端把新流连同元数据交给其 open handler）；KindData 携带流上的载荷字节；KindClose 结束一条流。一条流对应一个 TEE 需要的独立字节管道；读测序由一个分发 goroutine 统一做，写侧由一把锁串行化，保证并发写不交错。
 
 流的身份在两端免碰撞：Low 端在 ID 空间下半分配，High 端在上半分配，双方各自单调递增。每条流有独立的接收缓冲上限，消费端读不过来时只重置这一条流（不会拖住其它流）；任一侧主动关闭后，另一侧的读在排空缓冲后返回 io.EOF。多路复用器整体关闭时各流以 io.EOF 收尾，底层连接失败时则以可区分的错误收尾（见第 10 节）。
 
-传输层适配是可替换的：生产用 WebSocket（tokenhive/tunnel/ws.go 把连接包装成连续字节流，一条 binary 消息对应一次 Write，读侧把消息拼接为连续流），测试可用 net.Pipe。分帧协议本身对载荷内容不敏感，因此它既承载控制流（Agent 注册、开流元数据）也承载数据流。
+传输层适配是可替换的：生产用 WebSocket（tunnel/ws.go 把连接包装成连续字节流，一条 binary 消息对应一次 Write，读侧把消息拼接为连续流），测试可用 net.Pipe。分帧协议本身对载荷内容不敏感，因此它既承载控制流（Agent 注册、开流元数据）也承载数据流。
 
 ---
 
@@ -60,7 +60,7 @@ User ─HTTP/SSE 或 WS─► Hub ─┬─ /v1/execute（请求模式）─► 
 
 **Hub**：持有全部需要理解业务语义的逻辑。用户面 API（/v1/chat/completions、/v1/messages、/v1/responses、/v1/session、/v1/models 模型目录）、模型到 Provider 的最低在线价调度、配额、计价与佣金、账本、回执审计、usage（token 用量）解析、重试与故障回退。Hub 还承担反向隧道的两端服务器角色（见第 4 节）：Agent 拨入的注册门（AgentGate）与 TEE 拨入的中继端点（TeeRelay）。Hub 只持有加密的凭证信封（见第 7 节，键 15），永不见明文 token、不接触 TLS 密钥。
 
-**Provider Agent（tokenhive/provider）**：纯粹的反向隧道客户端。拨向 Hub 的 AgentGate 并保持一条多路复用 WebSocket；注册上线后，对 Hub 在隧道上打开的每条中继流，拨向一个固定的允许列表（allowlist）之内的上游 host，然后双向复制字节。Agent 不读取所搬运的字节——TEE 与上游之间的 TLS 会话端到端加密，Agent 只看到自己并未参与会话的一段密文。隧道断开后 Agent 按指数退避重连（起点 1s、封顶 30s，连接成功后重置），每次等待带随机抖动：退避保证单个 Agent 不会以固定速率猛打一个宕掉的 Hub，抖动保证"同一时刻一起掉线"的机群不会在同一时刻一起回来形成锁步尖峰。注册时可**可选声明**自己的上游能服务哪些模型（见第 4 节）；从 CLI 不带 `-models` 启动即视为配置了自动发现：Agent 在拨 Hub 之前向上游惯例的 `/v1/models` 端点拉取一次模型清单，**拉取失败或列表为空即报错并拒绝上线**——一个无法证明自己能服务什么的 Agent 绝不静默地以"服务一切"注册。注册消息未携带模型清单的 Agent（内嵌 provider 包、不配置自动发现的形态），Hub 视为服务任何模型。
+**Provider Agent（provider）**：纯粹的反向隧道客户端。拨向 Hub 的 AgentGate 并保持一条多路复用 WebSocket；注册上线后，对 Hub 在隧道上打开的每条中继流，拨向一个固定的允许列表（allowlist）之内的上游 host，然后双向复制字节。Agent 不读取所搬运的字节——TEE 与上游之间的 TLS 会话端到端加密，Agent 只看到自己并未参与会话的一段密文。隧道断开后 Agent 按指数退避重连（起点 1s、封顶 30s，连接成功后重置），每次等待带随机抖动：退避保证单个 Agent 不会以固定速率猛打一个宕掉的 Hub，抖动保证"同一时刻一起掉线"的机群不会在同一时刻一起回来形成锁步尖峰。注册时可**可选声明**自己的上游能服务哪些模型（见第 4 节）；从 CLI 不带 `-models` 启动即视为配置了自动发现：Agent 在拨 Hub 之前向上游惯例的 `/v1/models` 端点拉取一次模型清单，**拉取失败或列表为空即报错并拒绝上线**——一个无法证明自己能服务什么的 Agent 绝不静默地以"服务一切"注册。注册消息未携带模型清单的 Agent（内嵌 provider 包、不配置自动发现的形态），Hub 视为服务任何模型。
 
 **上游服务商**：只看到 Provider 的出口 IP 与其发来的请求，不知 Hub 与 TEE 的存在。
 
@@ -70,7 +70,7 @@ User ─HTTP/SSE 或 WS─► Hub ─┬─ /v1/execute（请求模式）─► 
 
 ## 4. Hub 的反向隧道服务器
 
-Hub 侧维护两个 WebSocket 端点，这是它作为「NAT 背后贡献者和 TEE 的汇合点」的存在方式。两端的处理逻辑在 tokenhive/hub/agenthttp.go 与 agentnet.go。
+Hub 侧维护两个 WebSocket 端点，这是它作为「NAT 背后贡献者和 TEE 的汇合点」的存在方式。两端的处理逻辑在 hub/agenthttp.go 与 agentnet.go。
 
 **AgentGate（/v1/agent）**：Agent 拨入以在线。握手时校验 Agent 预设的共享密钥（agentKeyMatches 做常数时间比较，任何与该 provider 在 Hub 密钥表（-agent-keys）中的密钥不匹配的握手中断），随后把连接包成多路复用隧道，等待 Agent 的第一条控制流。控制流的开流元数据是 AgentRegister——它声明为哪个 provider 出口、可选展示名、可选的自我报价（SelfPrice）、**可选的模型清单（Models）**，以及**密封在 `Credential` 里的 token**：Agent 从 Hub 的 /v1/credential-key 拉取 TEE 收件公钥，把自己的 token 加密成凭证信封（tee.EncryptCredential）后随注册上报，Hub 只把密文信封存入凭证库、永不见明文。每个 agent 每次拨入都要取一次收件公钥，因此 Hub **只合并在途的拉取**：同一时刻到达的调用共用一个到 TEE 的往返，结果分发给全部等待者后即丢弃，下一个调用者仍重新读 TEE。之所以不做 TTL 缓存：收件密钥在 TEE 每次重启时轮换，缓存会在重启后的整个 TTL 窗口内把已作废的公钥发给每一个重连的 agent，它们封出的信封新 TEE 根本打不开——反而把一次重启拖成更长的故障。Models 是软能力提示：非空时该 Agent 只作为这些模型的候选；为空则该 Agent 服务任何模型。Hub 随后用部署白名单按 host+path 预检该 Agent 的上游（`Policy.AllowsRoute`，覆盖 Hub 暴露的全部路由），不通过即拒绝其上线——卖家"卖什么"由自己声明，但"能不能连"由部署决定。控制流保持打开期间该 Agent 视为在线；控制流一旦关闭，Agent 从调度器离线、隧道拆除，Hub 同时从凭证库撤销该 provider 的信封。Agent 未声明自价时接受 Hub 为该 provider 声明的平台默认价；若 provider 无平台默认价，该 Agent 无法注册。
 
@@ -84,7 +84,7 @@ Hub 侧维护两个 WebSocket 端点，这是它作为「NAT 背后贡献者和 
 
 ## 5. TEE 侧的出站路径
 
-TEE 的出站不知道任何 Agent 地址；它只有一个 Hub 中继端点。tokenhive/transport 拆成两层。
+TEE 的出站不知道任何 Agent 地址；它只有一个 Hub 中继端点。transport 拆成两层。
 
 ChannelManager（transport/channel.go）持有连接驻留语义：以 (provider, host) 为键的通道池，空闲连接在窗口内不关闭（连接「一直保持」由此落实），同一时刻一条 HTTP/1.1 连接承载一个在途请求，异常后整体作废不再复用半开连接。它满足 tee.Transport 与 tee.SessionOpener 两个接口，tee.Service 主体流程（校验 → 授权 → 注入 → 执行 → 摘要 → 签回执）与 /v1/execute 线格式不因连接模型而变。
 
@@ -127,7 +127,7 @@ ChannelConfig 的 egress 配置：RelayURL（经 Hub 中继，生产形态与本
 
 ## 7. JobSpec 与键号现状
 
-JobSpec（tokenhive/jobs/spec.go）是 Hub 交给 TEE 的作业描述，其哈希签进回执，供 provider 事后核对凭证用途。它是「凭证使用授权」的载体，不携带任何网络拓扑或账务元数据。
+JobSpec（jobs/spec.go）是 Hub 交给 TEE 的作业描述，其哈希签进回执，供 provider 事后核对凭证用途。它是「凭证使用授权」的载体，不携带任何网络拓扑或账务元数据。
 
 现有键号连续编号 1–15：1 Version、2 JobID、3 Provider、4 Method、5 Host、6 Path、7 Query、8 Headers、9 BodyHash、10 Nonce、11 ExpiresAt、12 MaxResponseBytes、13 Stream、14 Session、15 Credential。没有空缺。键随规格的演进重新连续编号是刻意的：键号属于线格式的一部分，一旦发布不可重用或重编号；当前连续 1–15 是发布时点的确定性快照。其中键 3 是**卖家 Agent 的身份**（一个 Agent 一个名字、一把 key，同时是回执归属、单调序号与 relay 配对的键），不是上游——上游由部署白名单按 host+path 约束。
 
@@ -141,7 +141,7 @@ Session（键 14，omitempty）标记流式 WebSocket 型会话请求：置位�
 
 仿真的装配原则：cmd/hub serve 以 -agent-keys（per-provider 密钥表）与 -relay-key 启动，同时挂载 AgentGate 与 TeeRelay；Provider Agent 以 -hub、-key（本 provider 的密钥）、-provider、-targets 拨入；真实 TEE 以 -relay ws://…/v1/relay -relay-key 出站。三个角色（hub、agent、tee）的 CLI 参数即反向隧道拓扑的可读表达。仿真不要求证明的正确性（simulated 适配器的既定立场：证据字段结构与真实报告一一对应，只换信任根不换代码路径），但业务代码路径与真实 TEE 完全一致。
 
-harness 场景矩阵覆盖：正常流、策略拒绝、provider 故障（401/429/truncate）、跨重启 ProviderSeq 续增、序列空洞审计、配额、真实 TEE 经反向隧道 + tap 抓包断言（Agent 只见密文、零凭证命中）、Agent 中途被杀优雅失败、epoch 轮换、超尺寸响应截断、连接驻留（N 请求恰一条上游 TCP 连接、断流后作废并重拨）、流模式会话、最低价调度与抽成、Agent 不带 -models 自动发现（经仿真 CA 拉上游 /v1/models）并登记模型目录、买家按精确/子串搜索目录、Hub↔TEE mTLS（TEE 发布 RA-TLS 证书、Hub 钉住且出示客户端身份、错钉/平文均被拒）。三层测试法不变：fake TEE 毫秒级业务测试、真 TEE 进程可信属性测试、接缝测试。一键运行入口为 bash tokenhive/harness/harness.sh；go test ./tokenhive/... 跑单元与跨包测试。
+harness 场景矩阵覆盖：正常流、策略拒绝、provider 故障（401/429/truncate）、跨重启 ProviderSeq 续增、序列空洞审计、配额、真实 TEE 经反向隧道 + tap 抓包断言（Agent 只见密文、零凭证命中）、Agent 中途被杀优雅失败、epoch 轮换、超尺寸响应截断、连接驻留（N 请求恰一条上游 TCP 连接、断流后作废并重拨）、流模式会话、最低价调度与抽成、Agent 不带 -models 自动发现（经仿真 CA 拉上游 /v1/models）并登记模型目录、买家按精确/子串搜索目录、Hub↔TEE mTLS（TEE 发布 RA-TLS 证书、Hub 钉住且出示客户端身份、错钉/平文均被拒）。三层测试法不变：fake TEE 毫秒级业务测试、真 TEE 进程可信属性测试、接缝测试。一键运行入口为 bash harness/harness.sh；go test ./... 跑单元与跨包测试。
 
 ---
 

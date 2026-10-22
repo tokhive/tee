@@ -62,11 +62,11 @@
 ### 2.1 各语言的对接方式
 
 - **Go 接入方**：直接 import 非 internal 包并使用其方法，无需自己实现编码器：
-  - `tokenhive/tee`：`ExecuteRequest.EncodeCanonical()`、`DecodeExecuteRequest()`、`SessionRequest.EncodeCanonical()`、`DecodeReceiptFrame()`、常量 `ExecuteContentType` / `EventReceipt` / `EventError`
-  - `tokenhive/jobs`：`Spec.EncodeCanonical()`、`Spec.Hash()`、`HashBody()`
-  - `tokenhive/proof`：`Verify()`、`SignedReceipt`
-  - `tokenhive/policy`：`Policy` / `Set`（仅当你也运行 TEE 侧）
-- **非 Go 接入方**：`tokenhive/internal/canonical` 是 Go internal 包，外部**无法导入**。请按上述四条规则用你语言的 CBOR 库实现确定性编码（例如 Go 的 `fxamacker/cbor` 用 `CoreDetEncodingOptions`；其它语言需配置"最短长度 + 键排序 + 禁用不定长"）。
+  - `tee`：`ExecuteRequest.EncodeCanonical()`、`DecodeExecuteRequest()`、`SessionRequest.EncodeCanonical()`、`DecodeReceiptFrame()`、常量 `ExecuteContentType` / `EventReceipt` / `EventError`
+  - `jobs`：`Spec.EncodeCanonical()`、`Spec.Hash()`、`HashBody()`
+  - `proof`：`Verify()`、`SignedReceipt`
+  - `policy`：`Policy` / `Set`（仅当你也运行 TEE 侧）
+- **非 Go 接入方**：`internal/canonical` 是 Go internal 包，外部**无法导入**。请按上述四条规则用你语言的 CBOR 库实现确定性编码（例如 Go 的 `fxamacker/cbor` 用 `CoreDetEncodingOptions`；其它语言需配置"最短长度 + 键排序 + 禁用不定长"）。
 
 ### 2.2 域分隔哈希常量
 
@@ -350,7 +350,7 @@ SignedReceipt = {
 ### 7.1 谁定义、如何生效
 
 - 全部署**只有一份** Policy，是部署方的，不是每个 Provider 一份、也不由 Provider 声明。它随 TEE 被测 bundle 一起打包加载：`pack.sh` 把 `SNP_POLICY_DIR` 的 `policy.cbor` 烤进被测 bundle 的 `./policy/`，loader 解包到 `/run/bundle`，运行在里面的进程（tee、hub）按同一条规则取用它——显式 `-policy-dir`/`TEE_POLICY_DIR` 若给出就必须装着 `policy.cbor`，缺失在任何模式下都是启动错误（绝不静默回落到另一份白名单）；未显式配置时取 bundle 里的 `./policy`，再没有才落到 `TOKENHIVE_SIM_DIR`（`shared.ResolvePolicyDir`）。本地仿真没有 bundle，于是走最后一条：`EnsureDefaults` 在状态目录里生成 `policy.cbor`。宽松只属于仿真：sevsnp 平台上白名单是**强制**的，bundle 里没有 `policy.cbor`，TEE 直接 `log.Fatalf` 拒绝启动，绝不回退到默认文档；且 sevsnp 下显式目录只能**复述**被测字节（逐字节一致才放行），内容不一致同样拒绝启动——飞地执行的必须恰好是 attestation 覆盖的那份，覆盖不能替代度量。bundle 外的 Hub（跨主机部署时跑在普通主机上）由 `crosshost.sh deploy` 收到同一份 `policy.cbor` 并以 `-policy-dir` 指向它，这样 hub 的准入与 `/v1/policies` 与 TEE 执行的是**同一份、且被 `SNP_APP_HASH` 覆盖的字节**。这条不变量由 `crosshost.sh` 保证、而非仅靠约定：`up` 记录的 `app_hash` 取自所启动镜像自带的 `snp-app` 标签（即该镜像内嵌 bundle 的摘要），`deploy` 按这个摘要从 `bin/bundles/<sha256>.tar` 取回**那一版**的白名单，取不到就拒绝部署——所以 hub 拿到的永远是被测应用里那一份，而不是「当前构建」那一份。
-- **写下来的是一份 JSON 文档**：白名单以 `tokenhive/policy/whitelist.json` 维护（随代码发行，由 `policy.Default` 读取），`-emit-policy-dir` 把它转成 `policy.cbor` 交付给 bundle——`policy.cbor` 是派生件，文档才是唯一定义。文档只写规则（`version`/`hosts`/`rules`/`limits`）；**有效期窗口不在文档里**，由加载方统一盖成"永不过期"（`policy.NoIssueDate`/`policy.NoExpiry`）：日期是策略而不是规则，且 `IssuedAt` 必须是常量，否则每次构建都会挪动 `SNP_APP_HASH`。文档里出现未知字段会被**直接拒绝**，不会静默丢弃——白名单最不能有的失败就是"文件写着一条规则、飞地其实没执行"。改白名单=改这份文档并重新构建。
+- **写下来的是一份 JSON 文档**：白名单以 `policy/whitelist.json` 维护（随代码发行，由 `policy.Default` 读取），`-emit-policy-dir` 把它转成 `policy.cbor` 交付给 bundle——`policy.cbor` 是派生件，文档才是唯一定义。文档只写规则（`version`/`hosts`/`rules`/`limits`）；**有效期窗口不在文档里**，由加载方统一盖成"永不过期"（`policy.NoIssueDate`/`policy.NoExpiry`）：日期是策略而不是规则，且 `IssuedAt` 必须是常量，否则每次构建都会挪动 `SNP_APP_HASH`。文档里出现未知字段会被**直接拒绝**，不会静默丢弃——白名单最不能有的失败就是"文件写着一条规则、飞地其实没执行"。改白名单=改这份文档并重新构建。
 - **部署时定死、运行期不可改**：TEE 内没有任何修改 Policy 的代码路径，加载发生在进程启动、之后只读。因此不存在轮换接口，也不需要防回滚逻辑。
 - 完整性由**证明**背书：TEE 启动时计算这份 Policy 的哈希（`policy.Hash()`），并把它绑进 attestation（仿真落在证据的 `policy_hash` 字段；AWS 上策略文件作为被测 bundle 的一部分被 SNP_APP_HASH 一并测量）。**回执里也带同一个 `policy_hash`**，且验证方一旦 pin 了部署白名单，`attest.Verifier` 会逐条比对回执所载的哈希，不符即拒——这才是"回执证明了飞地按这份白名单运行"。由于策略字节进入了被测 bundle，**换白名单会改变应用测量指纹（`snp-app:<hash>`）**，而不是在运行期静默放宽 TEE 接受的边界。
 - **准入**：Provider Agent 上线时，Hub 用同一份 Policy 按 host+path 核对它的上游是否被允许（见第 12 章）；不允许的 Agent 在上线处即被拒，而不是等到作业被 TEE 拒绝。核对的 host 是该 Provider 自己的上游——Hub 启动参数 `-provider-hosts` 有覆盖用覆盖，否则走 Hub 统一 `-host`——因此多 vendor 部署里每个卖家按自家上游独立准入。
@@ -366,7 +366,7 @@ SignedReceipt = {
 | 7 | `limits` | Limits | `{max_response_bytes, max_body_bytes, allowed_headers}` |
 | 8/9 | `issued_at` / `expires_at` | IssuedAt / ExpiresAt | 生效窗口；**不在文档里**，由加载方盖成永不过期 |
 
-> 上表即全部字段。键号是线格式（CBOR）的一部分：空缺的键号一律不再使用，也不会被重新编号。文档键即 `tokenhive/policy/whitelist.json` 的写法，该文件本身就是一份完整示例。
+> 上表即全部字段。键号是线格式（CBOR）的一部分：空缺的键号一律不再使用，也不会被重新编号。文档键即 `policy/whitelist.json` 的写法，该文件本身就是一份完整示例。
 
 ### 7.3 授权判定与拒绝原因
 
@@ -413,7 +413,7 @@ SignedReceipt = {
 - `Ephemeral` + `Nonce` + `Ciphertext`：一次性 X25519 临时公钥 + AES-GCM 随机 nonce + 密文，密钥由 `ECDH(收件私钥, 临时公钥)` 派生；
 - 密文内容是 `{Provider, Secret, IssuedAt}` 的 JSON——**Provider 被绑进密文**，Hub 无法把给 Provider A 的信封改派给 Provider B（TEE 打开后比较声明 Provider 与作业 Provider）。
 
-信封对外有两种形态：控制面上以 **JSON**（`key_id`/`ephemeral`/`nonce`/`ciphertext`，base64）在 Agent 注册时经 Hub 中转；作业面上由 Hub 用 **canonical CBOR** 编码后放进 `JobSpec.Credential`。两条形态编解码都在 `tokenhive/tee`（`EncodeCanonical` / `DecodeEnvelope` / `EncryptCredential`）。
+信封对外有两种形态：控制面上以 **JSON**（`key_id`/`ephemeral`/`nonce`/`ciphertext`，base64）在 Agent 注册时经 Hub 中转；作业面上由 Hub 用 **canonical CBOR** 编码后放进 `JobSpec.Credential`。两条形态编解码都在 `tee`（`EncodeCanonical` / `DecodeEnvelope` / `EncryptCredential`）。
 
 ### 7.4.3 凭证生命周期（Agent 上线 → 掉线）
 
@@ -431,7 +431,7 @@ SignedReceipt = {
 ## 8. 验证回执（验签）
 
 ```go
-import "github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+import "github.com/tokhive/tee/proof"
 
 err := proof.Verify(signed, proof.VerifyOptions{
     Now:              time.Now(),                 // 验证方时钟；零值用 time.Now()
@@ -513,7 +513,7 @@ hub -audit -provider openai-sim   # 只看一个 Provider
 
 ## 11. 接入清单（上线前逐项打勾）
 
-- [ ] 用**确定性 CBOR**（整数键、键排序、最短长度、无不定长）编码；Go 方直接用 `tokenhive/tee` 的 `EncodeCanonical`
+- [ ] 用**确定性 CBOR**（整数键、键排序、最短长度、无不定长）编码；Go 方直接用 `tee` 的 `EncodeCanonical`
 - [ ] JobID 每次随机 16 字节；Nonce 8–64 字节；ExpiresAt 设置为"现在 + 很短的窗口"
 - [ ] BodyHash = `sha256("TokenHive.RequestBody.v1" ‖ body)`，且发送体与之一致
 - [ ] 不设置任何 TEE 独占头（`authorization`/`host`/`content-length`/…）

@@ -48,7 +48,7 @@
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN="$SCRIPT_DIR/bin"
 SIM="$REPO/.sim"
 
@@ -91,7 +91,7 @@ wipe() {
 # --- kill any stale simulation processes from an interrupted prior run -----
 # (a leftover faketee would still hold :18090 and serve an old policy/seqstore)
 pkill -f "$BIN/" 2>/dev/null
-pkill -f "tokenhive/cmd" 2>/dev/null
+pkill -f "$REPO/cmd/" 2>/dev/null
 sleep 0.3
 
 # --- build ---------------------------------------------------------------
@@ -99,7 +99,7 @@ echo "==> building simulation binaries"
 mkdir -p "$BIN"
 for pkg in mockprovider faketee hub tee agent streamer sessiondriver; do
   echo "    building $pkg"
-  go build -o "$BIN/$pkg" "./tokenhive/cmd/$pkg" || { echo "build failed for $pkg"; exit 1; }
+  go build -o "$BIN/$pkg" "./cmd/$pkg" || { echo "build failed for $pkg"; exit 1; }
 done
 
 # --- fresh state ---------------------------------------------------------

@@ -23,7 +23,7 @@ instance down strictly by tag.
    (`runAWSIsolated`) only the root *broker* copy strips it (it owns the TPM/SEV
    devices and doesn't need it); the unprivileged **app** keeps it.
 3. `shared.NewRATLSManager`/`ExtractIdentityFromRATLS` (the exact code
-   `tee_k`/`tee_t` and `tokenhive/cmd/tee` run) bind `SNP_APP_HASH` into the
+   `tee_k`/`tee_t` and `cmd/tee` run) bind `SNP_APP_HASH` into the
    combined AWS SEV-SNP attestation's `report_data` and self-verify it.
 
 So the earlier `SNP_APP_HASH not set by loader` failure had one cause: the TEE

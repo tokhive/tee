@@ -27,10 +27,10 @@ build() {
   local out="bin"
   mkdir -p "$out"
   log "building linux/amd64 binaries"
-  (cd ../.. && \
-   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags sevsnp -o "tokenhive/cloudtest/$out/tee" ./tokenhive/cmd/tee && \
+  (cd .. && \
+   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags sevsnp -o "cloudtest/$out/tee" ./cmd/tee && \
    for pkg in hub mockprovider agent; do \
-     GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "tokenhive/cloudtest/$out/$pkg" "./tokenhive/cmd/$pkg" || exit 1; \
+     GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o "cloudtest/$out/$pkg" "./cmd/$pkg" || exit 1; \
    done) || { log "build failed"; exit 1; }
   log "built: $(ls "$out")"
 }

@@ -3,7 +3,7 @@
 #
 # Starts the same real components the S4 harness uses (mock provider over real
 # TLS, Provider Agent over the reverse tunnel, simulated TEE on the genuine
-# tee.Service) and runs tokenhive/cmd/bench in two configurations:
+# tee.Service) and runs cmd/bench in two configurations:
 #
 #   direct  -> client -> provider            (baseline, no TEE/Agent)
 #   tee     -> client -> TEE -> Hub relay -> Agent -> provider
@@ -23,12 +23,12 @@
 # relative TTFT target (e.g. the latency a real provider would add).
 #
 # Usage:
-#   bash tokenhive/harness/bench.sh
-#   bash tokenhive/harness/bench.sh -baseline-rtt 50ms
+#   bash harness/bench.sh
+#   bash harness/bench.sh -baseline-rtt 50ms
 
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN="$SCRIPT_DIR/bin"
 SIM="$REPO/.sim"
 
@@ -44,14 +44,14 @@ done
 
 # kill stale simulation processes from an interrupted prior run
 pkill -f "$BIN/" 2>/dev/null
-pkill -f "tokenhive/cmd" 2>/dev/null
+pkill -f "$REPO/cmd/" 2>/dev/null
 sleep 0.3
 
 echo "==> repo: $REPO"
 mkdir -p "$BIN"
 echo "==> building: mockprovider agent hub tee bench"
 for pkg in mockprovider agent hub tee bench; do
-  go build -o "$BIN/$pkg" "./tokenhive/cmd/$pkg" || { echo "build failed for $pkg"; exit 1; }
+  go build -o "$BIN/$pkg" "./cmd/$pkg" || { echo "build failed for $pkg"; exit 1; }
 done
 
 rm -rf "$SIM"

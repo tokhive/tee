@@ -4,7 +4,7 @@
 // The loader launches this binary twice on AWS SEV-SNP: once as a root,
 // device-owning attestation broker (/dev/sev-guest, /dev/tpm*) and once as the
 // unprivileged app connected to it. `RunSNPAttestationBrokerIfRequested`
-// handles that split (the same one tee_k/tee_t and tokenhive/cmd/tee use).
+// handles that split (the same one tee_k/tee_t and cmd/tee use).
 //
 // As the app, this probe proves the core claim of a real TEE run: that the
 // loader correctly exported `SNP_APP_HASH` (= sha256 of the measured bundle)

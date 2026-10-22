@@ -71,7 +71,7 @@ build_loader() {
 # build_bundle compiles tee_<role> + stages mpcl circuits + CA certs into the
 # deterministic app bundle (its sha256 is the cross-cloud snp-app: digest);
 # or, when SNP_EXTERNAL_BUNDLE is set, adopts an already-built app bundle
-# verbatim (used by tokenhive/cloudtest/snp/pack.sh whose app is its own loader
+# verbatim (used by cloudtest/snp/pack.sh whose app is its own loader
 # probe, not a tee_k/tee_t binary).
 build_bundle() {
     local role="$1"

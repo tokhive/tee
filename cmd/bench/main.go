@@ -13,7 +13,7 @@
 // mean something against a running provider and a running TEE, and they are
 // the kind of thing you want to watch trend over time rather than assert
 // exact values in CI. The hard regression gates (proof < 2KB, receipt p95
-// < 5ms) are additionally locked in by tokenhive/tee/receipt_budget_test.go
+// < 5ms) are additionally locked in by tee/receipt_budget_test.go
 // so they catch regressions without a network.
 package main
 

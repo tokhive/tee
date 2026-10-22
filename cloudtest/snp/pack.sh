@@ -34,7 +34,7 @@ set -euo pipefail
 set -a; source ../.env 2>/dev/null || true; set +a
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)" 2>/dev/null || SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"   # reclaim-tee
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"   # repository root
 OUT_BUNDLE="${TOKENHIVE_OUT_BUNDLE:-${SCRIPT_DIR}/../bin/tokenhive-app-bundle.tar}"
 GO_TOOLCHAIN="${SNP_TEE_GO_TOOLCHAIN:-}"
 
@@ -91,7 +91,7 @@ bundle_mp() {
 }
 
 # build_single packs a one-instance topology bundle: ./app is the supervisor
-# (tokenhive/cmd/single) and the real services travel alongside it as ./svc/*,
+# (cmd/single) and the real services travel alongside it as ./svc/*,
 # plus the Hub mTLS identity ./mtls/{hub-ca,hub-cert,hub-key}.pem. With
 # TOKENHIVE_SUPERVISE=1 in user-data the supervisor runs mockprovider+tee+hub+
 # agent all on loopback inside the single confidential instance; without it the
@@ -170,11 +170,11 @@ bundle_cacerts() {
 build_single() {
     local stage="$1"
     echo "[pack] compiling supervisor ./app + svc/*"
-    gobuild ./tokenhive/cmd/single        "${stage}/app"
-    gobuild ./tokenhive/cmd/tee "${stage}/svc/tee" 'sevsnp enclave osusergo netgo static_build'
-    gobuild ./tokenhive/cmd/hub          "${stage}/svc/hub"
-    gobuild ./tokenhive/cmd/agent        "${stage}/svc/agent"
-    gobuild ./tokenhive/cmd/mockprovider "${stage}/svc/mockprovider"
+    gobuild ./cmd/single        "${stage}/app"
+    gobuild ./cmd/tee "${stage}/svc/tee" 'sevsnp enclave osusergo netgo static_build'
+    gobuild ./cmd/hub          "${stage}/svc/hub"
+    gobuild ./cmd/agent        "${stage}/svc/agent"
+    gobuild ./cmd/mockprovider "${stage}/svc/mockprovider"
     bundle_ca "${stage}"
     bundle_mp "${stage}"
     bundle_cacerts "${stage}"
@@ -194,10 +194,10 @@ build() {
     if [[ "${TOKENHIVE_BUILD_SINGLE:-0}" == "1" ]]; then
         build_single "${stage}"
     elif [[ "${TOKENHIVE_BUILD_STUB:-0}" == "1" ]]; then
-        gobuild ./tokenhive/cloudtest/snp/stub "${stage}/app"
+        gobuild ./cloudtest/snp/stub "${stage}/app"
     else
-        echo "[pack] compiling tokenhive/cmd/tee (sevsnp) -> app"
-        gobuild ./tokenhive/cmd/tee "${stage}/app" 'sevsnp enclave osusergo netgo static_build'
+        echo "[pack] compiling cmd/tee (sevsnp) -> app"
+        gobuild ./cmd/tee "${stage}/app" 'sevsnp enclave osusergo netgo static_build'
         bundle_ca "${stage}"
         bundle_mp "${stage}"
         bundle_cacerts "${stage}"

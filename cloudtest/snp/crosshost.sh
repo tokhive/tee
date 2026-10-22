@@ -61,7 +61,7 @@ CERTS_DIR="${HERE}/.certs"
 # enclave loads exactly this file at startup and refuses to serve without it, so
 # it is not optional build input: a bundle built without it produces an AMI whose
 # TEE cannot come up. It is regenerated on every build from the document in
-# tokenhive/policy/whitelist.json — the document is deterministic, so re-emitting
+# policy/whitelist.json — the document is deterministic, so re-emitting
 # it is a no-op until the document changes, and a change to the document always
 # reaches the bundle. Set SNP_POLICY_DIR to ship an operator-authored whitelist
 # instead.
@@ -78,7 +78,7 @@ BUNDLES_DIR="${CLOUDTEST}/bin/bundles"
 # whitelist's remote location is written down — the upload and the Hub's
 # -policy-dir both derive from it, so the two cannot disagree again.
 REMOTE_POLICY_REL="policy"
-REPO_ROOT="${HERE}/../../.."            # reclaim-tee
+REPO_ROOT="${HERE}/../.."            # repository root
 DEPLOY_DIR="${REPO_ROOT}/deploy"
 HOSTS="${CLOUDTEST}/crosshost.json"
 
@@ -151,7 +151,7 @@ PYDIG
 #
 # When the operator supplied a directory (SNP_POLICY_DIR) that is their
 # document and this script must not touch it. Otherwise the whitelist is the
-# document shipped in tokenhive/policy/whitelist.json, and it is regenerated on
+# document shipped in policy/whitelist.json, and it is regenerated on
 # every build: the document is deterministic, so re-emitting it is a no-op until
 # the document actually changes — and a frozen copy would silently keep shipping
 # the old rules (a new host or path in the document would never reach the
@@ -166,7 +166,7 @@ ensure_policy() {
     return
   fi
   mkdir -p "${POLICY_DIR}"
-  ( cd "${REPO_ROOT}" && go run ./tokenhive/cmd/tee -emit-policy-dir "${POLICY_DIR}" )
+  ( cd "${REPO_ROOT}" && go run ./cmd/tee -emit-policy-dir "${POLICY_DIR}" )
   log "deployment whitelist -> ${POLICY_DIR}/policy.cbor"
 }
 
@@ -181,7 +181,7 @@ ensure_certs() {
     return
   fi
   mkdir -p "${CERTS_DIR}"
-  ( cd "${REPO_ROOT}" && go run ./tokenhive/cloudtest/snp/gencerts "${CERTS_DIR}" )
+  ( cd "${REPO_ROOT}" && go run ./cloudtest/snp/gencerts "${CERTS_DIR}" )
   log "TLS fixtures -> ${CERTS_DIR}"
 }
 
