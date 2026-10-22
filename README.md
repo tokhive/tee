@@ -36,7 +36,7 @@ tunnel/             reverse-tunnel framing shared with the provider agent
 jobs/ policy/ proof/  job specs, the egress whitelist, receipts
 platform/           attestation platforms: sevsnp (production), simulated (tests)
 evidence/ metrics/  evidence retrieval, timing instrumentation
-shared/             runtime base inherited from reclaim-tee: RA-TLS, SNP attestation,
+shared/             runtime base: RA-TLS, SNP attestation,
                     Secure Boot, logging, env helpers
 proto/              generated protocol types used by shared
 
@@ -66,7 +66,7 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
 ```
 
 The local harness starts a reference Hub, a reference provider agent, a mock AI
-provider and the TEE on loopback and drives sixteen scenarios end to end:
+provider and the TEE on loopback and drives eighteen scenarios end to end:
 
 ```sh
 bash harness/harness.sh
@@ -103,6 +103,7 @@ a replaceable app bundle whose SHA-256 is the `snp-app:` identity the Hub pins.
 
 ```sh
 cp deploy/.env.example deploy/.env      # GCP_PROJECT and AWS_SNP_REGION
+cp cloudtest/.env.example cloudtest/.env # TOKENHIVE_USER: the tag prefix on every resource
 # provision deploy/secure-boot/R.key out of band; it is gitignored on purpose
 
 cd cloudtest/snp
@@ -112,6 +113,10 @@ cd cloudtest/snp
 ./crosshost.sh verify
 ./crosshost.sh down
 ```
+
+The full operations manual, including what each step creates and the traps found
+while doing it for real, is [`docs/aws-snp-deployment.md`](docs/aws-snp-deployment.md);
+[`cloudtest/snp/README.md`](cloudtest/snp/README.md) documents the cross-host tool itself.
 
 The build prints two values worth recording: the app digest (`snp-app:<sha256>`),
 which the Hub must pin via `HIVE_TEE_EXPECTED_APP`, and the base UKI hash, which
@@ -140,6 +145,6 @@ Pin a commit, not a version range. `hive` and `bee` keep the pinned commit in a
 ## Documentation
 
 `docs/README.md` indexes the design notes, the external interface contract, the
-AWS deployment manual, and the incident audits. The audit notes were written
-against the previous repository layout; their `tokenhive/` prefixes refer to paths
-as they were before this repository was split out.
+AWS deployment manual, and the incident audits. Paths in every note are written as
+they are in this repository; commit hashes in the audit notes predate the move and
+do not resolve here.
