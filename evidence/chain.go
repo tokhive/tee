@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/tokhive/tee/platform"
 )
 
 // Fetcher resolves an evidence hash to full evidence bytes. It is the abstract

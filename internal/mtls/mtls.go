@@ -23,7 +23,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/tokhive/tee/platform"
 )
 
 // Fixture certificate lifetimes. Every certificate this package mints is

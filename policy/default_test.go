@@ -3,7 +3,7 @@ package policy
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/tokhive/tee/jobs"
 	"testing"
 	"time"
 )

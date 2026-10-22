@@ -3,7 +3,7 @@ package hub
 import (
 	"errors"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/proof"
 )
 
 // mebibyte is the unit exchange volume is billed in.

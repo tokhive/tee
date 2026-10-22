@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tunnel"
+	"github.com/tokhive/tee/tee"
+	"github.com/tokhive/tee/tunnel"
 )
 
 // These tests drive the real HTTP gate over a real WebSocket handshake. They

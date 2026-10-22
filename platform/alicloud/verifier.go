@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/tokhive/tee/platform"
 )
 
 // Verifier implements platform.EvidenceVerifier for Alibaba Cloud confidential

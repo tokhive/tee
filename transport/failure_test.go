@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/tee"
 )
 
 // stageOf digs the stage out of a Do error. Every failure that crossed the wire

@@ -14,12 +14,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/cmd/internal/shared"
+	"github.com/tokhive/tee/evidence"
+	"github.com/tokhive/tee/internal/mtls"
+	"github.com/tokhive/tee/platform/simulated"
+	"github.com/tokhive/tee/proof"
+	"github.com/tokhive/tee/tee"
 )
 
 // mockChunks is the fixed, deterministic response stream. Because it never

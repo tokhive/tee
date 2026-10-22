@@ -22,7 +22,7 @@ package metrics
 import (
 	"sync"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/tee"
 )
 
 // DefaultRetain is how many request records a store keeps when a caller names

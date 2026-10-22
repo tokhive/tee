@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/cmd/internal/shared"
+	"github.com/tokhive/tee/hub"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/proof"
 )
 
 // These tests exercise the user-facing routes (chat completions, Anthropic

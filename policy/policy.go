@@ -38,8 +38,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/tokhive/tee/internal/canonical"
+	"github.com/tokhive/tee/jobs"
 )
 
 const (

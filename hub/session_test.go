@@ -12,8 +12,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/internal/canonical"
+	"github.com/tokhive/tee/proof"
 )
 
 // sessionTunnel is a full-duplex pipe: the Hub runs its Read and Write on two

@@ -116,7 +116,7 @@ func newCloudWatchCore(serviceName string, level zapcore.Level) (zapcore.Core, e
 
 	group := os.Getenv("CLOUDWATCH_LOG_GROUP")
 	if group == "" {
-		group = "/reclaim-tee/snp"
+		group = "/tokhive/tee/snp"
 	}
 	stream := serviceName
 	if sa := os.Getenv("SELF_ADDR"); sa != "" {

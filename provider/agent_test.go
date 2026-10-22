@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tunnel"
+	"github.com/tokhive/tee/hub"
+	"github.com/tokhive/tee/tunnel"
 )
 
 const testAgentSecret = "s3cret-agent-key"

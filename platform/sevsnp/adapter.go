@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/tokhive/tee/shared"
+	"github.com/tokhive/tee/platform"
 )
 
 // Config controls the identity emitted by the AWS SEV-SNP adapter.

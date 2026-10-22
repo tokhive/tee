@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/tokhive/tee/platform"
 )
 
 // HTTPStore is the server half of evidence retrieval: it serves the Store's

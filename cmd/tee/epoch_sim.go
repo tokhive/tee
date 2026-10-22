@@ -3,9 +3,9 @@ package main
 import (
 	"fmt"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
+	"github.com/tokhive/tee/internal/mtls"
+	"github.com/tokhive/tee/platform"
+	"github.com/tokhive/tee/platform/simulated"
 )
 
 // buildSimulatedEpoch returns a fresh software attestation epoch whose

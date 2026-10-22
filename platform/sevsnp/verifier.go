@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/reclaimprotocol/reclaim-tee/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/shared"
+	"github.com/tokhive/tee/platform"
+	"github.com/tokhive/tee/proof"
 )
 
 // Verifier implements platform.EvidenceVerifier for AWS SEV-SNP confidential

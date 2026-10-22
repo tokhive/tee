@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/platform"
+	"github.com/tokhive/tee/platform/sevsnp"
+	"github.com/tokhive/tee/platform/simulated"
+	"github.com/tokhive/tee/proof"
 )
 
 // testSigner is a signer plus the whitelist digest its epoch was configured

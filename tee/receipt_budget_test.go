@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/simulated"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/platform/simulated"
+	"github.com/tokhive/tee/proof"
 )
 
 // TestSimReceiptWithinBudget is the permanent, network-free gate for the §9

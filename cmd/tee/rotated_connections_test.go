@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/tee"
 )
 
 // fakeConn is a net.Conn that records only what this bookkeeping does to it.

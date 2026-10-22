@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"time"
 
-	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform/sevsnp"
+	rootShared "github.com/tokhive/tee/shared"
+	"github.com/tokhive/tee/platform/sevsnp"
 )
 
 // buildEpoch assembles the attested signing epoch and its RA-TLS server TLS

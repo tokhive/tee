@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/proof"
 )
 
 // recordingSink captures what the service reports. It is safe for concurrent

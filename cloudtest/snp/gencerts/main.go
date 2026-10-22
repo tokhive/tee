@@ -13,7 +13,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
+	"github.com/tokhive/tee/internal/mtls"
 )
 
 func main() {

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/tokhive/tee/jobs"
 )
 
 // scriptedHub builds a Hub over an in-memory TEE that never egresses: these

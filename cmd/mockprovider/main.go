@@ -33,8 +33,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
+	"github.com/tokhive/tee/cmd/internal/shared"
+	"github.com/tokhive/tee/internal/mtls"
 )
 
 // connStats tallies TCP connections seen by the HTTP server. newConns is

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/tokhive/tee/platform"
 )
 
 // testEpoch is a stand-in for a real attested key epoch. It exercises the same

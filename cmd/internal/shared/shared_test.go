@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
+	"github.com/tokhive/tee/internal/mtls"
+	"github.com/tokhive/tee/policy"
 )
 
 // TestWritePolicyDirRoundTrips pins the "bake the whitelist into a policy

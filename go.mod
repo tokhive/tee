@@ -1,4 +1,4 @@
-module github.com/reclaimprotocol/reclaim-tee
+module github.com/tokhive/tee
 
 go 1.27
 

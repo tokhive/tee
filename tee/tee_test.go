@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/platform"
+	"github.com/tokhive/tee/policy"
+	"github.com/tokhive/tee/proof"
 )
 
 // baseTime pins the clock for every test. Receipt timestamps are signed, so a

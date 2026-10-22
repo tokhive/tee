@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/proof"
 )
 
 // Session errors.

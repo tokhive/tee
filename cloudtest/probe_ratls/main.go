@@ -32,7 +32,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/shared"
+	"github.com/tokhive/tee/shared"
 )
 
 // minRefreshFloor mirrors cmd/tee's floor on the retry cadence. Duplicated on

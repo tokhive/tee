@@ -51,15 +51,15 @@ import (
 
 	"go.uber.org/zap"
 
-	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/metrics"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/transport"
+	rootShared "github.com/tokhive/tee/shared"
+	"github.com/tokhive/tee/cmd/internal/shared"
+	"github.com/tokhive/tee/evidence"
+	"github.com/tokhive/tee/hub"
+	"github.com/tokhive/tee/internal/mtls"
+	"github.com/tokhive/tee/metrics"
+	"github.com/tokhive/tee/proof"
+	"github.com/tokhive/tee/tee"
+	"github.com/tokhive/tee/transport"
 )
 
 // defaultPlatform is what the harness and the local simulation use: a software

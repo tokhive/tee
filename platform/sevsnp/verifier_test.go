@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/tokhive/tee/platform"
 )
 
 // The whitelist is staged into the measured bundle, so the attested application

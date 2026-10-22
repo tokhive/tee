@@ -25,8 +25,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/platform"
+	"github.com/tokhive/tee/proof"
 )
 
 // Fetcher resolves a hash-only attestation reference to full evidence, keyed by

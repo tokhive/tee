@@ -10,9 +10,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/internal/canonical"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/proof"
 )
 
 // The Hub↔TEE interface is a single RPC: POST /v1/execute carrying a canonical

@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/proof"
 )
 
 // This file is the TEE's instrumentation. It answers one question — where did

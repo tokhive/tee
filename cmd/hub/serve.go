@@ -16,12 +16,12 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/cmd/internal/shared"
+	"github.com/tokhive/tee/hub"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/policy"
+	"github.com/tokhive/tee/proof"
+	"github.com/tokhive/tee/tee"
 )
 
 // defaultRequestReadTimeout bounds how long a client may take to send a whole

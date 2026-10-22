@@ -12,8 +12,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	rootShared "github.com/tokhive/tee/shared"
+	"github.com/tokhive/tee/proof"
 )
 
 // A session is unbounded work, so the deadline its receipt must be signed

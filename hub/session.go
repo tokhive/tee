@@ -9,9 +9,9 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/proof"
+	"github.com/tokhive/tee/tee"
 )
 
 // OpenSession implements TEE by dialing the TEE's /v1/session WebSocket,

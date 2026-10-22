@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/tee"
 )
 
 // rec builds a record with the given job ID and one stage, so a test can tell

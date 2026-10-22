@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	teeproto "github.com/reclaimprotocol/reclaim-tee/proto"
+	teeproto "github.com/tokhive/tee/proto"
 
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"

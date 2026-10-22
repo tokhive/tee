@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/tee"
 )
 
 // ChannelConfig assembles a ChannelManager.

@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/tee"
 )
 
 // hostOf turns an httptest server URL into the host[:port] form a tee.Request

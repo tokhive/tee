@@ -12,12 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/internal/canonical"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/platform"
+	"github.com/tokhive/tee/policy"
+	"github.com/tokhive/tee/proof"
+	"github.com/tokhive/tee/tee"
 )
 
 // now is the single clock this test uses, so nothing here depends on when it

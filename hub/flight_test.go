@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/tokhive/tee/jobs"
 )
 
 // blockingTEE returns a scripted TEE whose FIRST reply blocks until release is

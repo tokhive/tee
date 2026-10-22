@@ -7,9 +7,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
+	"github.com/tokhive/tee/cmd/internal/shared"
+	"github.com/tokhive/tee/hub"
+	"github.com/tokhive/tee/policy"
 )
 
 // TestPoliciesHandlerServesTheDeployedWhitelist pins the buyer/seller-facing

@@ -9,7 +9,7 @@ import (
 	"slices"
 	"time"
 
-	teeproto "github.com/reclaimprotocol/reclaim-tee/proto"
+	teeproto "github.com/tokhive/tee/proto"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"

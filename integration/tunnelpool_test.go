@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/proof"
 )
 
 // These two tests pin the pool's terminal handling at the layer the unit tests

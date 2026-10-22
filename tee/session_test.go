@@ -6,8 +6,8 @@ import (
 	"io"
 	"testing"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/policy"
+	"github.com/tokhive/tee/proof"
 )
 
 // fakeSessionConn is a scripted provider byte pipe for Session tests.

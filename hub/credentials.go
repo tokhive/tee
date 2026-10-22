@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/tee"
 )
 
 // CredentialStore persists the Hub's view of provider credentials: the opaque

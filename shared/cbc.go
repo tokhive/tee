@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
-	teeproto "github.com/reclaimprotocol/reclaim-tee/proto"
+	teeproto "github.com/tokhive/tee/proto"
 )
 
 const (

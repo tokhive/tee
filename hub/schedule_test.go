@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/proof"
+	"github.com/tokhive/tee/tee"
 )
 
 // These tests exercise the C2 business rules — lowest-price scheduling and the

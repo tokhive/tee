@@ -19,8 +19,8 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"github.com/reclaimprotocol/reclaim-tee/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/tokhive/tee/shared"
+	"github.com/tokhive/tee/platform"
 )
 
 func TestNewAWSRequiresAWSSEVSNP(t *testing.T) {

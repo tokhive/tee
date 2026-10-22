@@ -7,8 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tunnel"
+	"github.com/tokhive/tee/hub"
+	"github.com/tokhive/tee/tunnel"
 )
 
 // Relay limits and their defaults. The binaries ship these values; a zero in

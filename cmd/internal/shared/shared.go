@@ -25,14 +25,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/mtls"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/evidence"
+	"github.com/tokhive/tee/hub"
+	"github.com/tokhive/tee/internal/canonical"
+	"github.com/tokhive/tee/internal/mtls"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/platform"
+	"github.com/tokhive/tee/policy"
+	"github.com/tokhive/tee/tee"
 )
 
 // Default fixtures.

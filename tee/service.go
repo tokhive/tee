@@ -54,10 +54,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	rootShared "github.com/tokhive/tee/shared"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/policy"
+	"github.com/tokhive/tee/proof"
 )
 
 // Configuration errors, all of which mean the service was built wrong rather

@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/proof"
 )
 
 // TestSettlementRefusesSameJobTwice pins the dedup guard: one JobID settles

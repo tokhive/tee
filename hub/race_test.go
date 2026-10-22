@@ -7,9 +7,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tunnel"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/tee"
+	"github.com/tokhive/tee/tunnel"
 )
 
 // fakeMux builds a throwaway *tunnel.Multiplexer to stand in for a live agent

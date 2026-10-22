@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/tokhive/tee/jobs"
 )
 
 // The budget is the cumulative counterpart of MaxJobMicros: the ceiling bounds

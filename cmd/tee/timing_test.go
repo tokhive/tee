@@ -11,8 +11,8 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/metrics"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/metrics"
+	"github.com/tokhive/tee/tee"
 )
 
 // newTimingTestSink returns a sink whose lines can be read back as JSON. The

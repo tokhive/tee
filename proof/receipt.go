@@ -14,8 +14,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/tokhive/tee/internal/canonical"
+	"github.com/tokhive/tee/platform"
 )
 
 const (

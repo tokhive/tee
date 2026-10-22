@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 
 	"github.com/gorilla/websocket"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tunnel"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/tee"
+	"github.com/tokhive/tee/tunnel"
 )
 
 // RelayKeyHeader is the HTTP header the TEE sets on its dial-in to the Hub's

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tunnel"
+	"github.com/tokhive/tee/tunnel"
 )
 
 // mustDialStream opens a stream on a client multiplexer and wraps it in the

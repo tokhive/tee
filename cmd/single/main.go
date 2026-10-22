@@ -23,8 +23,8 @@ import (
 	"strings"
 	"time"
 
-	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
+	rootShared "github.com/tokhive/tee/shared"
+	"github.com/tokhive/tee/cmd/internal/shared"
 )
 
 // bundleDir is where the loader extracts the measured ./app (this binary) and

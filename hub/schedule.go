@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/tee"
 )
 
 // ErrNoProviderForModel means no provider on the market can serve the

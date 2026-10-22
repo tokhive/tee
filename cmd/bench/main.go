@@ -34,9 +34,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/cmd/internal/shared"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/tee"
 )
 
 // §9 acceptance targets (from the plan). The relative TTFT/throughput targets

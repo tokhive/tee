@@ -22,7 +22,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/reclaimprotocol/reclaim-tee/shared"
+	"github.com/tokhive/tee/shared"
 )
 
 func main() {

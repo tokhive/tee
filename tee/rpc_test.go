@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/tokhive/tee/jobs"
 )
 
 // TestWriteStartFrame pins the exact bytes of the response-start frame: the

@@ -5,8 +5,8 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tunnel"
+	"github.com/tokhive/tee/tee"
+	"github.com/tokhive/tee/tunnel"
 )
 
 // This file is the server half of the reverse tunnel. A Provider Agent behind a

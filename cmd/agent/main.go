@@ -22,9 +22,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/provider"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	"github.com/tokhive/tee/hub"
+	"github.com/tokhive/tee/provider"
+	"github.com/tokhive/tee/tee"
 )
 
 func main() {

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/tokhive/tee/jobs"
 )
 
 // ErrInvalidSecret means a resolved credential is structurally unusable: an

@@ -32,7 +32,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/tokhive/tee/platform"
 )
 
 // Store persists attestation evidence keyed by its SHA-256 hash. The key is

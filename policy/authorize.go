@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
+	"github.com/tokhive/tee/jobs"
 )
 
 // Authorization errors. Every one of them means "the job is well-formed but

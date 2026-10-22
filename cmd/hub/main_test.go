@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
+	"github.com/tokhive/tee/cmd/internal/shared"
 )
 
 // buildVerifier's AWS SEV-SNP pin requirement: an allowlist entry for

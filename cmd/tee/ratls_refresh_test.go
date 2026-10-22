@@ -19,13 +19,13 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	rootShared "github.com/reclaimprotocol/reclaim-tee/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/cmd/internal/shared"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/evidence"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
+	rootShared "github.com/tokhive/tee/shared"
+	"github.com/tokhive/tee/cmd/internal/shared"
+	"github.com/tokhive/tee/evidence"
+	"github.com/tokhive/tee/platform"
+	"github.com/tokhive/tee/policy"
+	"github.com/tokhive/tee/proof"
+	"github.com/tokhive/tee/tee"
 )
 
 // TestNextRefreshDelayTracksTheNitroTPMLeaf pins the cadence to the thing that

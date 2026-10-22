@@ -31,7 +31,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
+	"github.com/tokhive/tee/platform"
 )
 
 const (

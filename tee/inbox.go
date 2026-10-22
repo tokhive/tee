@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/internal/canonical"
+	"github.com/tokhive/tee/internal/canonical"
 )
 
 // CredentialEnvelopeDomain separates the credential-envelope key derivation

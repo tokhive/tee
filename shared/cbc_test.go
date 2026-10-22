@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	teeproto "github.com/reclaimprotocol/reclaim-tee/proto"
+	teeproto "github.com/tokhive/tee/proto"
 )
 
 func TestTLS12CBCRecordDigestBindsDirectionSequenceAndWireBytes(t *testing.T) {

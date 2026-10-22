@@ -13,14 +13,14 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/hub"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/jobs"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/platform"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/provider"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/tee"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/transport"
+	"github.com/tokhive/tee/hub"
+	"github.com/tokhive/tee/jobs"
+	"github.com/tokhive/tee/platform"
+	"github.com/tokhive/tee/policy"
+	"github.com/tokhive/tee/proof"
+	"github.com/tokhive/tee/provider"
+	"github.com/tokhive/tee/tee"
+	"github.com/tokhive/tee/transport"
 )
 
 // refuseTEE is a Hub TEE seam that refuses every job. e2eStack never routes a

@@ -17,8 +17,8 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/policy"
-	"github.com/reclaimprotocol/reclaim-tee/tokenhive/proof"
+	"github.com/tokhive/tee/policy"
+	"github.com/tokhive/tee/proof"
 )
 
 // nitroEnvelope builds the AWS-tagged combined envelope a real TEE's RA-TLS
