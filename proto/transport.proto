@@ -1,0 +1,441 @@
+syntax = "proto3";
+
+package teeproto;
+
+option go_package = "tee-mpc/proto;teeproto";
+
+import "common.proto";
+import "signing.proto";
+import "attestor_api.proto";
+
+enum Sender {
+  SENDER_UNSPECIFIED = 0;
+  SENDER_USER = 1;
+  SENDER_TEE_K = 2;
+  SENDER_TEE_T = 3;
+}
+
+// Envelope for all websocket frames
+message Envelope {
+  string session_id = 1;
+  uint64 seq = 2;
+  string correlation_id = 3;
+  Sender sender = 4;
+  int64 timestamp_ms = 5;
+
+  oneof payload {
+    // Session and control
+    ConnectionReady connection_ready = 10;
+    TCPReady tcp_ready = 11;
+    ErrorData error = 12;
+    FinishedMessage finished = 13;
+    SessionCreated session_created = 14;
+    SessionReady session_ready = 15;
+
+    // Handshake
+    RequestConnection request_connection = 20;
+    TCPData tcp_data = 21;
+    HandshakeComplete handshake_complete = 22;
+    HandshakeKeyDisclosure handshake_key_disclosure = 23;
+
+    // Split AEAD (TEE_K <-> TEE_T)
+    KeyShareRequest key_share_request = 30;
+    KeyShareResponse key_share_response = 32;
+    BatchedEncryptedRequest batched_encrypted_request = 33;
+
+    // Redaction/TEET
+    RedactedRequest redacted_request = 40;                    // Client -> TEE_T
+    RedactionStreams redaction_streams = 41;                  // TEE_K -> TEE_T
+    BatchedEncryptedDataResponse batched_encrypted_data = 43; // TEE_T -> Client (DO NOT RENUMBER)
+    RedactionVerification redaction_verification = 44;        // TEE_T -> TEE_K
+    ResponseRedactionSpec response_redaction_spec = 45;       // Client -> TEE_K
+
+    // Batches
+    BatchedEncryptedResponses batched_encrypted_responses = 50;
+    BatchedResponseLengths batched_response_lengths = 51;
+    BatchedTagSecrets batched_tag_secrets = 52;
+    BatchedTagVerifications batched_tag_verifications = 53;
+    BatchedDecryptionStreams batched_decryption_streams = 54;
+
+    // Signing outputs
+    SignedMessage signed_message = 57;
+
+    // Mutual attestation (TEE_K <-> TEE_T)
+    TEEKAttestationRequest teek_attestation = 60;
+    TEETAttestationResponse teet_attestation = 61;
+
+    // OPRF MPC messages
+    OPRFRangesSubmission oprf_ranges_submission = 70;   // Client -> TEE_K (DO NOT RENUMBER)
+    CiphertextReady ciphertext_ready = 62;              // TEE_T -> TEE_K
+    OPRFMPCResult oprf_mpc_result = 63;                 // TEE_T -> TEE_K
+
+    // OT precomputation messages (TEE_K <-> TEE_T)
+    OTPrecomputeRequest ot_precompute_request = 64;     // TEE_K -> TEE_T (init or extend)
+    OTPrecomputeResponse ot_precompute_response = 65;   // TEE_T -> TEE_K
+    OTPrecomputeComplete ot_precompute_complete = 66;   // TEE_K -> TEE_T after each verified KOS batch
+    OPRFOnlineFull oprf_online_full = 67;               // TEE_K -> TEE_T (online round 1)
+    OPRFMPCRound2 oprf_mpc_round2 = 73;                 // TEE_T -> TEE_K (choice corrections)
+    OPRFMPCRound3 oprf_mpc_round3 = 74;                 // TEE_K -> TEE_T (corrected OT masks)
+
+    // OT pool resume across a transient control reconnect (both enclaves
+    // retained their pool halves). TEE_K sends epoch+counter instead of a
+    // full re-precompute; TEE_T accepts iff it still holds that pool.
+    OTResumeRequest ot_resume_request = 68;             // TEE_K -> TEE_T
+    OTResumeResponse ot_resume_response = 69;           // TEE_T -> TEE_K
+
+    // Per-session connection management (TEE_K <-> TEE_T)
+    SessionConnectionInit session_connection_init = 80;   // TEE_K -> TEE_T (on per-session WS)
+    SessionConnectionAck session_connection_ack = 81;     // TEE_T -> TEE_K (on per-session WS)
+    SessionClosed session_closed = 82;                    // TEE_K -> TEE_T (on control WS)
+    SessionCreatedAck session_created_ack = 83;           // TEE_T -> TEE_K (on control WS)
+
+    // Router-mode pair assignment (multi-pair architecture, Phase 3+)
+    TEEKPairAssignment teek_pair_assignment = 84;         // TEE_K -> TEE_T (first message on /ws/peer)
+
+    // Router-mode client authentication. The first envelope a client sends
+    // on /ws to either TEE; carries the allocation JWT minted by /allocate.
+    ClientAuth client_auth = 85;                          // Client -> TEE_K/TEE_T
+
+    // Trusted-TEE TLS 1.2 CBC compatibility path.
+    TLS12CBCReadState tls12_cbc_read_state = 86;          // TEE_K -> TEE_T
+    TLS12CBCReadStateAck tls12_cbc_read_state_ack = 87;   // TEE_T -> TEE_K
+    TLS12CBCRequest tls12_cbc_request = 88;               // Client -> TEE_K
+    BatchedTLSRecords batched_tls_records = 89;           // TEE_K -> Client or Client -> TEE_T
+    AuthenticatedCBCResponse authenticated_cbc_response = 90; // TEE_T -> Client
+  }
+}
+
+// Basic types aligned with existing JSON models
+message RequestConnection {
+  string hostname = 1;
+  int32 port = 2;
+  string sni = 3;
+  repeated string alpn = 4;
+  string force_tls_version = 5; // optional
+  string force_cipher_suite = 6; // optional (kept string form)
+  bool supports_tls12_cbc = 7; // additive client capability; absent means legacy split-AEAD only
+}
+
+message ConnectionReady { bool success = 1; }
+message TCPReady { bool success = 1; }
+message TCPData { bytes data = 1; }
+
+message HandshakeComplete {
+  bool success = 1;
+  repeated bytes certificate_chain = 2;
+  uint32 cipher_suite = 3;  // Negotiated cipher suite for consolidated verification
+  TLS12CBCSessionBinding tls12_cbc_binding = 4; // present only for trusted CBC
+}
+
+message HandshakeKeyDisclosure {
+  bytes handshake_key = 1;
+  bytes handshake_iv = 2;
+  bytes certificate_packet = 3;
+  uint32 cipher_suite = 4; // uint16 fits here
+  string algorithm = 5;
+  bool success = 6;
+}
+
+message KeyShareRequest {
+  int32 key_length = 1;
+  int32 iv_length = 2;
+}
+
+message KeyShareResponse {
+  bytes key_share = 1;
+  bool success = 2;
+}
+
+message BatchedEncryptedDataResponse {
+  repeated EncryptedDataResponse fragments = 1;
+  uint64 base_seq_num = 2; // Starting sequence number for fragments
+  bool success = 3;
+}
+
+message EncryptedDataResponse {
+  bytes encrypted_data = 1; // R_Enc
+  bytes auth_tag = 2; // T
+  bool success = 3;
+}
+
+message RedactedRequest {
+  bytes redacted_request = 1; // R_red
+  repeated bytes commitments = 2 [deprecated = true]; // DEPRECATED: unused, no longer populated or verified
+  repeated RequestRedactionRange redaction_ranges = 3;
+}
+
+message RedactionVerification {
+  bool success = 1;
+  string message = 2;
+}
+
+message RedactionStreams {
+  repeated bytes streams = 1; // [Str_S, Str_SP]
+  repeated bytes commitment_keys = 2 [deprecated = true]; // DEPRECATED: unused, no longer populated or verified
+}
+
+// Client to TEE_K: response redaction specification
+message ResponseRedactionSpec {
+  repeated ResponseRedactionRange ranges = 1;
+}
+
+// Batched encrypted request for multiple fragments
+message BatchedEncryptedRequest {
+  repeated EncryptedRequest fragments = 1;
+  uint64 base_seq_num = 2; // Starting sequence number
+  uint32 cipher_suite = 3;
+  repeated bytes commitments = 4 [deprecated = true]; // DEPRECATED: unused, no longer populated or verified
+}
+
+message EncryptedRequest {
+  bytes encrypted_data = 1; // R_red_Enc
+  bytes tag_secrets = 2;
+  repeated bytes commitments = 3 [deprecated = true]; // DEPRECATED: unused, no longer populated or verified
+  uint32 cipher_suite = 4; // uint16 fits here
+  uint64 seq_num = 5;
+  repeated RequestRedactionRange redaction_ranges = 6;
+}
+
+message EncryptedResponseData {
+  bytes encrypted_data = 1; // payload (without tag)
+  bytes tag = 2; // auth tag
+  bytes record_header = 3; // 5 bytes
+  uint64 seq_num = 4;
+  bytes explicit_iv = 5; // optional (tls1.2)
+}
+
+message ResponseTagVerification {
+  bool success = 1;
+  uint64 seq_num = 2;
+  string message = 3;
+}
+
+// Batches
+message BatchedEncryptedResponses {
+  repeated EncryptedResponseData responses = 1;
+  string session_id = 2;
+  int32 total_count = 3;
+}
+
+message BatchedResponseLengths {
+  message Length {
+    int32 length = 1;
+    bytes record_header = 2;
+    uint64 seq_num = 3;
+    bytes explicit_iv = 4;
+  }
+  repeated Length lengths = 1;
+  string session_id = 2;
+  int32 total_count = 3;
+}
+
+message BatchedTagSecrets {
+  message TagSecret {
+    bytes tag_secrets = 1;
+    uint64 seq_num = 2;
+  }
+  repeated TagSecret tag_secrets = 1;
+  string session_id = 2;
+  int32 total_count = 3;
+}
+
+message BatchedTagVerifications {
+  message Verification {
+    bool success = 1;
+    uint64 seq_num = 2;
+    string message = 3;
+  }
+  repeated Verification verifications = 1;
+  string session_id = 2;
+  int32 total_count = 3;
+  bool all_successful = 4;
+}
+
+message BatchedDecryptionStreams {
+  repeated ResponseDecryptionStreamData decryption_streams = 1;
+  string session_id = 2;
+  int32 total_count = 3;
+}
+
+message BatchedSignedRedactedDecryptionStreams {
+  repeated SignedRedactedDecryptionStream signed_redacted_streams = 1;
+  string session_id = 2;
+  int32 total_count = 3;
+}
+
+message SessionCreated {}
+message SessionCreatedAck { string session_id = 1; }
+message SessionReady { bool ready = 1; }
+
+// Mutual attestation messages
+message TEEKAttestationRequest {
+  AttestationReport attestation_report = 1;
+}
+
+message TEETAttestationResponse {
+  AttestationReport attestation_report = 1;
+}
+
+// OPRF MPC message definitions
+message OPRFRangeSpec {
+  int32 tls_start = 1;
+  int32 tls_length = 2;  // max 64
+}
+
+message OPRFRangesSubmission {
+  string session_id = 1;
+  repeated OPRFRangeSpec ranges = 2;  // empty = no OPRF needed
+}
+
+message CiphertextReady {
+  string session_id = 1;
+  int32 total_length = 2;
+}
+
+// OT Precomputation - Request (used for both initial setup and extension)
+message OTPrecomputeRequest {
+  uint32 count = 1;           // Number of OTs to precompute
+  bytes ot_sender_setup = 2;  // Phase-framed KOS begin or 128 base-OT choices
+  bool is_initial = 3;        // True for initial setup, false for extension
+  string epoch = 4;           // Pool synchronization token; rotates after every committed batch
+}
+
+// OT pool resume: TEE_K still holds a ready pool after a transient control
+// reconnect and asks TEE_T to keep using it instead of re-precomputing.
+message OTResumeRequest {
+  string epoch = 1;           // Pool synchronization token TEE_K is resuming
+  uint64 next_index = 2;      // TEE_K's next unreserved pool index (consistency check)
+}
+
+message OTResumeResponse {
+  bool accepted = 1;          // True if TEE_T still holds the matching pool; false -> TEE_K full re-precompute
+}
+
+message OTPrecomputeResponse {
+  uint32 count = 1;           // Number of OTs responded
+  bytes ot_receiver_data = 2; // Phase-framed base-OT setup or verified KOS batch data
+}
+
+message OTPrecomputeComplete {
+  uint64 pool_size = 1;       // Total OTs generated after committing this batch
+}
+
+// Online round 1: the garbler sends the circuit before it knows the receiver's
+// random-OT choice corrections. Full output-label pairs and OT pad deltas are
+// deliberately absent.
+message OPRFOnlineFull {
+  string session_id = 1;
+  uint64 oprf_session_id = 2;
+  int32 range_index = 3;
+  int32 tls_start = 4;
+  int32 tls_length = 5;
+  bytes tls_session_hash = 6;
+
+  // Serialized circuit payload: tables, garbler labels, and one output
+  // translation bit per output wire.
+  bytes garbled_tables = 7;
+  reserved 8, 9, 11;
+  reserved "garbler_inputs", "output_hints", "dual_masks";
+
+  uint64 ot_start_index = 10;    // Starting index in precomputed OT pool
+  int32 total_ranges = 12;       // Total OPRF ranges this session; TEE_T's authoritative expected count
+}
+
+// Online round 2: c=d XOR b for each evaluator input bit. The uniformly
+// random, single-use precomputed choice d hides the actual input bit b.
+message OPRFMPCRound2 {
+  string session_id = 1;
+  uint64 oprf_session_id = 2;
+  bytes choice_corrections = 3;  // 640 packed bits (80 bytes)
+  int32 range_index = 4;
+}
+
+// Online round 3: two correction-aware masks per evaluator input wire. The
+// message never contains R0 XOR R1.
+message OPRFMPCRound3 {
+  string session_id = 1;
+  uint64 oprf_session_id = 2;
+  bytes ot_masks = 3;            // 640 pairs of 16-byte masks
+  int32 range_index = 4;
+}
+
+// OPRF result with MANDATORY output labels for garbler verification.
+// CMAC and HashOutput are intentionally NOT on the wire — TEE_K derives both
+// from the verified output labels so a compromised TEE_T can't substitute them.
+message OPRFMPCResult {
+  string session_id = 1;
+  uint64 oprf_session_id = 2;
+  int32 range_index = 3;
+  reserved 4, 5;
+  reserved "cmac_output", "hash_output";
+  bytes output_labels = 6;       // MANDATORY: actual output wire labels for garbler verification
+}
+
+// Per-session connection management messages
+message SessionConnectionInit {
+  string session_id = 1;         // Session ID to bind this connection to
+}
+
+message SessionConnectionAck {
+  string session_id = 1;
+  bool success = 2;
+  string error_message = 3;      // If !success
+}
+
+message SessionClosed {
+  string session_id = 1;
+  string reason = 2;             // Reason for closure (normal, error, timeout, etc.)
+}
+
+// TEEKPairAssignment is the first envelope TEE_K sends to TEE_T over the
+// RA-TLS peer connection in router mode. It carries the pair_id TEE_K
+// generated at boot; TEE_T uses it to register itself with the router
+// under the same id so both /register calls land on the same record.
+message TEEKPairAssignment {
+  string pair_id = 1;
+}
+
+// ClientAuth is the first envelope a client sends on its WebSocket
+// connection to TEE_K or TEE_T in router mode. The jwt field is the
+// ES256 token the router minted at /allocate; the TEE verifies signature,
+// expiry, and that the `aud` claim matches its own pair_id before
+// accepting any further messages from the client.
+message ClientAuth {
+  string jwt = 1;
+  // Client build identifier, logged by the TEE so a tag failure can be
+  // attributed to a specific client build (empty = pre-versioning build).
+  string client_version = 2;
+}
+
+message TLS12CBCReadState {
+  TLS12CBCSessionBinding binding = 1;
+  bytes read_key = 2;
+  bytes read_mac_key = 3;
+  bytes read_iv = 4;
+  uint64 read_sequence = 5;
+}
+
+message TLS12CBCReadStateAck {
+  bytes session_binding = 1;
+  bool success = 2;
+  string error_message = 3;
+}
+
+message TLS12CBCRequest {
+  bytes full_request = 1;
+  repeated RequestRedactionRange redaction_ranges = 2;
+}
+
+message BatchedTLSRecords {
+  repeated TLSRecord records = 1;
+}
+
+message AuthenticatedCBCResponse {
+  message Fragment {
+    uint64 seq_num = 1;
+    uint32 record_type = 2;
+    bytes plaintext = 3;
+  }
+  repeated Fragment fragments = 1;
+  bool close_notify = 2;
+}

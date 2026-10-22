@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package teeproto;
+
+option go_package = "tee-mpc/proto;teeproto";
+
+import "common.proto";
+
+// Deterministically serialized payloads to be signed by TEEs
+message KOutputPayload {
+  // Session binding - cryptographically links TEE_K and TEE_T outputs
+  string session_id = 7; // Shared session ID for cross-TEE binding
+
+  // For single request-response mode
+  bytes redacted_request = 1; // R_red
+  repeated RequestRedactionRange request_redaction_ranges = 2;
+
+  // REPLACED: repeated SignedRedactedDecryptionStream redacted_streams = 3; (individual response streams - CONSOLIDATE)
+  // REPLACED: repeated bytes packets = 4; (TLS handshake packets - REMOVE)
+  bytes consolidated_response_keystream = 3;  // NEW: Single response decryption keystream
+  CertificateInfo certificate_info = 4;      // NEW: Structured cert data instead of handshake packets
+
+  repeated ResponseRedactionRange response_redaction_ranges = 5;
+  uint64 timestamp_ms = 6; // Unix timestamp in milliseconds when payload was created (SIGNED)
+
+  // MPC OPRF outputs
+  repeated OPRFOutput oprf_outputs = 10;
+
+  // Attestation generation asserted by the TEE and covered by this signature.
+  // Old clients ignore this field but preserve the original body bytes.
+  string attestation_type = 11;
+
+  // Present only for the trusted-TEE TLS 1.2 CBC contract. Legacy AEAD
+  // keystream semantics must not be mixed with this field.
+  TLS12CBCKOutput tls12_cbc = 12;
+}
+
+message TOutputPayload {
+  // Session binding - cryptographically links TEE_K and TEE_T outputs
+  string session_id = 4; // Shared session ID for cross-TEE binding
+
+  // REPLACED: repeated bytes packets = 1; (TLS packets for BOTH request and response - REMOVE ALL)
+  bytes consolidated_response_ciphertext = 1;  // NEW: Single response ciphertext stream
+
+  // PRESERVE: Individual R_SP streams for R_S vs R_SP distinction
+  repeated bytes request_proof_streams = 2;    // UNCHANGED: Individual R_SP streams for revealing sensitive_proof ranges
+  uint64 timestamp_ms = 3;                     // UNCHANGED
+
+  // MPC OPRF outputs
+  repeated OPRFOutput oprf_outputs = 10;
+
+  // Attestation generation asserted by the TEE and covered by this signature.
+  // Old clients ignore this field but preserve the original body bytes.
+  string attestation_type = 11;
+
+  // Present only for the trusted-TEE TLS 1.2 CBC contract. The response is
+  // authenticated plaintext, not a split-AEAD ciphertext share.
+  TLS12CBCTOutput tls12_cbc = 12;
+}
+
+message TLS12CBCKOutput {
+  TLS12CBCSessionBinding binding = 1;
+  bytes authenticated_redacted_request = 2;
+  bytes request_records_sha256 = 3;
+  repeated RequestRedactionRange request_redaction_ranges = 4;
+}
+
+message TLS12CBCTOutput {
+  TLS12CBCSessionBinding binding = 1;
+  bytes authenticated_redacted_response = 2;
+  bytes response_records_sha256 = 3;
+  repeated ResponseRedactionRange response_redaction_ranges = 4;
+  repeated uint32 plaintext_record_lengths = 5;
+  bool close_notify = 6;
+}
+
+// Attestation report with structured data
+message AttestationReport {
+  string type = 1; // "gcp"
+  bytes report = 2; // raw provider-specific attestation bytes
+}
+
+// Signature wrapper used everywhere
+enum BodyType {
+  BODY_TYPE_UNSPECIFIED = 0;
+  BODY_TYPE_K_OUTPUT = 1;
+  BODY_TYPE_T_OUTPUT = 2;
+}
+
+// TLS packet metadata for client-side decryption
+message TLSPacketInfo {
+  uint64 seq_num = 1;
+  uint32 position = 2;
+  uint32 length = 3;
+  bytes nonce = 4;
+}
+
+// MPC OPRF output included in signed transcripts
+message OPRFOutput {
+  int32 tls_start = 1;
+  int32 tls_length = 2;
+  bytes hash_output = 3;  // 32 bytes SHA256(CMAC)
+}
+
+message SignedMessage {
+  BodyType body_type = 1;
+  bytes body = 2; // serialized deterministic KOutputPayload or TOutputPayload (contains signed timestamp)
+  bytes eth_address = 3; // ETH address (20 bytes, standalone mode only)
+  bytes signature = 4; // signature over body bytes
+  AttestationReport attestation_report = 5; // full attestation (enclave mode only)
+  
+  // Additional metadata (not signed) for client-side decryption
+  repeated TLSPacketInfo response_packets = 6;
+  bytes server_app_key = 7;
+  uint32 cipher_suite = 8;
+}

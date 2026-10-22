@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package teeproto;
+
+option go_package = "tee-mpc/proto;teeproto";
+
+import "signing.proto";
+
+// OPRF verification data for a single hashed range
+message OPRFVerificationData {
+  uint32 stream_pos = 1;      // Position in the consolidated TLS stream
+  uint32 stream_length = 2;   // Length of data in the stream
+  bytes public_signals_json = 3; // ZK proof and public parameters (InputVerifyParams)
+}
+
+
+// Single artefact produced by client for offline verification
+message VerificationBundle {
+
+  // Signed transcripts
+  SignedMessage teek_signed = 1; // BODY_TYPE_K_OUTPUT (contains signed certificate_info)
+  SignedMessage teet_signed = 2; // BODY_TYPE_T_OUTPUT
+  
+  // OPRF verification data for hashed ranges
+  repeated OPRFVerificationData oprf_verifications = 3;
+}
+
+
