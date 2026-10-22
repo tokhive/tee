@@ -31,9 +31,13 @@ set -euo pipefail
 # SNP_CA_BUNDLE (explicit PEM), else SNP_CA_IMAGE (digest-pinned alpine, default
 # matches deploy/snp-image/pins.env), else a host bundle. Build fails loudly if
 # none is reachable, so a broken TEE is never shipped silently.
-set -a; source ../.env 2>/dev/null || true; set +a
-
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)" 2>/dev/null || SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Optional operator env (TOKENHIVE_* / SNP_*), resolved next to the script rather
+# than the cwd. It must be tested before sourcing: under `set -e` a `source` of a
+# missing file ends the shell outright — the trailing `|| true` never runs — so
+# `source ../.env || true` used to kill the build right here on a fresh checkout,
+# which has no .env.
+if [[ -f "${SCRIPT_DIR}/../.env" ]]; then set -a; source "${SCRIPT_DIR}/../.env"; set +a; fi
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"   # repository root
 OUT_BUNDLE="${TOKENHIVE_OUT_BUNDLE:-${SCRIPT_DIR}/../bin/tokenhive-app-bundle.tar}"
 GO_TOOLCHAIN="${SNP_TEE_GO_TOOLCHAIN:-}"
