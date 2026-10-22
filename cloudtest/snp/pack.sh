@@ -164,7 +164,10 @@ bundle_cacerts() {
     cp "${src}" "${stage}/etc/ssl/certs/ca-certificates.crt"
     chmod 0644 "${stage}/etc/ssl/certs/ca-certificates.crt"
     echo "[pack] baked root CA bundle -> ./etc/ssl/certs/ca-certificates.crt"
-    [[ -n "${clean}" ]] && rm -f "${clean}"
+    # `[[ ... ]] && rm` as the last statement would make this function return 1
+    # when `clean` is empty (SNP_CA_BUNDLE or the host-bundle fallback), and
+    # `set -e` would then kill the whole script mid-build. Use an explicit if.
+    if [[ -n "${clean}" ]]; then rm -f "${clean}"; fi
 }
 
 build_single() {
@@ -205,6 +208,9 @@ build() {
     # Stage the deployment whitelist into the measured bundle for every topology
     # so the policy covered by SNP_APP_HASH travels with the target image.
     bundle_policy "${stage}"
+    # A fresh clone has no ../bin (build output is not tracked), and the tar step
+    # below opens the output path for writing without creating its directory.
+    mkdir -p "$(dirname "${OUT_BUNDLE}")"
     # Deterministic tar regardless of the host's tar flavor (macOS bsdtar has no
     # --sort; GNU tar lives in the image builder), so the bundle digest is
     # byte-reproducible: fixed owner/group, fixed mtime, normalized modes.
