@@ -123,3 +123,13 @@ func TestForwardResponseHeadersCarriesWhatCodexReads(t *testing.T) {
 		}
 	}
 }
+
+// TestForwardResponseHeadersCarriesTheResellerRequestID pins the ID the API
+// reseller bills each request under, which the market needs to reconcile its
+// settlements against the reseller's records.
+func TestForwardResponseHeadersCarriesTheResellerRequestID(t *testing.T) {
+	got := ForwardResponseHeaders(map[string][]string{"X-Wokey-Request-Id": {"2026102608083912dfi"}, "Request-Id": {"req_011"}})
+	if len(got["X-Wokey-Request-Id"]) != 1 || len(got["Request-Id"]) != 1 {
+		t.Fatalf("reseller and vendor request IDs not both forwarded: %v", got)
+	}
+}
