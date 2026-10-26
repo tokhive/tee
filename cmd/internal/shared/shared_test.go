@@ -131,7 +131,7 @@ func TestStalePerProviderPoliciesAreIgnored(t *testing.T) {
 	}
 }
 
-// TestDefaultPolicyCoversTheRealAPIs pins the two upstreams the public default
+// TestDefaultPolicyCoversTheRealAPIs pins the upstreams the public default
 // whitelist exists to admit, on the shapes the Hub serves them with: a seller
 // onboards against this document, so dropping either API would silently make
 // every seller of that shape unadmittable.
@@ -147,6 +147,9 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 		{"chatgpt.com", "/backend-api/codex/models", "GET"},
 		// Anthropic's token count, under the /v1/messages rule.
 		{"api.anthropic.com", "/v1/messages/count_tokens", "POST"},
+		// The API reseller the market falls back to, on both shapes.
+		{"api.wokey.ai", "/v1/responses", "POST"},
+		{"api.wokey.ai", "/v1/messages", "POST"},
 	} {
 		if err := p.AllowsRoute(r.host, r.path, r.method); err != nil {
 			t.Errorf("%s %s%s not admitted by the default policy: %v", r.method, r.host, r.path, err)

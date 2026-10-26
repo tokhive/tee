@@ -67,6 +67,10 @@ var AllowedResponseHeaders = map[string]struct{}{
 	// ask for: x-request-id is not what chatgpt.com sends.
 	"x-oai-request-id": {},
 	"cf-ray":           {},
+	// The API reseller's own request ID: its per-request billing records are
+	// keyed by it, and the market reconciles what it settled against them.
+	// The Anthropic request-id on the same response is a different ID.
+	"x-wokey-request-id": {},
 	// What the Codex client reads off a subscription response, so a buyer's
 	// Codex behaves as it does signed in to the subscription. The quota and
 	// credit headers that endpoint also sends describe the seller's account,

@@ -52,7 +52,9 @@ var defaultWhitelist []byte
 // request families on them, and the bounds a job must stay inside. Hosts name
 // the upstreams the deployment is willing to reach: the two AI vendors' API
 // endpoints, the ChatGPT subscription endpoint a logged-in account speaks to,
-// and the mock host the simulation runs every shape behind. Its paths mirror
+// the API reseller the market falls back to when no subscription account can
+// serve a request (wokey, which speaks the vendors' Responses and Messages
+// shapes), and the mock host the simulation runs every shape behind. Its paths mirror
 // the Hub's user-facing routes: the OpenAI chat completions endpoint, the
 // OpenAI Responses endpoint, the Anthropic messages endpoint, the ChatGPT
 // subscription endpoint and the Codex model catalog beside it, and the
