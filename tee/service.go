@@ -1274,6 +1274,16 @@ func (s *Session) markTruncated() {
 // same Session return once the socket is closed.
 func (s *Session) Close() error { return s.conn.Close() }
 
+// Subprotocol reports the protocol the provider selected in the opening
+// handshake, when the transport can report one. It is empty for a transport
+// that does not speak WebSocket or a provider that selected none.
+func (s *Session) Subprotocol() string {
+	if h, ok := s.conn.(interface{ Subprotocol() string }); ok {
+		return h.Subprotocol()
+	}
+	return ""
+}
+
 // Receipt signs the session's execution receipt. It is idempotent: the first
 // call signs, and later calls return the same result. Call it once the session
 // is over. The receipt carries StatusCode 101 (the successful upgrade),

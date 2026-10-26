@@ -50,8 +50,26 @@ import (
 // wedging the tunnel forever.
 const SessionIdleTimeout = 5 * time.Minute
 
-// SessionAck is the success reply to a SessionRequest.
-const SessionAck = `{"ok":true}`
+// SessionAck is the shape of the success reply to a SessionRequest. The
+// subprotocol is what the provider selected during the Upgrade handshake; the
+// Hub needs it to answer its own user-facing handshake with the same value, and
+// an empty one means the provider selected none.
+type SessionAck struct {
+	OK          bool   `json:"ok"`
+	Subprotocol string `json:"subprotocol,omitempty"`
+}
+
+// sessionAckJSON renders the success reply. It is a function rather than a
+// constant because the answer now carries the provider's selected subprotocol.
+func sessionAckJSON(subprotocol string) []byte {
+	raw, err := json.Marshal(SessionAck{OK: true, Subprotocol: subprotocol})
+	if err != nil {
+		// Marshalling this fixed struct cannot fail; the literal is the safe
+		// answer rather than an empty frame.
+		return []byte(`{"ok":true}`)
+	}
+	return raw
+}
 
 // SessionRequest is the payload of the first Hub→TEE frame of a session: a
 // JobSpec with Spec.Session set, bound to an empty body. The body-hash binding
@@ -125,7 +143,7 @@ func ServeSession(svc *Service, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(SessionAck)); err != nil {
+	if err := conn.WriteMessage(websocket.TextMessage, sessionAckJSON(ss.Subprotocol())); err != nil {
 		_ = ss.Close()
 		return
 	}
