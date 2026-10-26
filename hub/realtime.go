@@ -134,6 +134,18 @@ func sessionProtocolOK(link RealtimeLink, conn SessionConn) error {
 	return nil
 }
 
+// closeLink asks a link that owns the user-facing handshake to end both ends,
+// and reports whether it could. A link that cannot close is cut by the caller:
+// nothing upstream would otherwise end its session.
+func closeLink(link RealtimeLink, reason string) bool {
+	closer, ok := link.(SessionCloser)
+	if !ok {
+		return false
+	}
+	closer.CloseSession(reason)
+	return true
+}
+
 // upGrant is how long relaySession waits for an in-flight uplink to finish
 // before counting it, once the session has ended. Long enough for a buffered
 // user link to drain in tests, short enough that a silent-but-connected user
@@ -521,19 +533,17 @@ func relaySession(ctx context.Context, tunnel *meteredTunnel, link RealtimeLink,
 	var idleTimer *time.Timer
 	idleFired := make(chan struct{}, 1)
 	if idle > 0 {
-		var idleOnce sync.Once
+		// A repeated firing is harmless: CloseSession and tunnel.Close are both
+		// idempotent, and the grace timer ends the session before a second idle
+		// interval usually elapses.
 		idleTimer = time.AfterFunc(idle, func() {
-			idleOnce.Do(func() {
-				if closer, ok := link.(SessionCloser); ok {
-					closer.CloseSession("provider went idle")
-				} else {
-					_ = tunnel.Close()
-				}
-				select {
-				case idleFired <- struct{}{}:
-				default:
-				}
-			})
+			if !closeLink(link, "provider went idle") {
+				_ = tunnel.Close()
+			}
+			select {
+			case idleFired <- struct{}{}:
+			default:
+			}
 		})
 		defer idleTimer.Stop()
 	}
@@ -596,9 +606,7 @@ func relaySession(ctx context.Context, tunnel *meteredTunnel, link RealtimeLink,
 					// cleanly: the link owns the handshake on both ends, and a
 					// graceful close is what lets the provider finish and the
 					// TEE sign a receipt for what it actually delivered.
-					if closer, ok := link.(SessionCloser); ok {
-						closer.CloseSession("uplink byte limit reached")
-					}
+					closeLink(link, "uplink byte limit reached")
 					break
 				}
 				upCount.Add(uint64(n))
@@ -655,20 +663,17 @@ func relaySession(ctx context.Context, tunnel *meteredTunnel, link RealtimeLink,
 	}()
 
 	// askToClose sends the upstream close through the link when it owns the
-	// handshake, and reports whether that happened. A link that cannot close is
-	// cut where it stands: nothing upstream would otherwise end the session.
+	// handshake, and cuts the tunnel when it does not.
 	askToClose := func(reason string) bool {
-		closer, ok := link.(SessionCloser)
-		if !ok {
-			_ = tunnel.Close()
-			return false
-		}
 		// CloseSession can block on a tunnel write the provider stopped reading;
 		// that is why the idle watchdog calls it off this goroutine. Here the
 		// loop is already ending the session, and the bounded wait for the answer
 		// is the same grace every other end path gets.
-		closer.CloseSession(reason)
-		return true
+		if closeLink(link, reason) {
+			return true
+		}
+		_ = tunnel.Close()
+		return false
 	}
 
 	upCh, linkCh, ctxCh := upGone, linkGone, ctx.Done()

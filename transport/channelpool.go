@@ -413,12 +413,9 @@ func reservedUpgradeHeader(name string) bool {
 
 // newWebSocketKey returns a fresh Sec-WebSocket-Key: the base64 of 16 random
 // bytes, which is exactly what the WebSocket handshake spec prescribes.
+// crypto/rand does not fail on a supported platform.
 func newWebSocketKey() string {
 	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		// crypto/rand never fails on this platform; if it somehow does, a stale
-		// but well-formed key keeps the upgrade parseable rather than panicking.
-		return base64.StdEncoding.EncodeToString([]byte("00000000000000000000"))
-	}
+	_, _ = rand.Read(nonce[:])
 	return base64.StdEncoding.EncodeToString(nonce[:])
 }

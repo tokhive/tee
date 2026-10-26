@@ -54,10 +54,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	rootShared "github.com/tokhive/tee/shared"
 	"github.com/tokhive/tee/jobs"
 	"github.com/tokhive/tee/policy"
 	"github.com/tokhive/tee/proof"
+	rootShared "github.com/tokhive/tee/shared"
 )
 
 // Configuration errors, all of which mean the service was built wrong rather

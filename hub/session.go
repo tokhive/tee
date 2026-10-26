@@ -51,6 +51,14 @@ func (t *HTTPTEE) OpenSession(ctx context.Context, spec jobs.Spec) (SessionConn,
 	if err != nil {
 		return nil, fmt.Errorf("dial TEE session: %w", err)
 	}
+	// Every return before the tunnel is handed back leaves the connection
+	// behind, so the cleanup is stated once instead of at each refusal.
+	opened := false
+	defer func() {
+		if !opened {
+			_ = conn.Close()
+		}
+	}()
 
 	// Bound the whole request/ack exchange, and let the caller's cancellation
 	// interrupt a read the socket deadline alone would only end at expiry.
@@ -64,17 +72,14 @@ func (t *HTTPTEE) OpenSession(ctx context.Context, spec jobs.Spec) (SessionConn,
 		_ = conn.SetReadDeadline(time.Now())
 		_ = conn.SetWriteDeadline(time.Now())
 	})
+	defer stopAck()
 
 	if err := conn.WriteMessage(websocket.BinaryMessage, first); err != nil {
-		stopAck()
-		_ = conn.Close()
 		return nil, fmt.Errorf("send session request: %w", err)
 	}
 
 	mt, ack, err := conn.ReadMessage()
 	if err != nil {
-		stopAck()
-		_ = conn.Close()
 		return nil, fmt.Errorf("read session ack: %w", err)
 	}
 	// The ack is the end of the opening exchange; the tunnel itself must not
@@ -82,36 +87,28 @@ func (t *HTTPTEE) OpenSession(ctx context.Context, spec jobs.Spec) (SessionConn,
 	// cancellation raced the ack, do not hand back a tunnel whose caller has
 	// already gone — the callback may also have re-armed the deadline.
 	if !stopAck() && ctx.Err() != nil {
-		_ = conn.Close()
 		return nil, fmt.Errorf("session opening cancelled: %w", ctx.Err())
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 	_ = conn.SetWriteDeadline(time.Time{})
 	if mt != websocket.TextMessage {
-		_ = conn.Close()
 		return nil, fmt.Errorf("session ack was not text (type %d)", mt)
 	}
 	// A successful ack has to say so. Treating any JSON object without an
 	// "error" as success would accept a malformed or empty acknowledgement and
 	// start relaying into a tunnel the TEE never opened.
-	var ackMsg struct {
-		OK          bool   `json:"ok"`
-		Error       string `json:"error"`
-		Subprotocol string `json:"subprotocol"`
-	}
+	var ackMsg tee.SessionAck
 	if err := json.Unmarshal(ack, &ackMsg); err != nil {
-		_ = conn.Close()
 		return nil, fmt.Errorf("decode session ack %q: %w", ack, err)
 	}
 	if ackMsg.Error != "" {
-		_ = conn.Close()
 		return nil, fmt.Errorf("%w: TEE refused session: %s", ErrTEERefused, ack)
 	}
 	if !ackMsg.OK {
-		_ = conn.Close()
 		return nil, fmt.Errorf("%w: TEE did not acknowledge the session: %s", ErrTEERefused, ack)
 	}
 
+	opened = true
 	return &sessionTunnel{conn: conn, subprotocol: ackMsg.Subprotocol}, nil
 }
 

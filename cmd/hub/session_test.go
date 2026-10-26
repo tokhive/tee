@@ -283,6 +283,13 @@ func TestSessionLinkSendsOneCloseAndNothingAfter(t *testing.T) {
 	if len(frames) != 1 || frames[0].Opcode != hub.WSOpClose {
 		t.Fatalf("tunnel frames = %+v, want exactly one close and nothing after it", frames)
 	}
+	// The decoder stops at a close, so it cannot show whether a second close
+	// followed. The byte count can: one masked close frame is the whole tunnel.
+	want := len(hub.MaskClientFrame(hub.WSOpClose,
+		hub.ClosePayload(websocket.ClosePolicyViolation, "session ended")))
+	if tunnel.Len() != want {
+		t.Fatalf("tunnel carries %d bytes, want exactly one %d-byte close frame", tunnel.Len(), want)
+	}
 }
 
 // TestBuildSessionCarriesTheNegotiatedProtocolAndConfiguredPath pins the spec the

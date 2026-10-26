@@ -80,12 +80,11 @@ func maskClientFrame(opcode byte, payload []byte, fin bool) []byte {
 			byte(n>>56), byte(n>>48), byte(n>>40), byte(n>>32),
 			byte(n>>24), byte(n>>16), byte(n>>8), byte(n))
 	}
+	// A random key keeps masking unpredictable and avoids a fixed fingerprint
+	// on every frame. crypto/rand does not fail on a supported platform, and a
+	// zero key would still be legal masking.
 	var key [4]byte
-	if _, err := rand.Read(key[:]); err != nil {
-		// crypto/rand does not fail on a supported platform; a fixed key keeps
-		// the frame legal rather than failing an otherwise healthy session.
-		copy(key[:], []byte{0x55, 0xaa, 0x12, 0x34})
-	}
+	_, _ = rand.Read(key[:])
 	buf = append(buf, key[:]...)
 	for i, b := range payload {
 		buf = append(buf, b^key[i%4])
