@@ -35,7 +35,6 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	rootShared "github.com/tokhive/tee/shared"
 	"github.com/tokhive/tee/attest"
 	"github.com/tokhive/tee/cmd/internal/shared"
 	"github.com/tokhive/tee/evidence"
@@ -48,6 +47,7 @@ import (
 	"github.com/tokhive/tee/platform/simulated"
 	"github.com/tokhive/tee/platform/tencent"
 	"github.com/tokhive/tee/policy"
+	rootShared "github.com/tokhive/tee/shared"
 	"github.com/tokhive/tee/tee"
 )
 
@@ -85,6 +85,7 @@ func main() {
 	sessionMax := flag.Uint64("session-max", 1<<20, "max downlink bytes a streaming session may relay (0 = unlimited)")
 	sessionMaxUp := flag.Uint64("session-max-up", 1<<20, "max uplink bytes a streaming session may relay (0 = unlimited)")
 	sessionIdle := flag.Duration("session-idle", 30*time.Second, "tear a session down if the provider streams nothing this long (0 = no watchdog)")
+	sessionUpstreamPath := flag.String("session-upstream-path", "", "upstream WebSocket path a streaming session is relayed to (empty = /v1/realtime; must be whitelisted by the deployment policy)")
 	attemptTimeout := flag.Duration("attempt-timeout", 3*time.Minute, "bound on one dispatch to a provider, including TEE time (0 = no bound; keep this above the TEE's -request-timeout)")
 	agentKeys := flag.String("agent-keys", "", "per-provider agent keys as provider=key[,provider=key]; binds each tunnel to exactly one provider (required in serve mode)")
 	relayKey := flag.String("relay-key", "", "key the TEE must present to dial /v1/relay (empty = unauthenticated relay)")
@@ -220,6 +221,7 @@ func main() {
 		ProviderHosts: perProviderHosts,
 		Query:         *query,
 		Max:           *maxBytes,
+		SessionPath:   *sessionUpstreamPath,
 		Tenants:       tenantResolver{keys: tenants},
 		Policy:        policyDoc,
 	}
@@ -243,7 +245,7 @@ func main() {
 		AgentKeys:            perProviderKeys,
 		RelaySecret:          []byte(*relayKey),
 		Credentials:          teeClient,
-		AdmitAgent:           admitAgainstPolicy(policyDoc, serveCfg.HostFor),
+		AdmitAgent:           admitAgainstPolicy(policyDoc, serveCfg.HostFor, serveCfg.upstreamSessionPath()),
 	})
 	if err != nil {
 		log.Fatalf("build hub: %v", err)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -13,6 +14,11 @@ import (
 	"github.com/tokhive/tee/proof"
 	"github.com/tokhive/tee/tee"
 )
+
+// sessionWriteWait bounds one tunnel write. Without it a TEE that stops
+// reading wedges the relay goroutine forever; the control frames the link
+// injects make that path common enough to matter, not just a shutdown case.
+const sessionWriteWait = 10 * time.Second
 
 // OpenSession implements TEE by dialing the TEE's /v1/session WebSocket,
 // submitting the upgrade handshake request, and handing back a raw byte tunnel.
@@ -53,17 +59,28 @@ func (t *HTTPTEE) OpenSession(ctx context.Context, spec jobs.Spec) (SessionConn,
 		_ = conn.Close()
 		return nil, fmt.Errorf("session ack was not text (type %d)", mt)
 	}
-	var ackJSON map[string]any
-	if err := json.Unmarshal(ack, &ackJSON); err != nil {
+	// A successful ack has to say so. Treating any JSON object without an
+	// "error" as success would accept a malformed or empty acknowledgement and
+	// start relaying into a tunnel the TEE never opened.
+	var ackMsg struct {
+		OK          bool   `json:"ok"`
+		Error       string `json:"error"`
+		Subprotocol string `json:"subprotocol"`
+	}
+	if err := json.Unmarshal(ack, &ackMsg); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("decode session ack %q: %w", ack, err)
 	}
-	if _, refused := ackJSON["error"]; refused {
+	if ackMsg.Error != "" {
 		_ = conn.Close()
 		return nil, fmt.Errorf("%w: TEE refused session: %s", ErrTEERefused, ack)
 	}
+	if !ackMsg.OK {
+		_ = conn.Close()
+		return nil, fmt.Errorf("%w: TEE did not acknowledge the session: %s", ErrTEERefused, ack)
+	}
 
-	return &sessionTunnel{conn: conn}, nil
+	return &sessionTunnel{conn: conn, subprotocol: ackMsg.Subprotocol}, nil
 }
 
 // sessionTunnel is the concrete SessionConn behind HTTPTEE.OpenSession.
@@ -81,6 +98,9 @@ func (t *HTTPTEE) OpenSession(ctx context.Context, spec jobs.Spec) (SessionConn,
 // next Read yields io.EOF. Write forwards uplink bytes verbatim.
 type sessionTunnel struct {
 	conn *websocket.Conn
+	// subprotocol is what the provider selected during the Upgrade the TEE
+	// performed on this session's behalf, carried back in the TEE's ack.
+	subprotocol string
 
 	readMu  sync.Mutex // serializes the downlink reader (one reader only)
 	writeMu sync.Mutex // serializes the uplink writer (one writer only)
@@ -105,11 +125,15 @@ func (s *sessionTunnel) Write(p []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 	s.mu.Unlock()
+	_ = s.conn.SetWriteDeadline(time.Now().Add(sessionWriteWait))
 	if err := s.conn.WriteMessage(websocket.BinaryMessage, p); err != nil {
 		return 0, err
 	}
 	return len(p), nil
 }
+
+// Subprotocol implements SessionHandshake.
+func (s *sessionTunnel) Subprotocol() string { return s.subprotocol }
 
 // Read returns downlink bytes, preferring anything the last Binary message has
 // left over, otherwise waiting for the next tunnel message.
@@ -179,6 +203,7 @@ func (s *sessionTunnel) Close() error {
 	}
 	s.closed = true
 	s.mu.Unlock()
+	_ = s.conn.SetWriteDeadline(time.Now().Add(time.Second))
 	_ = s.conn.WriteMessage(websocket.CloseMessage,
 		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "hub done"))
 	return s.conn.Close()

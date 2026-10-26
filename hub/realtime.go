@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,7 +42,97 @@ var (
 	// a buyer must not be charged on a number no receipt supports. A TEE that
 	// honours its cap never produces this.
 	ErrSessionLimitExceeded = errors.New("the TEE relayed past the session's agreed downlink bound")
+	// ErrSessionProtocolMismatch means the provider answered the Upgrade with a
+	// WebSocket subprotocol the user did not negotiate. Forwarding bytes after
+	// that would hand the user a protocol they did not ask for, and would make
+	// the Hub's own handshake answer a lie, so the session is refused before
+	// any tunnel byte is moved.
+	ErrSessionProtocolMismatch = errors.New("provider selected a different WebSocket subprotocol than the user negotiated")
 )
+
+// sessionCloseGrace is how long the relay holds a tunnel open after the user
+// side has ended. A user who closes first has already sent a close frame
+// upstream (the link owns that handshake), and the provider answers it by
+// ending its stream — which is what lets the TEE sign the terminal receipt.
+// Settling that receipt is the difference between a session that is billed for
+// what it delivered and one that is forfeited because the user hung up first.
+const sessionCloseGrace = 5 * time.Second
+
+// SessionLinkBinder is the optional extension a RealtimeLink implements when it
+// owns WebSocket control semantics.
+//
+// relaySession calls BindSession once, before relaying begins, with a writer
+// that serializes every tunnel write and counts every tunnel byte — the user's
+// uplink and the link's own ping/pong/close frames alike. ReleaseSession is
+// called when relaying stops, so a keepalive goroutine the link started cannot
+// outlive the session.
+type SessionLinkBinder interface {
+	BindSession(tunnel io.Writer)
+	ReleaseSession()
+}
+
+// SessionProtocol is the optional extension a RealtimeLink implements to state
+// the subprotocol it negotiated with the user (or that it negotiated none).
+// After the tunnel opens, runRealtime requires the provider's selection to
+// match it exactly; see ErrSessionProtocolMismatch.
+type SessionProtocol interface {
+	Subprotocol() string
+}
+
+// SessionCloser is the optional extension a RealtimeLink implements when it can
+// end the user-facing connection cleanly. relaySession calls it when the Hub —
+// not the provider or the user — ends the session (an uplink bound), so a
+// WebSocket link can also send the close frame upstream. Without that close the
+// provider would keep streaming until the grace expires, and the receipt that
+// attests what it delivered would be lost.
+type SessionCloser interface {
+	CloseSession(reason string)
+}
+
+// meteredTunnel is the only writer to the TEE tunnel. It serializes concurrent
+// writers — the uplink relay and the link's control frames — and counts every
+// byte that actually reached the tunnel, which is the number the receipt's
+// RequestBytes must not exceed.
+//
+// The count is deliberately not the user's byte count: a close handshake or a
+// ping answer the Hub injected is still a byte the TEE received and attested,
+// and reconciling against anything smaller would forfeit an honest session.
+type meteredTunnel struct {
+	SessionConn
+	writeMu sync.Mutex
+	written atomic.Uint64
+}
+
+func (m *meteredTunnel) Write(p []byte) (int, error) {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	n, err := m.SessionConn.Write(p)
+	if n > 0 {
+		m.written.Add(uint64(n))
+	}
+	return n, err
+}
+
+// Written is how many bytes have been handed to the tunnel.
+func (m *meteredTunnel) Written() uint64 { return m.written.Load() }
+
+// sessionProtocolOK reconciles the subprotocol the user negotiated with the one
+// the provider selected. A link that does not speak WebSocket has no opinion
+// and is skipped, as is a tunnel that does not expose its handshake.
+func sessionProtocolOK(link RealtimeLink, conn SessionConn) error {
+	wanted, ok := link.(SessionProtocol)
+	if !ok {
+		return nil
+	}
+	got := ""
+	if handshake, ok := conn.(SessionHandshake); ok {
+		got = handshake.Subprotocol()
+	}
+	if wanted.Subprotocol() != got {
+		return fmt.Errorf("%w: user %q, provider %q", ErrSessionProtocolMismatch, wanted.Subprotocol(), got)
+	}
+	return nil
+}
 
 // upGrant is how long relaySession waits for an in-flight uplink to finish
 // before counting it, once the session has ended. Long enough for a buffered
@@ -246,7 +337,17 @@ func (h *Hub) runRealtime(ctx context.Context, tenant, model, provider string,
 	}
 	defer conn.Close()
 
+	// The user's handshake has already been answered with a subprotocol; the
+	// provider's answer is only known now. A mismatch is refused before the
+	// first byte, because every later frame would speak a protocol the user did
+	// not negotiate.
+	if err := sessionProtocolOK(link, conn); err != nil {
+		return SessionOutcome{}, err
+	}
+
 	h.ledger.NoteDispatch(spec.Provider)
+
+	tunnel := &meteredTunnel{SessionConn: conn}
 
 	if h.sessionTimeout > 0 {
 		var cancel context.CancelFunc
@@ -261,12 +362,12 @@ func (h *Hub) runRealtime(ctx context.Context, tenant, model, provider string,
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = conn.Close()
+			_ = tunnel.Close()
 		case <-stop:
 		}
 	}()
 
-	up, down, downHash, relErr := relaySession(ctx, conn, link, spec.JobID,
+	up, down, downHash, relErr := relaySession(ctx, tunnel, link, spec.JobID,
 		h.sessionMaxUpBytes, h.sessionMaxDownBytes, h.sessionIdle)
 
 	if errors.Is(relErr, ErrSessionLimitExceeded) {
@@ -291,17 +392,19 @@ func (h *Hub) runRealtime(ctx context.Context, tenant, model, provider string,
 	if rec.StatusCode != 101 {
 		return SessionOutcome{}, fmt.Errorf("session receipt status %d, want 101", rec.StatusCode)
 	}
-	// The uplink comparison is deliberately one-sided. The Hub counts uplink
-	// when it reads it from the user, and a session can end while the user's
+	// The uplink comparison is deliberately one-sided. The Hub counts the
+	// bytes it handed to the tunnel, and a session can end while the user's
 	// final bytes are still in flight: the Hub may count bytes the closed
 	// tunnel never delivered, so its count is an upper bound on what the TEE
 	// can attest. An exact equality would forfeit a settled session over that
 	// teardown tail. Only a receipt attesting MORE uplink than the Hub ever
 	// relayed is a contradiction worth refusing — and the receipt stays the
 	// billing record either way, so the buyer pays exactly what the TEE
-	// attested was delivered. The downlink side is exact (the stream hash
-	// already binds it), so its count stays an equality.
-	if rec.RequestBytes > up || rec.ResponseBytes != down || !streamHashEq(rec.StreamHash, downHash[:]) {
+	// attested was delivered. The count includes control frames the Hub
+	// injected (ping answers, the close handshake), because those are bytes the
+	// TEE received and attested too. The downlink side is exact (the stream
+	// hash already binds it), so its count stays an equality.
+	if rec.RequestBytes > tunnel.Written() || rec.ResponseBytes != down || !streamHashEq(rec.StreamHash, downHash[:]) {
 		return SessionOutcome{}, ErrSessionStreamMismatch
 	}
 
@@ -375,14 +478,34 @@ func (h *Hub) runRealtime(ctx context.Context, tenant, model, provider string,
 // healthy session is cut by the TEE at the same number and settles for the
 // bytes it delivered. See ErrSessionLimitExceeded.
 //
-// relaySession returns as soon as the downlink side resolves (or the session
-// times out), because that is when the receipt has been produced. The uplink
+// The two directions end independently, and the difference matters to billing.
+// When the provider finishes, the TEE has signed the receipt and the session is
+// settled; the uplink is drained briefly and abandoned. When the user finishes
+// first, a WebSocket link has already sent its close frame upstream (the link
+// owns that handshake), so the provider answers it and the downlink ends on its
+// own. The tunnel is deliberately NOT closed at that point: closing it would
+// abort the TEE's provider read before it can sign, forfeiting a session that
+// delivered bytes and was simply closed by its user. A grace timer bounds how
+// long the relay waits for a provider that never answers the close.
+//
+// relaySession returns as soon as the downlink side resolves (or a bound or the
+// context ends), because that is when the receipt has been produced. The uplink
 // goroutine is left to unwind when the caller closes the user connection, which
 // is the only thing that can unblock a read on a live user socket.
-func relaySession(ctx context.Context, tunnel SessionConn, link RealtimeLink, jobID []byte,
+func relaySession(ctx context.Context, tunnel *meteredTunnel, link RealtimeLink, jobID []byte,
 	maxUp, maxDown uint64, idle time.Duration) (up, down uint64, downHash [32]byte, relErr error) {
 
 	hasher := proof.NewStreamingHasher(jobID)
+
+	// Hand the link the one metered writer before any byte moves. A WebSocket
+	// link owns the control plane on both sides — it answers the provider's
+	// pings and sends the close frame when the user ends — and those bytes must
+	// go through the same writer as the uplink so the receipt's RequestBytes
+	// still reconciles with what the tunnel received.
+	if binder, ok := link.(SessionLinkBinder); ok {
+		binder.BindSession(tunnel)
+		defer binder.ReleaseSession()
+	}
 
 	// Downlink-stall watchdog: if the provider streams nothing for `idle`, tear
 	// the tunnel down so the receipt (or io.EOF) surfaces and we stop waiting.
@@ -394,8 +517,14 @@ func relaySession(ctx context.Context, tunnel SessionConn, link RealtimeLink, jo
 
 	var downCount uint64
 	downDone := make(chan error, 1)
+	// linkGone reports that delivery to the user failed. The downlink keeps
+	// draining after that: the provider's transcript and the terminal receipt
+	// are still worth having, and abandoning the read would forfeit the session
+	// over a user that merely hung up. The grace timer below bounds the wait.
+	linkGone := make(chan struct{})
 	go func() {
 		buf := make([]byte, 32*1024)
+		var writeErr error
 		for {
 			n, rerr := tunnel.Read(buf)
 			if n > 0 {
@@ -405,17 +534,23 @@ func relaySession(ctx context.Context, tunnel SessionConn, link RealtimeLink, jo
 				}
 				downCount += uint64(n)
 				_ = hasher.WriteChunk(buf[:n])
-				if _, werr := link.Write(buf[:n]); werr != nil {
-					downDone <- werr
-					return
+				if writeErr == nil {
+					if _, werr := link.Write(buf[:n]); werr != nil {
+						writeErr = werr
+						close(linkGone)
+					}
 				}
 				if idleTimer != nil {
 					idleTimer.Reset(idle)
 				}
 			}
 			if rerr != nil {
-				if rerr == io.EOF {
-					downDone <- nil
+				if errors.Is(rerr, io.EOF) {
+					// A clean provider end: the session ends normally. If the
+					// user side had already failed, still report that failure —
+					// the receipt is settled, but the caller may want to log
+					// that delivery broke.
+					downDone <- writeErr
 				} else {
 					downDone <- rerr
 				}
@@ -434,9 +569,13 @@ func relaySession(ctx context.Context, tunnel SessionConn, link RealtimeLink, jo
 			if n > 0 {
 				if maxUp > 0 && upCount.Load()+uint64(n) > maxUp {
 					// The user is uploading more than the Hub will relay into
-					// the provider's tunnel. Stop reading and end the session:
-					// the provider's own tunnel sees a clean close, so nothing
-					// is truncated mid-frame and the receipt still reconciles.
+					// the provider's tunnel. Stop reading and end the session
+					// cleanly: the link owns the handshake on both ends, and a
+					// graceful close is what lets the provider finish and the
+					// TEE sign a receipt for what it actually delivered.
+					if closer, ok := link.(SessionCloser); ok {
+						closer.CloseSession("uplink byte limit reached")
+					}
 					break
 				}
 				upCount.Add(uint64(n))
@@ -448,8 +587,6 @@ func relaySession(ctx context.Context, tunnel SessionConn, link RealtimeLink, jo
 				break
 			}
 		}
-		// User side finished: stop the provider-side read so the session can end.
-		_ = tunnel.Close()
 	}()
 
 	// drainUplink lets an in-flight uplink finish so the count is as settled as
@@ -472,22 +609,57 @@ func relaySession(ctx context.Context, tunnel SessionConn, link RealtimeLink, jo
 		}
 	}
 
-	select {
-	case <-ctx.Done():
-		_ = tunnel.Close()
-		<-downDone
-		drainUplink()
-		return upCount.Load(), downCount, hasher.Sum(), ctx.Err()
-	case downErr := <-downDone:
-		// The provider closed (or a bound fired); the receipt may already have
-		// been read. Close the relay so any uplink still being handed to the
-		// tunnel unwinds, then settle the uplink count.
-		_ = tunnel.Close()
-		drainUplink()
-		if downErr != nil {
-			return upCount.Load(), downCount, hasher.Sum(), downErr
+	// The grace timer starts when the user side ends or delivery to it fails,
+	// and only bounds how long the provider gets to finish on its own. It is
+	// never armed for a session the provider has already ended.
+	var (
+		graceC     <-chan time.Time
+		graceTimer *time.Timer
+	)
+	armGrace := func() {
+		if graceTimer != nil {
+			return
 		}
-		return upCount.Load(), downCount, hasher.Sum(), nil
+		graceTimer = time.NewTimer(sessionCloseGrace)
+		graceC = graceTimer.C
+	}
+	defer func() {
+		if graceTimer != nil {
+			graceTimer.Stop()
+		}
+	}()
+
+	upCh, linkCh := upGone, linkGone
+	for {
+		select {
+		case <-ctx.Done():
+			_ = tunnel.Close()
+			<-downDone
+			drainUplink()
+			return upCount.Load(), downCount, hasher.Sum(), ctx.Err()
+		case downErr := <-downDone:
+			// The provider closed (or a bound fired); the receipt may already
+			// have been read. Close the relay so any uplink still being handed
+			// to the tunnel unwinds, then settle the uplink count.
+			_ = tunnel.Close()
+			drainUplink()
+			return upCount.Load(), downCount, hasher.Sum(), downErr
+		case <-upCh:
+			upCh = nil
+			armGrace()
+		case <-linkCh:
+			linkCh = nil
+			armGrace()
+		case <-graceC:
+			// The user is gone and the provider did not answer the close in
+			// time. Tear the tunnel down; if no receipt follows, RunRealtime
+			// reports ErrNoReceiptForSession rather than charging for a
+			// transcript nothing attested.
+			_ = tunnel.Close()
+			<-downDone
+			drainUplink()
+			return upCount.Load(), downCount, hasher.Sum(), nil
+		}
 	}
 }
 

@@ -50,6 +50,16 @@ import (
 // wedging the tunnel forever.
 const SessionIdleTimeout = 5 * time.Minute
 
+// sessionWriteTimeout bounds one downlink or control write to the Hub.
+//
+// The idle watchdog cannot help with a blocked write: it only closes the
+// provider tunnel, while the pump may be parked in conn.WriteMessage because the
+// Hub stopped reading. Without a deadline that goroutine — and the receipt the
+// session is worth — would never surface. The bound is generous compared with
+// the Hub's own write wait because a slow consumer is not a dead one; its
+// 32 KiB read side only stops while its user socket is being written.
+const sessionWriteTimeout = 30 * time.Second
+
 // SessionAck is the shape of the success reply to a SessionRequest. The
 // subprotocol is what the provider selected during the Upgrade handshake; the
 // Hub needs it to answer its own user-facing handshake with the same value, and
@@ -143,7 +153,7 @@ func ServeSession(svc *Service, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := conn.WriteMessage(websocket.TextMessage, sessionAckJSON(ss.Subprotocol())); err != nil {
+	if err := writeSessionReply(conn, string(sessionAckJSON(ss.Subprotocol()))); err != nil {
 		_ = ss.Close()
 		return
 	}
@@ -184,7 +194,13 @@ func relaySession(conn *websocket.Conn, ss *Session) {
 			case <-ticker.C:
 				last := time.Unix(0, lastActivity.Load())
 				if time.Since(last) > SessionIdleTimeout {
-					_ = conn.Close()
+					// End the provider side, not the Hub WebSocket: the pump is
+					// the only writer of the receipt, and closing the tunnel lets
+					// it sign and deliver one before the socket goes away.
+					// Closing conn here would abort that write and forfeit a
+					// session that was merely quiet.
+					ss.markTruncated()
+					_ = ss.Close()
 					return
 				}
 			}
@@ -265,6 +281,10 @@ func pumpDownlink(conn *websocket.Conn, ss *Session, touch func()) error {
 	for {
 		n, err := ss.Read(buf)
 		if n > 0 {
+			// A Hub that stops reading must not wedge this pump: the receipt is
+			// signed only after this returns, so a write with no deadline would
+			// forfeit the session (see sessionWriteTimeout).
+			_ = conn.SetWriteDeadline(time.Now().Add(sessionWriteTimeout))
 			if werr := conn.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil {
 				return nil
 			}
@@ -293,11 +313,16 @@ func writeReceiptReply(conn *websocket.Conn, signed proof.SignedReceipt) error {
 	if err != nil {
 		return err
 	}
+	_ = conn.SetWriteDeadline(time.Now().Add(sessionWriteTimeout))
 	return conn.WriteMessage(websocket.TextMessage, reply)
 }
 
-// writeSessionReply sends one Text control message.
+// writeSessionReply sends one Text control message. The write is deadline-bound
+// so a Hub that has stopped reading cannot park the control path (see
+// sessionWriteTimeout); it also refreshes the deadline after a failed downlink
+// write, whose expired deadline would otherwise fail this write immediately.
 func writeSessionReply(conn *websocket.Conn, payload string) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(sessionWriteTimeout))
 	return conn.WriteMessage(websocket.TextMessage, []byte(payload))
 }
 
