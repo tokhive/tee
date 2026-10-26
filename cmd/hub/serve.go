@@ -798,6 +798,12 @@ type sessionLink struct {
 	readMu  sync.Mutex // serializes the uplink reader (one reader only)
 	writeMu sync.Mutex // serializes the downlink writer (one writer only)
 
+	// ctlMu serializes this endpoint's upstream control frames and, because it
+	// is held across the write, fixes their order: once the close has gone out a
+	// keepalive ping or a late pong can never follow it. Control writes are
+	// short and share the tunnel's own write lock anyway.
+	ctlMu sync.Mutex
+
 	// mu guards the fields below; the wire I/O happens after releasing it.
 	mu      sync.Mutex
 	first   []byte // the first user message, replayed to the provider
@@ -922,6 +928,14 @@ func (l *sessionLink) Read(p []byte) (int, error) {
 			l.mu.Unlock()
 			return n, nil
 		}
+		// A close has already gone upstream — the idle watchdog, the wall clock,
+		// the uplink bound, or a broken user socket asked for it. No data frame
+		// may follow a close, so the uplink ends here even if the user keeps
+		// talking into a session that is already closing.
+		if l.upstreamClosed {
+			l.mu.Unlock()
+			return 0, io.EOF
+		}
 		if l.readErr != nil {
 			err := l.readErr
 			l.mu.Unlock()
@@ -958,6 +972,12 @@ func (l *sessionLink) Read(p []byte) (int, error) {
 			}
 			_ = l.conn.SetReadDeadline(time.Now().Add(sessionPongWait))
 			l.mu.Lock()
+			// The close may have been sent while this read was blocked; the
+			// message that arrived is too late to relay.
+			if l.upstreamClosed {
+				l.mu.Unlock()
+				return 0, io.EOF
+			}
 			payload = msg
 			op = frameOpcode(mt)
 		}
@@ -1108,6 +1128,8 @@ func (l *sessionLink) stopUserWrites() {
 // the only path for the link's own keepalive, pong and close frames, so they
 // are serialized and metered exactly like the user's data.
 func (l *sessionLink) writeTunnelFrame(op byte, payload []byte) {
+	l.ctlMu.Lock()
+	defer l.ctlMu.Unlock()
 	l.mu.Lock()
 	// After the close has gone out (or is about to, since sendTunnelClose flags
 	// it before writing), nothing else may follow it upstream — neither a
@@ -1129,14 +1151,22 @@ func (l *sessionLink) writeTunnelFrame(op byte, payload []byte) {
 // one close; a duplicate can make a strict provider drop the connection in the
 // middle of a close handshake the TEE is still waiting on.
 func (l *sessionLink) sendTunnelClose(code uint16, reason string) {
+	l.ctlMu.Lock()
+	defer l.ctlMu.Unlock()
 	l.mu.Lock()
 	if l.upstreamClosed {
 		l.mu.Unlock()
 		return
 	}
+	// Flagged before the write, so every other control writer — which also holds
+	// ctlMu — sees the close and stays silent.
 	l.upstreamClosed = true
+	tunnel := l.tunnel
 	l.mu.Unlock()
-	l.writeTunnelFrame(hub.WSOpClose, hub.ClosePayload(code, reason))
+	if tunnel == nil {
+		return
+	}
+	_, _ = tunnel.Write(hub.MaskClientFrame(hub.WSOpClose, hub.ClosePayload(code, reason)))
 }
 
 // closeUpstream tells the provider that the user's side ended. A close frame

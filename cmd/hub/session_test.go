@@ -248,6 +248,43 @@ func TestSessionLinkFinishSendsAnOrderlyUserClose(t *testing.T) {
 	}
 }
 
+// TestSessionLinkReadStopsAfterTheHubCloses pins the uplink side of a close the
+// Hub initiated: no data frame may follow the close upstream, even if the user
+// keeps talking into a session that is already ending.
+func TestSessionLinkReadStopsAfterTheHubCloses(t *testing.T) {
+	server, client := sessionPair(t)
+	link := &sessionLink{conn: server}
+	link.CloseSession("session ended")
+
+	if _, err := link.Read(make([]byte, 64)); !errors.Is(err, io.EOF) {
+		t.Fatalf("Read after the Hub closed = %v, want io.EOF", err)
+	}
+	// A message already in flight when the close went out is dropped too.
+	go func() { _ = client.WriteMessage(websocket.BinaryMessage, []byte("late")) }()
+	if _, err := link.Read(make([]byte, 64)); !errors.Is(err, io.EOF) {
+		t.Fatalf("Read after a late user message = %v, want io.EOF", err)
+	}
+}
+
+// TestSessionLinkSendsOneCloseAndNothingAfter pins the provider-facing control
+// order: repeated closes are collapsed to one frame, and no keepalive can follow
+// it. A provider that sees a ping after a close may drop the connection before
+// the TEE can sign.
+func TestSessionLinkSendsOneCloseAndNothingAfter(t *testing.T) {
+	server, _ := sessionPair(t)
+	var tunnel bytes.Buffer
+	link := &sessionLink{conn: server, tunnel: &tunnel}
+
+	link.CloseSession("session ended")
+	link.CloseSession("session ended again")
+	link.writeTunnelFrame(hub.WSOpPing, nil)
+
+	frames := mustFeed(t, hub.NewWsFrameDecoder(), tunnel.Bytes())
+	if len(frames) != 1 || frames[0].Opcode != hub.WSOpClose {
+		t.Fatalf("tunnel frames = %+v, want exactly one close and nothing after it", frames)
+	}
+}
+
 // TestBuildSessionCarriesTheNegotiatedProtocolAndConfiguredPath pins the spec the
 // TEE receives: the upstream path is the deployment's (not the Hub's user-facing
 // route), and the user's subprotocol is offered to the provider only when there

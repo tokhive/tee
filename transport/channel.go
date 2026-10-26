@@ -362,12 +362,19 @@ func (m *ChannelManager) OpenSession(ctx context.Context, req tee.Request) (tee.
 	// A plain cancellation (no deadline) must still abort a handshake that is
 	// blocked on a silent peer. The poke is stopped once the session is
 	// established — from then on the session's own idle watchdog governs, not
-	// the request context that opened it. The clear runs after the stop so a
-	// poke that fired at the worst moment cannot leave a stale deadline on a
-	// healthy session.
-	stopOnCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	// the request context that opened it. The clear runs only after the poke is
+	// known to have finished: if the callback already started, it may be about
+	// to set an expired deadline, and clearing first would let that poke land on
+	// a healthy session and kill its first read.
+	pokeDone := make(chan struct{})
+	stopOnCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(pokeDone)
+	})
 	defer func() {
-		stopOnCancel()
+		if !stopOnCancel() {
+			<-pokeDone
+		}
 		_ = conn.SetDeadline(time.Time{})
 	}()
 
