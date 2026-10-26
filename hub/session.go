@@ -20,6 +20,13 @@ import (
 // injects make that path common enough to matter, not just a shutdown case.
 const sessionWriteWait = 10 * time.Second
 
+// sessionAckWait bounds the TEE's acknowledgement of a session request. The TEE
+// performs the provider Upgrade before it answers, so this covers the dial and
+// handshake as well; a shorter caller deadline wins. Without it a TEE that
+// accepts the WebSocket and then stalls would pin the handler, the user's
+// connection, and the tenant's in-flight slot forever.
+const sessionAckWait = 90 * time.Second
+
 // OpenSession implements TEE by dialing the TEE's /v1/session WebSocket,
 // submitting the upgrade handshake request, and handing back a raw byte tunnel.
 //
@@ -45,16 +52,41 @@ func (t *HTTPTEE) OpenSession(ctx context.Context, spec jobs.Spec) (SessionConn,
 		return nil, fmt.Errorf("dial TEE session: %w", err)
 	}
 
+	// Bound the whole request/ack exchange, and let the caller's cancellation
+	// interrupt a read the socket deadline alone would only end at expiry.
+	ackDeadline := time.Now().Add(sessionAckWait)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(ackDeadline) {
+		ackDeadline = dl
+	}
+	_ = conn.SetReadDeadline(ackDeadline)
+	_ = conn.SetWriteDeadline(ackDeadline)
+	stopAck := context.AfterFunc(ctx, func() {
+		_ = conn.SetReadDeadline(time.Now())
+		_ = conn.SetWriteDeadline(time.Now())
+	})
+
 	if err := conn.WriteMessage(websocket.BinaryMessage, first); err != nil {
+		stopAck()
 		_ = conn.Close()
 		return nil, fmt.Errorf("send session request: %w", err)
 	}
 
 	mt, ack, err := conn.ReadMessage()
 	if err != nil {
+		stopAck()
 		_ = conn.Close()
 		return nil, fmt.Errorf("read session ack: %w", err)
 	}
+	// The ack is the end of the opening exchange; the tunnel itself must not
+	// inherit its deadline, which would cut the first long quiet stretch. If
+	// cancellation raced the ack, do not hand back a tunnel whose caller has
+	// already gone — the callback may also have re-armed the deadline.
+	if !stopAck() && ctx.Err() != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("session opening cancelled: %w", ctx.Err())
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Time{})
 	if mt != websocket.TextMessage {
 		_ = conn.Close()
 		return nil, fmt.Errorf("session ack was not text (type %d)", mt)

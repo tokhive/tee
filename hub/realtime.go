@@ -354,19 +354,13 @@ func (h *Hub) runRealtime(ctx context.Context, tenant, model, provider string,
 		ctx, cancel = context.WithTimeout(ctx, h.sessionTimeout)
 		defer cancel()
 	}
-	// Any expiry (wall-clock timeout or the caller's cancellation) must unwedge
-	// the relay loops, which are otherwise blocked on the tunnel: closing the
-	// tunnel aborts the downlink read so we can return and settle.
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = tunnel.Close()
-		case <-stop:
-		}
-	}()
 
+	// relaySession itself watches ctx.Done. It does not merely cut the tunnel:
+	// a link that owns the user-side handshake is asked to close both ends and
+	// the provider gets the same grace as any other user-side end, so a session
+	// that stops because its wall clock ran out can still produce a receipt for
+	// what it delivered. A link that cannot close is cut immediately, which is
+	// also what unwedges its blocked tunnel reads.
 	up, down, downHash, relErr := relaySession(ctx, tunnel, link, spec.JobID,
 		h.sessionMaxUpBytes, h.sessionMaxDownBytes, h.sessionIdle)
 
@@ -488,6 +482,13 @@ func (h *Hub) runRealtime(ctx context.Context, tenant, model, provider string,
 // delivered bytes and was simply closed by its user. A grace timer bounds how
 // long the relay waits for a provider that never answers the close.
 //
+// Every boundary that ends a session early follows the same rule: a flow the
+// Hub itself stops — an uplink bound, a wall-clock timeout, a cancelled
+// context, a downlink stall, or a user socket that broke — asks a link that
+// implements SessionCloser to close both ends, then waits out that same grace,
+// so the provider can still answer and the TEE can still sign. Only a link that
+// cannot close is cut directly, because nothing else would end its session.
+//
 // relaySession returns as soon as the downlink side resolves (or a bound or the
 // context ends), because that is when the receipt has been produced. The uplink
 // goroutine is left to unwind when the caller closes the user connection, which
@@ -507,11 +508,33 @@ func relaySession(ctx context.Context, tunnel *meteredTunnel, link RealtimeLink,
 		defer binder.ReleaseSession()
 	}
 
-	// Downlink-stall watchdog: if the provider streams nothing for `idle`, tear
-	// the tunnel down so the receipt (or io.EOF) surfaces and we stop waiting.
+	// Downlink-stall watchdog: if the provider streams nothing for `idle`, end
+	// the session so the receipt (or io.EOF) surfaces instead of the relay
+	// waiting forever. A link that owns the WebSocket control plane is asked to
+	// close both ends — that close is what lets the provider finish and the TEE
+	// sign — and the select loop below gives it the same grace as any other
+	// user-side end. A link without that ability is simply cut.
+	//
+	// The callback runs on its own goroutine: a close handshake can block on a
+	// tunnel write for a writer that has stopped reading, and the relay loop must
+	// stay free to process the downlink that may still arrive.
 	var idleTimer *time.Timer
+	idleFired := make(chan struct{}, 1)
 	if idle > 0 {
-		idleTimer = time.AfterFunc(idle, func() { _ = tunnel.Close() })
+		var idleOnce sync.Once
+		idleTimer = time.AfterFunc(idle, func() {
+			idleOnce.Do(func() {
+				if closer, ok := link.(SessionCloser); ok {
+					closer.CloseSession("provider went idle")
+				} else {
+					_ = tunnel.Close()
+				}
+				select {
+				case idleFired <- struct{}{}:
+				default:
+				}
+			})
+		})
 		defer idleTimer.Stop()
 	}
 
@@ -609,12 +632,14 @@ func relaySession(ctx context.Context, tunnel *meteredTunnel, link RealtimeLink,
 		}
 	}
 
-	// The grace timer starts when the user side ends or delivery to it fails,
-	// and only bounds how long the provider gets to finish on its own. It is
-	// never armed for a session the provider has already ended.
+	// The grace timer starts whenever the user side ends (cleanly, by a failed
+	// delivery, or because a bound or the context is ending the session), and
+	// only bounds how long the provider gets to finish on its own. It is never
+	// armed for a session the provider has already ended.
 	var (
 		graceC     <-chan time.Time
 		graceTimer *time.Timer
+		ctxErr     error
 	)
 	armGrace := func() {
 		if graceTimer != nil {
@@ -629,36 +654,76 @@ func relaySession(ctx context.Context, tunnel *meteredTunnel, link RealtimeLink,
 		}
 	}()
 
-	upCh, linkCh := upGone, linkGone
+	// askToClose sends the upstream close through the link when it owns the
+	// handshake, and reports whether that happened. A link that cannot close is
+	// cut where it stands: nothing upstream would otherwise end the session.
+	askToClose := func(reason string) bool {
+		closer, ok := link.(SessionCloser)
+		if !ok {
+			_ = tunnel.Close()
+			return false
+		}
+		// CloseSession can block on a tunnel write the provider stopped reading;
+		// that is why the idle watchdog calls it off this goroutine. Here the
+		// loop is already ending the session, and the bounded wait for the answer
+		// is the same grace every other end path gets.
+		closer.CloseSession(reason)
+		return true
+	}
+
+	upCh, linkCh, ctxCh := upGone, linkGone, ctx.Done()
 	for {
 		select {
-		case <-ctx.Done():
-			_ = tunnel.Close()
-			<-downDone
-			drainUplink()
-			return upCount.Load(), downCount, hasher.Sum(), ctx.Err()
+		case <-ctxCh:
+			// The wall clock ran out or the caller cancelled. Do not cut the
+			// tunnel: ask both ends to close and wait out the grace for the
+			// provider's answer, because that answer is what lets the TEE sign a
+			// receipt for the bytes that already crossed. A link that cannot
+			// close is cut immediately, exactly as before.
+			ctxCh = nil
+			ctxErr = ctx.Err()
+			if askToClose("session ended") {
+				armGrace()
+			}
 		case downErr := <-downDone:
 			// The provider closed (or a bound fired); the receipt may already
 			// have been read. Close the relay so any uplink still being handed
-			// to the tunnel unwinds, then settle the uplink count.
+			// to the tunnel unwinds, then settle the uplink count. A cancelled
+			// context is reported even when the provider finished first: the
+			// caller asked to stop, and runRealtime still settles the receipt.
 			_ = tunnel.Close()
 			drainUplink()
+			if ctxErr != nil && !errors.Is(downErr, ErrSessionLimitExceeded) {
+				return upCount.Load(), downCount, hasher.Sum(), ctxErr
+			}
 			return upCount.Load(), downCount, hasher.Sum(), downErr
 		case <-upCh:
+			// The user closed (their close frame already went upstream), or the
+			// uplink bound fired and the link sent one. Wait for the provider to
+			// answer before tearing the tunnel down.
 			upCh = nil
 			armGrace()
 		case <-linkCh:
+			// Delivery to the user failed. The user socket is gone, so the
+			// provider must be told too — otherwise it streams into a dead
+			// session until the grace expires. The downlink keeps draining, so
+			// the provider's transcript is still captured.
 			linkCh = nil
+			askToClose("user delivery failed")
+			armGrace()
+		case <-idleFired:
+			// The watchdog already asked a closing link to close both ends (or
+			// cut the tunnel itself); give the provider its grace to finish.
 			armGrace()
 		case <-graceC:
-			// The user is gone and the provider did not answer the close in
+			// The user side is gone and the provider did not answer the close in
 			// time. Tear the tunnel down; if no receipt follows, RunRealtime
 			// reports ErrNoReceiptForSession rather than charging for a
 			// transcript nothing attested.
 			_ = tunnel.Close()
 			<-downDone
 			drainUplink()
-			return upCount.Load(), downCount, hasher.Sum(), nil
+			return upCount.Load(), downCount, hasher.Sum(), ctxErr
 		}
 	}
 }

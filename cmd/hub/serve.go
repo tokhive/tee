@@ -618,9 +618,12 @@ var sessionUpgrader = websocket.Upgrader{
 // end it; the Hub probes both peers and treats an unanswered probe as a dead
 // connection. The upstream ping interval must stay well under the TEE's idle
 // watchdog (SessionIdleTimeout), because that ping is also what keeps a quiet
-// session alive inside the enclave instead of being reaped mid-conversation.
+// session alive inside the enclave instead of being reaped mid-conversation —
+// and well under the Hub's own -session-idle watchdog (30s by default), whose
+// clock is reset only by downlink bytes and would otherwise race the very pong
+// that proves the provider is alive.
 const (
-	sessionPingInterval = 30 * time.Second
+	sessionPingInterval = 10 * time.Second
 	sessionPongWait     = 75 * time.Second
 	userWriteWait       = 10 * time.Second
 )
@@ -676,6 +679,11 @@ func (c *sessionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mt, first, err := conn.ReadMessage()
 	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil {
+		// The Upgrade has already been answered; a bare return would leave the
+		// user with a TCP drop that looks like a network fault.
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "no session request"),
+			time.Now().Add(userWriteWait))
 		return
 	}
 	var req struct {
@@ -791,20 +799,37 @@ type sessionLink struct {
 	writeMu sync.Mutex // serializes the downlink writer (one writer only)
 
 	// mu guards the fields below; the wire I/O happens after releasing it.
-	mu        sync.Mutex
-	first     []byte // the first user message, replayed to the provider
-	firstOp   byte   // that message's frame opcode
-	pending   []byte // masked bytes still to hand out
-	readErr   error
-	writesOff bool // no more frames may be written to the user
-	tunnel    io.Writer
-	keepStop  chan struct{}
-	keepDone  chan struct{}
+	mu      sync.Mutex
+	first   []byte // the first user message, replayed to the provider
+	firstOp byte   // that message's frame opcode
+	pending []byte // masked bytes still to hand out (at most one whole frame)
+	// fragRemain is the unsent tail of one large message. Read emits at most one
+	// frame per call, so a control frame injected by the keepalive or the relay
+	// can only land between fragments — never inside a frame whose header has
+	// already declared its payload length.
+	fragRemain []byte
+	readErr    error
+	writesOff  bool // no more frames may be written to the user
+	tunnel     io.Writer
+	keepStop   chan struct{}
+	keepDone   chan struct{}
+	// upstreamClosed records that the one close frame this endpoint may send
+	// upstream has gone out. The user closing, the provider closing, and the
+	// Hub ending the session can race for it; a second close frame would be an
+	// RFC 6455 violation the provider may answer by dropping the connection
+	// before the TEE can sign.
+	upstreamClosed bool
 
 	// down frames the incoming provider (server) frame stream. Only the downlink
 	// writer touches it, so it is guarded by writeMu.
 	down *hub.WsFrameDecoder
 }
+
+// maskedFrameHeader is the most significant header MaskClientFrameFin can emit:
+// 2 (FIN+opcode+7-bit length) + 8 (64-bit length) + 4 (mask key). Sizing a
+// fragment so payload+header fits in the caller's buffer makes every Read
+// return a whole frame.
+const maskedFrameHeader = 14
 
 // Subprotocol implements hub.SessionProtocol: the protocol negotiated with the
 // user, which the provider's handshake must match.
@@ -872,13 +897,23 @@ func (l *sessionLink) keepalive(stop <-chan struct{}, done chan<- struct{}) {
 	}
 }
 
-// Read returns the next provider-bound chunk: a legal masked client frame built
-// from the user's message (or the replayed first frame). The bytes are exactly
-// what the provider's own parser must accept, and they are handed out in pieces
-// when the frame is larger than p.
+// Read returns the next provider-bound frame: a legal masked client frame built
+// from the user's message (or the replayed first frame). Each call yields at
+// most one whole frame, so a 16 MiB message arrives at the provider as a series
+// of RFC 6455 fragments rather than a frame whose body spans several tunnel
+// writes. That distinction is what lets the keepalive and the relay's own pong
+// answers interleave without corrupting the provider's parser: a control frame
+// may sit between fragments, never inside one.
 func (l *sessionLink) Read(p []byte) (int, error) {
 	l.readMu.Lock()
 	defer l.readMu.Unlock()
+	// The whole-frame guarantee needs room for a header and at least one payload
+	// byte. The relay always reads with a 32 KiB buffer, so this only rejects a
+	// caller that could not have carried a frame anyway; truncating one would
+	// let a control frame land inside it.
+	if len(p) <= maskedFrameHeader {
+		return 0, io.ErrShortBuffer
+	}
 	for {
 		l.mu.Lock()
 		if len(l.pending) > 0 {
@@ -892,11 +927,14 @@ func (l *sessionLink) Read(p []byte) (int, error) {
 			l.mu.Unlock()
 			return 0, err
 		}
-		// Pull one raw payload out of first (the message already read for model
-		// selection), then frame it below.
+		// Take the next message: the unsent tail of a fragmented one, the first
+		// message already read for model selection, or a fresh user message.
 		var payload []byte
 		var op byte
-		if len(l.first) > 0 {
+		if l.fragRemain != nil {
+			payload = l.fragRemain
+			op = hub.WSOpContinuation
+		} else if len(l.first) > 0 {
 			payload = l.first
 			l.first = nil
 			op = l.firstOp
@@ -921,12 +959,21 @@ func (l *sessionLink) Read(p []byte) (int, error) {
 			_ = l.conn.SetReadDeadline(time.Now().Add(sessionPongWait))
 			l.mu.Lock()
 			payload = msg
-			op = hub.WSOpText
-			if mt == websocket.BinaryMessage {
-				op = hub.WSOpBinary
-			}
+			op = frameOpcode(mt)
 		}
-		l.pending = hub.MaskClientFrame(op, payload)
+
+		// Emit one whole frame, sized to fit p. Anything left over stays queued
+		// for the next Read as a continuation fragment.
+		room := len(p) - maskedFrameHeader
+		fin := len(payload) <= room
+		part := payload
+		if !fin {
+			part = payload[:room]
+			l.fragRemain = payload[room:]
+		} else {
+			l.fragRemain = nil
+		}
+		l.pending = hub.MaskClientFrameFin(fin, op, part)
 		l.mu.Unlock()
 	}
 }
@@ -981,6 +1028,11 @@ func (l *sessionLink) Write(p []byte) (int, error) {
 			if !ok {
 				code, reason = websocket.CloseProtocolError, "invalid close frame from provider"
 			}
+			// Echo the close into the tunnel: the provider is the endpoint that
+			// started the handshake and may wait for our half before it drops
+			// TCP. Without the echo its socket stays open, the TEE's downlink
+			// never reaches EOF, and the receipt is lost to the idle watchdog.
+			l.sendTunnelClose(code, reason)
 			l.sendCloseLocked(int(code), reason)
 		}
 	}
@@ -999,7 +1051,7 @@ func (l *sessionLink) Write(p []byte) (int, error) {
 func (l *sessionLink) CloseSession(reason string) {
 	l.writeMu.Lock()
 	defer l.writeMu.Unlock()
-	l.writeTunnelFrame(hub.WSOpClose, hub.ClosePayload(websocket.ClosePolicyViolation, reason))
+	l.sendTunnelClose(websocket.ClosePolicyViolation, reason)
 	l.sendCloseLocked(websocket.ClosePolicyViolation, reason)
 }
 
@@ -1057,12 +1109,34 @@ func (l *sessionLink) stopUserWrites() {
 // are serialized and metered exactly like the user's data.
 func (l *sessionLink) writeTunnelFrame(op byte, payload []byte) {
 	l.mu.Lock()
+	// After the close has gone out (or is about to, since sendTunnelClose flags
+	// it before writing), nothing else may follow it upstream — neither a
+	// keepalive ping nor a pong the provider no longer needs.
+	if l.upstreamClosed && op != hub.WSOpClose {
+		l.mu.Unlock()
+		return
+	}
 	tunnel := l.tunnel
 	l.mu.Unlock()
 	if tunnel == nil {
 		return
 	}
 	_, _ = tunnel.Write(hub.MaskClientFrame(op, payload))
+}
+
+// sendTunnelClose sends this endpoint's one upstream close frame, whichever
+// side ending the session gets there first. A WebSocket endpoint sends exactly
+// one close; a duplicate can make a strict provider drop the connection in the
+// middle of a close handshake the TEE is still waiting on.
+func (l *sessionLink) sendTunnelClose(code uint16, reason string) {
+	l.mu.Lock()
+	if l.upstreamClosed {
+		l.mu.Unlock()
+		return
+	}
+	l.upstreamClosed = true
+	l.mu.Unlock()
+	l.writeTunnelFrame(hub.WSOpClose, hub.ClosePayload(code, reason))
 }
 
 // closeUpstream tells the provider that the user's side ended. A close frame
@@ -1080,5 +1154,5 @@ func (l *sessionLink) closeUpstream(err error) {
 			code, reason = websocket.CloseGoingAway, "user connection lost"
 		}
 	}
-	l.writeTunnelFrame(hub.WSOpClose, hub.ClosePayload(code, reason))
+	l.sendTunnelClose(code, reason)
 }

@@ -43,10 +43,32 @@ var ErrWSProtocol = errors.New("websocket protocol error")
 // a parser but weakens the masking a proxy relies on, and it is a stable
 // fingerprint on every frame the deployment sends.
 func MaskClientFrame(opcode byte, payload []byte) []byte {
+	return maskClientFrame(opcode, payload, true)
+}
+
+// MaskClientFrameFin is MaskClientFrame with the FIN bit chosen by the caller.
+// A link that must split one large message into several tunnel writes uses
+// fin=false for every fragment but the last, so each tunnel write carries a
+// whole frame and a control frame can legally interleave only between
+// fragments — never inside one.
+func MaskClientFrameFin(fin bool, opcode byte, payload []byte) []byte {
+	return maskClientFrame(opcode, payload, fin)
+}
+
+// maskClientFrame wraps a payload in a legal MASKED client frame. Control
+// frames (and any single small message) pass fin=true; a large data message is
+// deliberately broken into fragments with fin=false on all but the terminal
+// continuation, precisely so the emitted frames stay small enough to travel
+// atomically (see sessionLink.Read). fin=false is only legal on a data frame.
+func maskClientFrame(opcode byte, payload []byte, fin bool) []byte {
 	// Header is at most 2 (FIN+opcode+length) + 8 (64-bit length) + 4 (mask key)
 	// = 14 bytes; the extra body always fits without a realloc.
 	buf := make([]byte, 0, len(payload)+14)
-	buf = append(buf, 0x80|opcode) // FIN + opcode
+	first := opcode
+	if fin {
+		first |= 0x80
+	}
+	buf = append(buf, first)
 	n := len(payload)
 	switch {
 	case n < 126:

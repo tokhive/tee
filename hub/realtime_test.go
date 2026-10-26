@@ -770,6 +770,162 @@ func TestRunRealtimeSettlesWhenTheUserClosesFirst(t *testing.T) {
 	}
 }
 
+// blockedLink keeps its uplink open until the Hub ends the session, and records
+// the close it was asked to send. That lets a test separate a Hub-imposed
+// ending (a timeout or the idle watchdog) from the user hanging up first.
+type blockedLink struct {
+	userLink
+	hold   chan struct{}
+	once   sync.Once
+	mu     sync.Mutex
+	reason string
+}
+
+func newBlockedLink() *blockedLink { return &blockedLink{hold: make(chan struct{})} }
+
+func (l *blockedLink) Read(p []byte) (int, error) {
+	<-l.hold
+	return 0, io.EOF
+}
+
+func (l *blockedLink) CloseSession(reason string) {
+	l.mu.Lock()
+	if l.reason == "" {
+		l.reason = reason
+	}
+	l.mu.Unlock()
+	l.once.Do(func() { close(l.hold) })
+}
+
+func (l *blockedLink) closeReason() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.reason
+}
+
+// TestRunRealtimeSettlesAfterItsTimeoutWhenTheLinkCanClose pins the graceful
+// half of the wall-clock bound: the Hub must not cut the tunnel the instant the
+// deadline fires, because the provider's answer to the link's close is what
+// lets the TEE sign. Cutting it would forfeit a session that had already
+// delivered bytes. A link that cannot close is still cut, which
+// TestRunRealtimeTimeoutEndsASession covers.
+func TestRunRealtimeSettlesAfterItsTimeoutWhenTheLinkCanClose(t *testing.T) {
+	down := [][]byte{[]byte("data: {}\n\n")}
+	opened := make(chan *gatedTunnel, 1)
+	fake := &ScriptedTEE{
+		OpenReply: func(_ int, spec jobs.Spec) (SessionConn, error) {
+			tunnel := &gatedTunnel{
+				frames:  down,
+				rec:     sessionReceipt(spec.JobID, 0, down, 101),
+				release: make(chan struct{}),
+				done:    make(chan struct{}),
+			}
+			opened <- tunnel
+			return tunnel, nil
+		},
+	}
+	h := mustHub(t, Config{
+		TEE:            fake,
+		Rates:          ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 100}}),
+		SessionTimeout: 100 * time.Millisecond,
+	})
+	link := newBlockedLink()
+
+	type result struct {
+		outcome SessionOutcome
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		outcome, err := h.RunRealtime(context.Background(), "tenant", "m", buildSession, link)
+		done <- result{outcome, err}
+	}()
+
+	tunnel := <-opened
+	// Wait past the timeout, then check both halves of the contract: the Hub
+	// asked the link to close instead of hanging up on it, and it has left the
+	// tunnel open while the provider can still answer that close.
+	time.Sleep(300 * time.Millisecond)
+	if got := link.closeReason(); got != "session ended" {
+		t.Fatalf("close reason = %q, want the timeout to close both ends", got)
+	}
+	if tunnel.Closed() {
+		t.Fatal("the Hub cut the tunnel at the timeout instead of letting the provider answer the close")
+	}
+	close(tunnel.release)
+
+	select {
+	case r := <-done:
+		if !errors.Is(r.err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want the timeout reported alongside the settled outcome", r.err)
+		}
+		if !r.outcome.Stored {
+			t.Fatal("a session ended by its timeout must still settle for the bytes it delivered")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the session did not finish after the provider answered the close")
+	}
+}
+
+// TestRunRealtimeSettlesAfterAnIdleStallWhenTheLinkCanClose is the same contract
+// for the downlink-stall watchdog: a provider that goes quiet must be answered
+// with a close and given the grace to finish, not have its tunnel yanked out
+// from under a receipt it was about to sign.
+func TestRunRealtimeSettlesAfterAnIdleStallWhenTheLinkCanClose(t *testing.T) {
+	down := [][]byte{[]byte("data: {}\n\n")}
+	opened := make(chan *gatedTunnel, 1)
+	fake := &ScriptedTEE{
+		OpenReply: func(_ int, spec jobs.Spec) (SessionConn, error) {
+			tunnel := &gatedTunnel{
+				frames:  down,
+				rec:     sessionReceipt(spec.JobID, 0, down, 101),
+				release: make(chan struct{}),
+				done:    make(chan struct{}),
+			}
+			opened <- tunnel
+			return tunnel, nil
+		},
+	}
+	h := mustHub(t, Config{
+		TEE:         fake,
+		Rates:       ratesTable(map[string]RateCard{testProvider: {PerRequestMicros: 100}}),
+		SessionIdle: 50 * time.Millisecond,
+	})
+	link := newBlockedLink()
+
+	type result struct {
+		outcome SessionOutcome
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		outcome, err := h.RunRealtime(context.Background(), "tenant", "m", buildSession, link)
+		done <- result{outcome, err}
+	}()
+
+	tunnel := <-opened
+	time.Sleep(200 * time.Millisecond)
+	if got := link.closeReason(); got != "provider went idle" {
+		t.Fatalf("close reason = %q, want the idle watchdog to close both ends", got)
+	}
+	if tunnel.Closed() {
+		t.Fatal("the idle watchdog cut the tunnel instead of letting the provider answer the close")
+	}
+	close(tunnel.release)
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("run realtime: %v", r.err)
+		}
+		if !r.outcome.Stored {
+			t.Fatal("a session ended by the idle watchdog must still settle for the bytes it delivered")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the session did not finish after the provider answered the close")
+	}
+}
+
 // handshakeTunnel adds the provider's selected subprotocol to a scripted
 // tunnel, as the real sessionTunnel does.
 type handshakeTunnel struct {

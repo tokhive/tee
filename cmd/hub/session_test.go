@@ -100,21 +100,28 @@ func TestSessionLinkReadReplaysTheFirstFrameAcrossChunks(t *testing.T) {
 	big := bytes.Repeat([]byte("x"), 200_000)
 	go func() { _ = client.WriteMessage(websocket.BinaryMessage, big) }()
 
-	want := len(hub.MaskClientFrame(hub.WSOpText, first)) + len(hub.MaskClientFrame(hub.WSOpBinary, big))
-	got := make([]byte, 0, want)
+	// Each Read must yield at most one whole frame, so the 200 KB message reaches
+	// the provider as a series of RFC 6455 fragments that its own parser
+	// reassembles. Collecting decoded messages — rather than counting raw bytes —
+	// pins that shape instead of the size of one monolithic frame.
+	dec := hub.NewWsFrameDecoder()
 	buf := make([]byte, 32*1024)
-	for len(got) < want {
+	var frames []hub.WsFrame
+	for len(frames) < 2 {
 		n, err := link.Read(buf)
 		if err != nil {
-			t.Fatalf("read uplink after %d/%d bytes: %v", len(got), want, err)
+			t.Fatalf("read uplink after %d decoded messages: %v", len(frames), err)
 		}
 		if n == 0 {
 			t.Fatal("Read returned no bytes and no error")
 		}
-		got = append(got, buf[:n]...)
+		fed := mustFeed(t, dec, buf[:n])
+		if len(fed) > 1 {
+			t.Fatalf("one Read yielded %d decoded frames, want at most one whole frame", len(fed))
+		}
+		frames = append(frames, fed...)
 	}
 
-	frames := mustFeed(t, hub.NewWsFrameDecoder(), got)
 	if len(frames) != 2 {
 		t.Fatalf("decoded %d uplink messages, want 2", len(frames))
 	}
