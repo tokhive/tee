@@ -94,6 +94,19 @@ type SessionConn interface {
 	Receipt() (proof.SignedReceipt, error)
 }
 
+// SessionHandshake is an optional SessionConn capability: the WebSocket
+// subprotocol the provider selected during the opening handshake, or the empty
+// string when it selected none. A tunnel that does not implement it is treated
+// as having selected none, which is the only answer a non-WebSocket tunnel can
+// give.
+//
+// It is separate from SessionConn because the byte-relay contract does not
+// need it: only a WebSocket session has a handshake to reconcile with the
+// user's.
+type SessionHandshake interface {
+	Subprotocol() string
+}
+
 // CredentialService is the optional credential plane of a Hub's TEE. In the
 // agent-registration design the TEE itself never stores a token — it holds only
 // the private half of its inbox key — so the only control-plane thing a Hub can

@@ -109,7 +109,10 @@ func (p Policy) authorize(spec jobs.Spec) (Decision, error) {
 	if err := checkQuery(spec, rule); err != nil {
 		return empty, err
 	}
-	if spec.Stream && !rule.AllowStream {
+	// A session is a stream by construction: its receipt digests a byte
+	// transcript rather than a bounded body. Checking Stream alone would let a
+	// session be opened against a rule that never admitted streaming.
+	if (spec.Stream || spec.Session) && !rule.AllowStream {
 		return empty, fmt.Errorf("%w: %q on %q", ErrStreamNotAllowed, spec.Method, spec.Path)
 	}
 

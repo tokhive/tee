@@ -147,6 +147,46 @@ func TestValidateRejects(t *testing.T) {
 	}
 }
 
+func TestValidateSessionInvariants(t *testing.T) {
+	// A session is an upgrade, not a payload: it must be a GET and it must be
+	// admitted under the streaming rule. Both invariants are structural, so a
+	// bad session framing is refused before any policy or credential is touched.
+	session := func() Spec {
+		s := validSpec(t)
+		s.Method = "GET"
+		s.Path = "/v1/realtime"
+		empty := HashBody(nil)
+		s.BodyHash = empty[:]
+		s.Session = true
+		return s
+	}
+
+	good := session()
+	if good.Stream != true {
+		t.Fatal("test setup: a session spec must also be Stream")
+	}
+	if err := good.Validate(); err != nil {
+		t.Fatalf("valid session spec rejected: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		mut  func(*Spec)
+	}{
+		{"session is not a GET", func(s *Spec) { s.Method = "POST" }},
+		{"session is not a stream", func(s *Spec) { s.Stream = false }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := session()
+			tc.mut(&s)
+			if err := s.Validate(); !isError(err, ErrInvalidSession) {
+				t.Fatalf("got %v, want %v", err, ErrInvalidSession)
+			}
+		})
+	}
+}
+
 func TestValidateAtExpiry(t *testing.T) {
 	spec := validSpec(t)
 	expiresAt := spec.ExpiresAt

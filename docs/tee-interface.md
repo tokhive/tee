@@ -241,10 +241,14 @@ SessionRequest = {
 ```
 
 3. TEE 校验（同 4.1）后回复：
-   - 成功：Text `{"ok":true}`
+   - 成功：Text `{"ok":true}`；上游在 Upgrade 响应中选定了子协议时附加 `"subprotocol":"<值>"`
    - 失败：Text `{"error":"<原因>"}`（例如 `{"error":"first frame must be binary"}`）
 
 首帧读取超时 **30 秒**；成功握手后该超时解除。
+
+**子协议（`Sec-WebSocket-Protocol`）**：`Spec.Headers` 可携带该头（部署白名单允许），TEE 原样写入上游 Upgrade；TEE 校验上游必须返回 `101`、`Connection: Upgrade`、正确的 `Sec-WebSocket-Accept`，并拒绝协商任何扩展。上游选定的子协议通过 ack 的 `subprotocol` 字段回报，Hub 据此与用户侧协商的结果核对；两者不一致时会话在字节移动前被拒绝。TEE 自身不解释子协议的含义，只负责搬运和回报。
+
+**上游路径**：Upgrade 的目标路径来自 `Spec.Path`（通常是部署配置的 `/v1/realtime`，Hub 可用 `-session-upstream-path` 改写），不是 TEE 内置的固定路径。
 
 ### 5.2 透传
 
@@ -254,7 +258,7 @@ SessionRequest = {
 
 ### 5.3 收尾
 
-上游流结束（干净 EOF）后，TEE 签发**会话回执**，作为**最后一条 Text 消息**发送，然后关闭 WebSocket：
+上游流结束（干净 EOF、达到上限，或 TEE 因空闲/签名截止主动拆除）后，TEE 签发**会话回执**，作为**最后一条 Text 消息**发送，然后关闭 WebSocket：
 
 ```json
 {"receipt":"<base64( canonical SignedReceipt )>"}
@@ -264,8 +268,9 @@ SessionRequest = {
 
 ### 5.4 会话生命周期
 
-- 会话**没有总时长上限**——只有**空闲**会终止：任意方向**静默超过 5 分钟**（`SessionIdleTimeout`）TEE 拆除会话。空闲计时由任一方向成功转发的字节重置。
-- 因此：长时间"安静但存活"的会话不会死；对端消失导致的僵死连接会被回收。
+- 会话**没有总时长上限**——只有**空闲**会终止：任意方向**静默超过 5 分钟**（`SessionIdleTimeout`）TEE 拆除上游隧道。空闲计时由任一方向成功转发的字节重置（Hub 的周期 ping 也算上行字节）。
+- 空闲拆除**不丢弃收据**：TEE 先标记 `truncated` 再关闭上游隧道，由下行泵签发回执（`Completion=truncated`，不计费），之后才关闭会话 WebSocket。
+- 因此：长时间"安静但存活"的会话不会死；对端消失导致的僵死连接会被回收，且回收本身仍留下可审计的回执。
 
 ---
 
@@ -531,7 +536,7 @@ hub -audit -provider openai-sim   # 只看一个 Provider
 **Hub 用户面 API**（终端用户用 OpenAI SDK 直接调）：`POST /v1/chat/completions`、`POST /v1/messages`（Anthropic 格式）、`POST /v1/responses`（OpenAI Responses 格式）。要点：
 
 - Hub 是**字节中继**，不改写上游帧：`/v1/chat/completions` 追加 `data: [DONE]` 终止标记；`/v1/messages` 以 `message_stop` 结束、`/v1/responses` 以 `response.completed` 结束，**不追加 `[DONE]`**。
-- 长会话：Hub 另有用户面 WebSocket 端点 **`GET /v1/session`**（模型取自首帧 JSON）。它与 TEE 侧同路径端点（第 5 章）**不是同一个**——前者面向终端用户，后者是 Hub↔TEE 内部面。接入方务必确认打的是 TEE 的 `/v1/session`。
+- 长会话：Hub 另有用户面 WebSocket 端点 **`GET /v1/session`**（模型取自首帧 JSON，子协议原样协商；用户关闭时 Hub 会向上游发 close 并在宽限期内保留收据）。它与 TEE 侧同路径端点（第 5 章）**不是同一个**——前者面向终端用户，后者是 Hub↔TEE 内部面。Hub 连 TEE 时仍用 `/v1/session`，而 TEE 连上游的路径默认是 `/v1/realtime`，可用 `-session-upstream-path` 配置。接入方务必确认打的是哪个面。
 - 请求体中的 `model` 字段决定走哪个 Provider（最低价优先）；身份为 `X-TokenHive-Key` 头（v1 占位，非最终鉴权方案）。
 - **模型目录**：`GET /v1/models` 列出当前**在线** Agent 声明的全部模型及其最低在线价（即调度器此刻会实际派发的价格），响应为 `{"models":[{"model","provider","price_micros"}, …]}`。可选 `?q=<子串>` 做大小写不敏感过滤：精确 ID（`?q=claude-sim-haiku`）与片段（`?q=deepseek` 命中 `deepseek-pro` 与 `deepseek-flash`）都可搜。目录完全由 Hub 内存中的在线供应算出，**不触发任何对 Agent 或上游的探测**；未配 Agent 门的 Hub 返回空目录。
 - **策略白名单**：`GET /v1/policies` 输出 Hub 侧加载的**部署白名单**（与被测 bundle 携带的策略文件同源），买家/卖家可在发起调用前核对 TEE 允许访问的源头 AI 服务商范围，无需去问 TEE。全部署只有一份，因此响应也只描述这一份：`{"policy_hash":"<hex>","policy":{"hosts":[…],"rules":[…],"max_response_bytes":…,"max_body_bytes":…,"allowed_headers":[…],"issued_at":…,"expires_at":…}}`——没有 `provider` 维度可查，因为不存在按 Provider 划分的白名单。当 Hub 启动时因策略文件缺失未能装入白名单，会在 `unavailable` 字段置 `true` 表示（此时记日志，但不影响其余接口）。它与 `/v1/models` 同属"部署配置的只读视图"模式。

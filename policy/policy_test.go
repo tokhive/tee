@@ -355,6 +355,19 @@ func TestAuthorizeRejectsBypasses(t *testing.T) {
 			},
 		},
 		{
+			// A session is a stream even when it is framed as an upgrade: the
+			// same allow_stream gate must cover it, or a rule written for a
+			// request/response GET would admit an unbounded session.
+			name: "session where the rule forbids streaming",
+			want: ErrStreamNotAllowed,
+			change: func(s *jobs.Spec) {
+				s.Method = "GET"
+				s.Path = "/v1/models/gpt-4o"
+				s.Stream = true
+				s.Session = true
+			},
+		},
+		{
 			name: "header outside the whitelist",
 			want: ErrHeaderNotAllowed,
 			change: func(s *jobs.Spec) {

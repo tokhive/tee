@@ -10,6 +10,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -338,9 +340,14 @@ func buildRequestBytes(req tee.Request) ([]byte, error) {
 // relay and the provider, exactly as the plan's "transparent byte pipe" after
 // the handshake.
 type Session struct {
-	conn net.Conn
-	br   *bufio.Reader
+	conn        net.Conn
+	br          *bufio.Reader
+	subprotocol string
 }
+
+// Subprotocol reports the protocol the provider selected during the opening
+// handshake, or the empty string when it selected none.
+func (s *Session) Subprotocol() string { return s.subprotocol }
 
 // Read returns the provider's next bytes, preferring anything the handshake
 // already buffered.
@@ -362,7 +369,7 @@ func (s *Session) Close() error { return s.conn.Close() }
 // own handshake headers; the Host and the caller's headers — which include the
 // injected provider credential — are carried through unchanged. The handshake
 // bytes are not counted toward RequestBytes; only post-upgrade writes are.
-func buildUpgradeBytes(req tee.Request) ([]byte, error) {
+func buildUpgradeBytes(req tee.Request, key string) ([]byte, error) {
 	var buf bytes.Buffer
 
 	target := req.Path
@@ -375,22 +382,40 @@ func buildUpgradeBytes(req tee.Request) ([]byte, error) {
 	fmt.Fprintf(&buf, "Connection: Upgrade\r\n")
 	fmt.Fprintf(&buf, "Upgrade: websocket\r\n")
 	fmt.Fprintf(&buf, "Sec-WebSocket-Version: 13\r\n")
-	fmt.Fprintf(&buf, "Sec-WebSocket-Key: %s\r\n", newWebSocketKey())
-	for name, value := range req.Headers {
-		fmt.Fprintf(&buf, "%s: %s\r\n", name, value)
+	fmt.Fprintf(&buf, "Sec-WebSocket-Key: %s\r\n", key)
+	names := make([]string, 0, len(req.Headers))
+	for name := range req.Headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		// The handshake headers above are the TEE's to state, not the caller's.
+		// A duplicate would either break the parse or let a caller override the
+		// key whose accept value is verified below.
+		if reservedUpgradeHeader(name) {
+			continue
+		}
+		fmt.Fprintf(&buf, "%s: %s\r\n", name, req.Headers[name])
 	}
 	buf.WriteString("\r\n")
 	return buf.Bytes(), nil
 }
 
+// reservedUpgradeHeader reports whether a header belongs to the opening
+// handshake and must not be copied from the caller's spec.
+func reservedUpgradeHeader(name string) bool {
+	switch strings.ToLower(name) {
+	case "host", "connection", "upgrade", "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions":
+		return true
+	}
+	return false
+}
+
 // newWebSocketKey returns a fresh Sec-WebSocket-Key: the base64 of 16 random
 // bytes, which is exactly what the WebSocket handshake spec prescribes.
+// crypto/rand does not fail on a supported platform.
 func newWebSocketKey() string {
 	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		// crypto/rand never fails on this platform; if it somehow does, a stale
-		// but well-formed key keeps the upgrade parseable rather than panicking.
-		return base64.StdEncoding.EncodeToString([]byte("00000000000000000000"))
-	}
+	_, _ = rand.Read(nonce[:])
 	return base64.StdEncoding.EncodeToString(nonce[:])
 }

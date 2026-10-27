@@ -75,6 +75,7 @@ var (
 	ErrInvalidNonce       = errors.New("invalid nonce")
 	ErrInvalidExpiry      = errors.New("invalid expiry")
 	ErrInvalidLimit       = errors.New("invalid response size limit")
+	ErrInvalidSession     = errors.New("invalid session job")
 	ErrExpired            = errors.New("job spec has expired")
 )
 
@@ -183,6 +184,17 @@ func (s Spec) Validate() error {
 	}
 	if !SupportedMethods[s.Method] {
 		return fmt.Errorf("%w: %q", ErrInvalidMethod, s.Method)
+	}
+	// A session is an HTTP Upgrade, which is a GET with no body. Stating the
+	// invariant here keeps a session from being framed as an ordinary POST to a
+	// streaming path, which a policy written for streams would otherwise admit.
+	if s.Session {
+		if s.Method != "GET" {
+			return fmt.Errorf("%w: a session is a GET upgrade, got %q", ErrInvalidSession, s.Method)
+		}
+		if !s.Stream {
+			return fmt.Errorf("%w: a session must also be marked Stream", ErrInvalidSession)
+		}
 	}
 	if err := validateHost(s.Host); err != nil {
 		return err

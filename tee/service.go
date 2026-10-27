@@ -54,10 +54,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	rootShared "github.com/tokhive/tee/shared"
 	"github.com/tokhive/tee/jobs"
 	"github.com/tokhive/tee/policy"
 	"github.com/tokhive/tee/proof"
+	rootShared "github.com/tokhive/tee/shared"
 )
 
 // Configuration errors, all of which mean the service was built wrong rather
@@ -1273,6 +1273,16 @@ func (s *Session) markTruncated() {
 // Close tears down the underlying provider connection. Pending Reads on the
 // same Session return once the socket is closed.
 func (s *Session) Close() error { return s.conn.Close() }
+
+// Subprotocol reports the protocol the provider selected in the opening
+// handshake, when the transport can report one. It is empty for a transport
+// that does not speak WebSocket or a provider that selected none.
+func (s *Session) Subprotocol() string {
+	if h, ok := s.conn.(interface{ Subprotocol() string }); ok {
+		return h.Subprotocol()
+	}
+	return ""
+}
 
 // Receipt signs the session's execution receipt. It is idempotent: the first
 // call signs, and later calls return the same result. Call it once the session

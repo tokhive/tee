@@ -84,7 +84,9 @@
       "x-claude-remote-container-id",
       "x-claude-remote-session-id",
       "x-client-app",
-      "x-anthropic-additional-protection"
+      "x-anthropic-additional-protection",
+      "origin",
+      "sec-websocket-protocol"
     ]
   }
 }

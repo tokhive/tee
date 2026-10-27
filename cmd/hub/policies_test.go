@@ -113,12 +113,12 @@ func TestAdmitAgainstPolicyLooksUpByHostAndPath(t *testing.T) {
 	reg := hub.AgentRegister{Provider: "bee-9f3a"}
 	hostFor := serveConfig{Host: "api.openai.com"}.HostFor
 
-	if err := admitAgainstPolicy(&doc, hostFor)(reg); err != nil {
+	if err := admitAgainstPolicy(&doc, hostFor, realtimePath)(reg); err != nil {
 		t.Fatalf("a whitelisted upstream was refused: %v", err)
 	}
 
 	// The same agent, judged on a host the deployment does not reach.
-	if err := admitAgainstPolicy(&doc, serveConfig{Host: "evil.example.com"}.HostFor)(reg); err == nil {
+	if err := admitAgainstPolicy(&doc, serveConfig{Host: "evil.example.com"}.HostFor, realtimePath)(reg); err == nil {
 		t.Fatal("an agent behind an unlisted upstream was admitted")
 	} else if !strings.Contains(err.Error(), "bee-9f3a") {
 		t.Fatalf("refusal does not name the agent: %v", err)
@@ -129,7 +129,7 @@ func TestAdmitAgainstPolicyLooksUpByHostAndPath(t *testing.T) {
 	// move the refusal into the TEE.
 	narrow := doc
 	narrow.Rules = []policy.Rule{doc.Rules[0], doc.Rules[3]}
-	err := admitAgainstPolicy(&narrow, hostFor)(reg)
+	err := admitAgainstPolicy(&narrow, hostFor, realtimePath)(reg)
 	if err == nil {
 		t.Fatal("a whitelist missing a route admitted an agent")
 	}
@@ -137,7 +137,7 @@ func TestAdmitAgainstPolicyLooksUpByHostAndPath(t *testing.T) {
 		t.Fatalf("refusal does not name the uncovered route: %v", err)
 	}
 
-	if err := admitAgainstPolicy(nil, hostFor)(reg); err == nil {
+	if err := admitAgainstPolicy(nil, hostFor, realtimePath)(reg); err == nil {
 		t.Fatal("an unloaded whitelist admitted an agent")
 	}
 }
@@ -166,10 +166,10 @@ func TestAdmitAgainstPolicyJudgesEachProviderOnItsOwnHost(t *testing.T) {
 		ProviderHosts: map[string]string{"anthropic-seller": "api.anthropic.com"},
 	}.HostFor
 
-	if err := admitAgainstPolicy(&doc, routes)(hub.AgentRegister{Provider: "openai-seller"}); err != nil {
+	if err := admitAgainstPolicy(&doc, routes, realtimePath)(hub.AgentRegister{Provider: "openai-seller"}); err != nil {
 		t.Fatalf("the default-host seller was refused: %v", err)
 	}
-	if err := admitAgainstPolicy(&doc, routes)(hub.AgentRegister{Provider: "anthropic-seller"}); err != nil {
+	if err := admitAgainstPolicy(&doc, routes, realtimePath)(hub.AgentRegister{Provider: "anthropic-seller"}); err != nil {
 		t.Fatalf("the overridden seller was refused on its own whitelisted host: %v", err)
 	}
 
@@ -177,7 +177,7 @@ func TestAdmitAgainstPolicyJudgesEachProviderOnItsOwnHost(t *testing.T) {
 		Host:          "api.openai.com",
 		ProviderHosts: map[string]string{"anthropic-seller": "evil.example.com"},
 	}.HostFor
-	if err := admitAgainstPolicy(&doc, evil)(hub.AgentRegister{Provider: "anthropic-seller"}); err == nil {
+	if err := admitAgainstPolicy(&doc, evil, realtimePath)(hub.AgentRegister{Provider: "anthropic-seller"}); err == nil {
 		t.Fatal("a seller overridden to an unlisted upstream was admitted")
 	}
 }

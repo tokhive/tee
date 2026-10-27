@@ -169,3 +169,17 @@ func (c *flightConn) Close() error {
 	c.once.Do(c.release)
 	return err
 }
+
+// Subprotocol forwards the provider's negotiated WebSocket subprotocol when the
+// wrapped tunnel reports one. Embedding the SessionConn interface does not carry
+// optional capabilities, so without this forwarding the admission wrapper would
+// erase the provider's handshake answer — and the relay, which reconciles that
+// answer against the user's, would see "none" and refuse every negotiated
+// session. A tunnel that answers nothing selected no subprotocol, which is the
+// only answer a non-WebSocket tunnel can give.
+func (c *flightConn) Subprotocol() string {
+	if handshake, ok := c.SessionConn.(SessionHandshake); ok {
+		return handshake.Subprotocol()
+	}
+	return ""
+}

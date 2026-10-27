@@ -93,8 +93,8 @@ Configuration is environment-driven. The ones that matter operationally:
 | `TEE_REQUEST_TIMEOUT` | Bound on one provider exchange. Must stay below the Hub's execution budget. |
 | `TEE_TIMING` / `TEE_METRICS_ADDR` | Stage timing: `off`, `summary` or `full`, and an optional plaintext `/timing` endpoint. |
 
-Routes: `POST /v1/execute` (a job), `POST /v1/session` (a long-lived stream),
-`GET /v1/credential-key` (the enclave's current envelope key).
+Routes: `POST /v1/execute` (a job), `GET /v1/session` (a WebSocket upgrade for a
+long-lived stream), `GET /v1/credential-key` (the enclave's current envelope key).
 
 ## Deploying to AWS
 

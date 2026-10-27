@@ -3,13 +3,16 @@ package transport
 import (
 	"bufio"
 	"context"
+	"crypto/sha1"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -359,45 +362,108 @@ func (m *ChannelManager) OpenSession(ctx context.Context, req tee.Request) (tee.
 	// A plain cancellation (no deadline) must still abort a handshake that is
 	// blocked on a silent peer. The poke is stopped once the session is
 	// established — from then on the session's own idle watchdog governs, not
-	// the request context that opened it. The clear runs after the stop so a
-	// poke that fired at the worst moment cannot leave a stale deadline on a
-	// healthy session.
-	stopOnCancel := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	// the request context that opened it. The clear runs only after the poke is
+	// known to have finished: if the callback already started, it may be about
+	// to set an expired deadline, and clearing first would let that poke land on
+	// a healthy session and kill its first read.
+	pokeDone := make(chan struct{})
+	stopOnCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(pokeDone)
+	})
 	defer func() {
-		stopOnCancel()
+		if !stopOnCancel() {
+			<-pokeDone
+		}
 		_ = conn.SetDeadline(time.Time{})
 	}()
 
 	br := bufio.NewReader(conn)
-	if err := m.upgrade(ctx, conn, br, req); err != nil {
+	subprotocol, err := m.upgrade(ctx, conn, br, req)
+	if err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
-	return &Session{conn: conn, br: br}, nil
+	return &Session{conn: conn, br: br, subprotocol: subprotocol}, nil
 }
 
-// upgrade writes the HTTP Upgrade request and verifies the provider answered
-// 101 Switching Protocols. On any other status the connection is refused.
-func (m *ChannelManager) upgrade(ctx context.Context, conn net.Conn, br *bufio.Reader, req tee.Request) error {
-	requestBytes, err := buildUpgradeBytes(req)
+// upgrade writes the HTTP Upgrade request and verifies the provider's 101
+// response as RFC 6455 requires: the status, the Upgrade token, the
+// Sec-WebSocket-Accept value computed from our key, and the absence of any
+// extension we did not offer. It returns the subprotocol the provider selected,
+// which the Hub needs to answer its own user-facing handshake honestly.
+//
+// The accept check is the one that matters for correctness rather than
+// ceremony: it is the provider's proof that it actually read our key. A proxy
+// that answers 101 without computing it would otherwise be accepted, and every
+// byte after it would be relayed into a socket that is not speaking WebSocket.
+func (m *ChannelManager) upgrade(ctx context.Context, conn net.Conn, br *bufio.Reader, req tee.Request) (string, error) {
+	key := newWebSocketKey()
+	requestBytes, err := buildUpgradeBytes(req, key)
 	if err != nil {
-		return err
+		return "", err
 	}
 	n, err := conn.Write(requestBytes)
 	if err != nil {
-		return fmt.Errorf("write upgrade request: %w", err)
+		return "", fmt.Errorf("write upgrade request: %w", err)
 	}
 	if n != len(requestBytes) {
-		return io.ErrShortWrite
+		return "", io.ErrShortWrite
 	}
 	resp, err := http.ReadResponse(br, &http.Request{Method: req.Method})
 	if err != nil {
-		return fmt.Errorf("read upgrade response: %w", err)
+		return "", fmt.Errorf("read upgrade response: %w", err)
 	}
+	return verifyUpgradeResponse(resp, key)
+}
+
+// verifyUpgradeResponse applies the server half of the RFC 6455 opening
+// handshake to a provider's response. 101 is necessary but not sufficient:
+// without the accept value the 101 proves only that something answered, not
+// that a WebSocket endpoint did.
+func verifyUpgradeResponse(resp *http.Response, key string) (string, error) {
 	if resp.StatusCode != http.StatusSwitchingProtocols {
-		return fmt.Errorf("provider refused upgrade: %s", resp.Status)
+		return "", fmt.Errorf("provider refused upgrade: %s", resp.Status)
 	}
-	return nil
+	if !headerHasToken(resp.Header, "Upgrade", "websocket") {
+		return "", errors.New("provider accepted the upgrade without Upgrade: websocket")
+	}
+	if got, want := strings.TrimSpace(resp.Header.Get("Sec-WebSocket-Accept")), acceptKey(key); got != want {
+		return "", fmt.Errorf("provider sent a wrong Sec-WebSocket-Accept: got %q, want %q", got, want)
+	}
+	// The TEE offers no extensions, so one echoed back means the provider has
+	// wrapped the byte stream (permessage-deflate, most likely) in a way neither
+	// the TEE nor the Hub can decode. Refuse rather than relay ciphertext as if
+	// it were frames.
+	if ext := strings.TrimSpace(resp.Header.Get("Sec-WebSocket-Extensions")); ext != "" {
+		return "", fmt.Errorf("provider negotiated an unsupported WebSocket extension %q", ext)
+	}
+	return strings.TrimSpace(resp.Header.Get("Sec-WebSocket-Protocol")), nil
+}
+
+// headerHasToken reports whether a comma-separated header carries token,
+// case-insensitively (RFC 7230 list syntax).
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, value := range h.Values(name) {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// websocketGUID is the fixed string RFC 6455 appends to the client key when
+// computing Sec-WebSocket-Accept.
+const websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+// acceptKey computes the Sec-WebSocket-Accept value for a client key. SHA-1 is
+// not chosen here for security: RFC 6455 mandates this exact construction, and
+// the value proves only that the peer read the key.
+func acceptKey(key string) string {
+	sum := sha1.Sum([]byte(key + websocketGUID))
+	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
 // isClosed reports whether the manager has been shut down. It is the fast

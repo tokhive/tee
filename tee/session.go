@@ -30,7 +30,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -50,8 +49,26 @@ import (
 // wedging the tunnel forever.
 const SessionIdleTimeout = 5 * time.Minute
 
-// SessionAck is the success reply to a SessionRequest.
-const SessionAck = `{"ok":true}`
+// sessionWriteTimeout bounds one downlink or control write to the Hub.
+//
+// The idle watchdog cannot help with a blocked write: it only closes the
+// provider tunnel, while the pump may be parked in conn.WriteMessage because the
+// Hub stopped reading. Without a deadline that goroutine — and the receipt the
+// session is worth — would never surface. The bound is generous compared with
+// the Hub's own write wait because a slow consumer is not a dead one; its
+// 32 KiB read side only stops while its user socket is being written.
+const sessionWriteTimeout = 30 * time.Second
+
+// SessionAck is the reply to a SessionRequest, success or refusal. On success
+// the subprotocol is what the provider selected during the Upgrade handshake;
+// the Hub needs it to answer its own user-facing handshake with the same value,
+// and an empty one means the provider selected none. Error is set only when the
+// session was refused.
+type SessionAck struct {
+	OK          bool   `json:"ok"`
+	Error       string `json:"error,omitempty"`
+	Subprotocol string `json:"subprotocol,omitempty"`
+}
 
 // SessionRequest is the payload of the first Hub→TEE frame of a session: a
 // JobSpec with Spec.Session set, bound to an empty body. The body-hash binding
@@ -110,22 +127,22 @@ func ServeSession(svc *Service, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if mt != websocket.BinaryMessage {
-		writeSessionReply(conn, `{"error":"first frame must be binary"}`)
+		writeSessionReply(conn, SessionAck{Error: "first frame must be binary"})
 		return
 	}
 	req, err := DecodeSessionRequest(first)
 	if err != nil {
-		writeSessionReply(conn, `{"error":"decode session request: `+jsonErr(err)+`"}`)
+		writeSessionReply(conn, SessionAck{Error: "decode session request: " + err.Error()})
 		return
 	}
 
 	ss, err := svc.OpenSession(r.Context(), Job{Spec: req.Spec, Body: req.Body})
 	if err != nil {
-		writeSessionReply(conn, `{"error":"`+jsonErr(err)+`"}`)
+		writeSessionReply(conn, SessionAck{Error: err.Error()})
 		return
 	}
 
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(SessionAck)); err != nil {
+	if err := writeSessionReply(conn, SessionAck{OK: true, Subprotocol: ss.Subprotocol()}); err != nil {
 		_ = ss.Close()
 		return
 	}
@@ -148,6 +165,20 @@ func ServeSession(svc *Service, w http.ResponseWriter, r *http.Request) {
 // of its own: the pump is still the only thing that signs and sends one, so it
 // keeps its single writer and the receipt still arrives as the terminal marker.
 func relaySession(conn *websocket.Conn, ss *Session) {
+	// cut ends the provider side, never the Hub socket: the pump is the only
+	// writer of the receipt, and closing the tunnel lets it sign and deliver one
+	// before the socket goes away. Closing conn here would abort that write and
+	// forfeit a session that was merely quiet or out of signing time.
+	//
+	// The truncation mark comes first, and not as a convenience: the close is
+	// what unblocks the pump, and a provider whose connection ends on a clean
+	// read would otherwise leave the receipt claiming a transcript that is
+	// missing everything after this instant.
+	cut := func() {
+		ss.markTruncated()
+		_ = ss.Close()
+	}
+
 	// An idle watchdog bounds the session so a peer that stops moving bytes
 	// cannot wedge it forever. It is reset by every successful relay in either
 	// direction — see note on SessionIdleTimeout: only silence kills a session,
@@ -166,7 +197,7 @@ func relaySession(conn *websocket.Conn, ss *Session) {
 			case <-ticker.C:
 				last := time.Unix(0, lastActivity.Load())
 				if time.Since(last) > SessionIdleTimeout {
-					_ = conn.Close()
+					cut()
 					return
 				}
 			}
@@ -187,25 +218,20 @@ func relaySession(conn *websocket.Conn, ss *Session) {
 		select {
 		case <-stop:
 		case <-cutoff:
-			// The mark comes first, and not as a convenience: the close below
-			// is what unblocks the pump, and a provider whose connection ends
-			// on a clean read would otherwise leave the receipt claiming a
-			// transcript that is missing everything after this instant.
-			ss.markTruncated()
-			_ = ss.Close()
+			cut()
 		}
 	}()
 
 	pumpDone := make(chan struct{})
 	go func() {
 		defer close(pumpDone)
-		_ = pumpDownlink(conn, ss, touch)
+		pumpDownlink(conn, ss, touch)
 		// Whatever the outcome, the session is over: sign and send the receipt
 		// as the terminal Text marker, then close so the main goroutine's
 		// pending ReadMessage unwedges.
 		_ = ss.Close()
 		if res, rerr := ss.Receipt(); rerr != nil {
-			_ = writeSessionReply(conn, `{"error":"sign session receipt: `+jsonErr(rerr)+`"}`)
+			_ = writeSessionReply(conn, SessionAck{Error: "sign session receipt: " + rerr.Error()})
 		} else {
 			_ = writeReceiptReply(conn, res.Receipt)
 		}
@@ -236,29 +262,28 @@ func relaySession(conn *websocket.Conn, ss *Session) {
 }
 
 // pumpDownlink moves provider tunnel bytes to the Hub as Binary messages until
-// the provider finishes. A clean EOF ends the relay with no error; any other
-// provider error is surfaced so the terminal message can say so. A Hub that
-// vanished mid-stream aborts the relay silently.
+// the provider finishes, cleanly or not: the receipt the pump signs afterwards
+// accounts for exactly what crossed, so the distinction does not change what
+// this goroutine does. A Hub that vanished mid-stream aborts the relay silently.
 //
 // touch is invoked after every successfully relayed frame so the session's
 // idle watchdog can tell "quiet but alive" from "abandoned".
-func pumpDownlink(conn *websocket.Conn, ss *Session, touch func()) error {
+func pumpDownlink(conn *websocket.Conn, ss *Session, touch func()) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := ss.Read(buf)
 		if n > 0 {
+			// A Hub that stops reading must not wedge this pump: the receipt is
+			// signed only after this returns, so a write with no deadline would
+			// forfeit the session (see sessionWriteTimeout).
+			_ = conn.SetWriteDeadline(time.Now().Add(sessionWriteTimeout))
 			if werr := conn.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil {
-				return nil
+				return
 			}
-			if touch != nil {
-				touch()
-			}
+			touch()
 		}
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
+			return
 		}
 	}
 }
@@ -275,34 +300,23 @@ func writeReceiptReply(conn *websocket.Conn, signed proof.SignedReceipt) error {
 	if err != nil {
 		return err
 	}
+	_ = conn.SetWriteDeadline(time.Now().Add(sessionWriteTimeout))
 	return conn.WriteMessage(websocket.TextMessage, reply)
 }
 
-// writeSessionReply sends one Text control message.
-func writeSessionReply(conn *websocket.Conn, payload string) error {
-	return conn.WriteMessage(websocket.TextMessage, []byte(payload))
+// writeSessionReply sends one Text control message. The write is deadline-bound
+// so a Hub that has stopped reading cannot park the control path (see
+// sessionWriteTimeout); it also refreshes the deadline after a failed downlink
+// write, whose expired deadline would otherwise fail this write immediately.
+func writeSessionReply(conn *websocket.Conn, ack SessionAck) error {
+	raw, _ := json.Marshal(ack)
+	_ = conn.SetWriteDeadline(time.Now().Add(sessionWriteTimeout))
+	return conn.WriteMessage(websocket.TextMessage, raw)
 }
 
 func writeSessionClose(conn *websocket.Conn, code int, reason string) {
 	_ = conn.WriteControl(websocket.CloseMessage,
 		websocket.FormatCloseMessage(code, reason), time.Now().Add(time.Second))
-}
-
-// jsonErr keeps an untrusted or reasoned string safe for embedding in a JSON
-// control message.
-func jsonErr(err error) string {
-	if err == nil {
-		return ""
-	}
-	b, e := json.Marshal(err.Error())
-	if e != nil {
-		return "error"
-	}
-	s := string(b)
-	if len(s) >= 2 {
-		return s[1 : len(s)-1]
-	}
-	return s
 }
 
 // DecodeSessionReceipt parses the final Text message of a session into its
