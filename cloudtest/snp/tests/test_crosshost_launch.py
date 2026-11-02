@@ -13,6 +13,7 @@ asked for one, not a profile whose name happens to be empty.
 """
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -66,6 +67,31 @@ class ConfidentialLaunchProfileTest(unittest.TestCase):
         name = crosshost.TEE_PROFILE_ENV
         self.assertEqual(name, "TOKENHIVE_TEE_INSTANCE_PROFILE")
         self.assertIn(name, (CLOUDTEST / ".env.example").read_text())
+
+
+class LocalKeyTest(unittest.TestCase):
+    """A missing private key is refused, never generated.
+
+    Generating one is how this repo lost the only private half of its AWS key
+    pair (2026-10-28): the fresh file could not match the pair imported back in
+    September, and ensure_key() skips the import whenever the pair exists — so
+    the replacement went unnoticed until old machines rejected it. The property
+    worth pinning is therefore negative: no file appears.
+    """
+
+    def test_a_missing_key_is_refused_and_nothing_is_created(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = Path(d) / "ssh-key.pem"
+            original = crosshost.KEY_FILE
+            crosshost.KEY_FILE = missing
+            try:
+                with self.assertRaises(SystemExit) as refused:
+                    crosshost.ensure_local_key("tokenhive-tee-chenxinghao")
+            finally:
+                crosshost.KEY_FILE = original
+            self.assertIn("refusing to generate", str(refused.exception))
+            self.assertIn("tokenhive-tee-chenxinghao", str(refused.exception))
+            self.assertFalse(missing.exists(), "a key was generated after all")
 
 
 if __name__ == "__main__":

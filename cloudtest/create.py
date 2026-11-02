@@ -12,7 +12,6 @@ safety valve here is that this script never deletes anything.
 """
 
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -42,11 +41,25 @@ def boto3_client(cfg):
     return boto3.client("ec2", region_name=cfg.region)
 
 
-def ensure_local_key() -> None:
+def ensure_local_key(key_name: str) -> None:
+    """Refuse to mint a key: AWS has one key pair and this file must be its half.
+
+    Same rule as cloudtest/snp/crosshost.py, and for the same reason: a key
+    generated here can only ever be one AWS does not know, while ensure_key()
+    skips the import whenever the pair already exists — so the fresh file
+    replaces the deployment's only login key and only the machines launched
+    afterwards accept it.
+    """
     if KEY_FILE.exists():
         return
-    subprocess.run(
-        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(KEY_FILE)], check=True
+    sys.exit(
+        f"no SSH private key at {KEY_FILE}; refusing to generate one.\n"
+        f"It has to be the private half of the AWS key pair '{key_name}' — a "
+        f"freshly generated key would not match it, and instances launched "
+        f"with that pair would reject it.\n"
+        f"Restore that key and rerun. Only a deployment whose key pair does "
+        f"not exist yet may create one here (ssh-keygen -t ed25519 -N '' -f "
+        f"{KEY_FILE}), because then it is the key AWS imports."
     )
 
 
@@ -54,7 +67,7 @@ def main() -> None:
     cfg = load()
     if not cfg.user:
         sys.exit("TOKENHIVE_USER is empty; refusing to launch untagged instances")
-    ensure_local_key()
+    ensure_local_key(cfg.key_name)
     ec2 = boto3_client(cfg)
 
     print(f"==> ensuring infrastructure in {cfg.region} (user tag: {cfg.user})")

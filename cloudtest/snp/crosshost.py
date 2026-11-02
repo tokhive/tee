@@ -68,7 +68,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -190,10 +189,33 @@ def save_state(state: dict) -> None:
     HOSTS_FILE.write_text(json.dumps(state, indent=2) + "\n")
 
 
-def ensure_local_key() -> None:
+def ensure_local_key(key_name: str) -> None:
+    """Refuse to mint a key: AWS has one key pair and this file must be its half.
+
+    This used to ssh-keygen a fresh ed25519 whenever the file was missing, and
+    that is how this repo lost its only login key (2026-10-28): the new file
+    replaced the private half of the pair AWS imported in September, while
+    ensure_key() saw the pair already registered and skipped the import — so
+    old machines rejected the key and only new ones accepted it.
+
+    A generated key can only ever be one AWS does not know, so a missing file
+    is a fact to report. `key_name` is passed in rather than re-read so the
+    refusal names the pair to restore; checking a candidate against it means
+    AWS' fingerprint (MD5 of the DER public key, not `ssh-keygen -l`'s SHA256)
+    via `ssh-keygen -e -m PKCS8 -f ssh-key.pem.pub | openssl pkey -pubin
+    -outform DER | openssl md5 -c`, which cannot export ed25519 anyway.
+    """
     if KEY_FILE.exists():
         return
-    subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(KEY_FILE)], check=True)
+    sys.exit(
+        f"no SSH private key at {KEY_FILE}; refusing to generate one.\n"
+        f"It has to be the private half of the AWS key pair '{key_name}' — a "
+        f"freshly generated key would not match it, and instances launched "
+        f"with that pair would reject it.\n"
+        f"Restore that key and rerun. Only a deployment whose key pair does "
+        f"not exist yet may create one here (ssh-keygen -t ed25519 -N '' -f "
+        f"{KEY_FILE}), because then it is the key AWS imports."
+    )
 
 
 def open_cross_ports(ec2, cfg, sg_id: str) -> None:
@@ -310,7 +332,7 @@ def main() -> None:
     cfg = load()
     if not cfg.user:
         sys.exit("TOKENHIVE_USER is empty; refusing to launch untagged instances")
-    ensure_local_key()
+    ensure_local_key(cfg.key_name)
     ec2 = boto3("ec2")
 
     print(f"==> ensuring infrastructure in {cfg.region} (user tag: {cfg.user})")
