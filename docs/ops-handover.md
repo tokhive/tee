@@ -23,10 +23,26 @@
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y openssl efitools docker.io qemu-utils python3-pip
-pip install uefivars          # PyPI 包名就是 uefivars
+sudo apt-get install -y openssl efitools docker.io qemu-utils python3-venv
 # 另需：AWS CLI v2、Go 1.27.3+、GNU tar
+
+# uefivars 装进独立 venv，再软链到 /usr/local/bin。
+# Ubuntu 24.04 的系统 Python 受 PEP 668 保护，直接 pip install 会被
+# externally-managed-environment 拒绝；装到用户目录又常常因为
+# ~/.local/bin 不在 PATH 而找不到命令。
+sudo python3 -m venv /opt/uefivars
+sudo /opt/uefivars/bin/pip install -q uefivars
+sudo ln -sf /opt/uefivars/bin/uefivars /usr/local/bin/uefivars
+uefivars --help >/dev/null && echo "uefivars ok"
 ```
+
+如果已经跑过 `pip install uefivars` 但 `command -v uefivars` 为空，先定位它装到哪：
+
+```bash
+python3 -m pip show -f uefivars | grep -E 'Location|bin/'
+```
+
+脚本在 `~/.local/bin` 时把该目录加进 PATH（`export PATH="$HOME/.local/bin:$PATH"`）即可；若报 `externally-managed-environment`，说明被 PEP 668 拦下，按上面的 venv 方式重装，不要用 `--break-system-packages` 绕过。
 
 确认 Docker 可用（构建要在容器里做 UKI 组装）：
 
@@ -117,16 +133,18 @@ openssl pkey -pubin -in ../../shared/secure_boot_release_pub.pem -outform DER | 
 ```bash
 # 有旧 store 就以它为容器；没有就用发行版的 OVMF_VARS.fd（路径随包而异）
 if [ -f aws-uefi-data.b64 ]; then
-  base64 -d aws-uefi-data.b64 > base.aws
-  uefivars -i aws -o edk2 -I base.aws -O vars.fd
+  uefivars -i aws -o edk2 -I aws-uefi-data.b64 -O vars.fd
 else
   cp /usr/share/OVMF/OVMF_VARS.fd vars.fd
 fi
 
+# -i aws / -o aws 内部自己处理 base64：输入输出都是 .b64 文本。
+# 不要再 base64 -d，也不要再 base64 -w0，否则会二次编解码。
 uefivars -i edk2 -o aws -I vars.fd \
-  --PK PK.esl --KEK KEK.esl --db R.esl -O new.aws
-base64 -w0 new.aws > aws-uefi-data.b64
+  --PK PK.esl --KEK KEK.esl --db R.esl -O aws-uefi-data.b64
 ```
+
+命令应打印 `Replacing PK` / `Replacing KEK` / `Replacing db`。想再确认，跑 `uefivars -i aws -o json -I aws-uefi-data.b64`，输出里应只有 PK、KEK、db 三条变量。
 
 `--PK/--KEK/--db` 会覆盖这三个变量。从零部署三份都用新 ESL；只轮换 R 时，PK/KEK 用原值。
 

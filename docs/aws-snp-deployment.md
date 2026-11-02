@@ -71,20 +71,28 @@ openssl pkey -pubin -in ../../shared/secure_boot_release_pub.pem -outform DER | 
 第五步，重建 AWS 的 UEFI 变量存储 `aws-uefi-data.b64`。AWS EC2 的 `register-image --uefi-data` 参数接受一段 base64 编码的 NVRAM（非易失随机存取存储器）变量二进制，内含 PK、KEK、db 三组变量；db 中放入的就是上一步的 R.esl。用 `uefivars` 工具（PyPI 包名就是 `uefivars`）把三个 ESL 按 UEFI 规范的 NVRAM 布局序列化，再 base64 编码写入该文件。`--PK/--KEK/--db` 会覆盖这三个变量：从零部署时三份都用新生成的 ESL；只轮换 R 时，PK/KEK 用原值即可。
 
 ```bash
-pip install uefivars
+# 安装一次即可。Ubuntu 24.04 的系统 Python 受 PEP 668 保护，
+# 直接 pip install 会被 externally-managed-environment 拒绝；
+# 装到用户目录又可能因为 ~/.local/bin 不在 PATH 而找不到命令。
+sudo python3 -m venv /opt/uefivars
+sudo /opt/uefivars/bin/pip install -q uefivars
+sudo ln -sf /opt/uefivars/bin/uefivars /usr/local/bin/uefivars
+
 # 有旧 store 就以它为容器（它已带 SecureBootEnable 等非密钥变量）；
 # 没有就用发行版的 OVMF_VARS.fd，路径随包而异
 if [ -f aws-uefi-data.b64 ]; then
-  base64 -d aws-uefi-data.b64 > base.aws
-  uefivars -i aws -o edk2 -I base.aws -O vars.fd
+  uefivars -i aws -o edk2 -I aws-uefi-data.b64 -O vars.fd
 else
   cp /usr/share/OVMF/OVMF_VARS.fd vars.fd
 fi
 
+# -i aws / -o aws 内部处理 base64：输入输出都是 .b64 文本，
+# 不要再 base64 -d / base64 -w0
 uefivars -i edk2 -o aws -I vars.fd \
-  --PK PK.esl --KEK KEK.esl --db R.esl -O new.aws
-base64 -w0 new.aws > aws-uefi-data.b64
+  --PK PK.esl --KEK KEK.esl --db R.esl -O aws-uefi-data.b64
 ```
+
+命令应打印 `Replacing PK` / `Replacing KEK` / `Replacing db`。
 
 `R.key` 是发布签名私钥；`PK.key` 与 `KEK.key` 同样不能进入版本库。三把私钥只应存在于构建机与离线密钥库。仓库的 `.gitignore` 已用 `deploy/secure-boot/*.key` 模式排除所有 `.key`；其余 R.crt.pem、R.crt.der、R.pub.pem、R.esl、aws-uefi-data.b64 均为公钥/证书材料，是分发物，与 PK、KEK 的公开材料一样纳入版本管理，保证任何克隆仓库的人都能复现构建与验证。
 
