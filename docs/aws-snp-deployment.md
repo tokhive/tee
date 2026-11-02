@@ -35,7 +35,7 @@ TokenHive 的真实 TEE 测试在云上复现了一条完整的信任链：从�
 
 Secure Boot 的信任体系是三级嵌套：PK（平台密钥）位于最顶层，只有持有 PK 私钥才能修改 KEK（密钥交换密钥）；KEK 授权对 db（签名数据库）的更新；db 中列出的证书是"被信任的签名者"，固件只启动由这些签名者签名的可执行文件。TokenHive 的信任根 R 就是这个体系中的签名者：R 的证书被放进 db，镜像的 UKI 由 R 的私钥签名，于是只要固件在 Secure Boot 模式下启动，未经 R 签名的代码就不可能被执行。
 
-本仓库的 `deploy/secure-boot/` 目录下，PK 与 KEK 的密钥对（含证书、ESL、公钥）是仓库既有资产；R 是本模块的发布信任根，当私钥丢失或需要轮换时按以下步骤重建。所有命令在 `deploy/secure-boot/` 目录内执行。
+本仓库的 `deploy/secure-boot/` 目录下，PK 与 KEK 只有公开材料（`.crt.der`/`.crt.pem`、`.esl`、`.pub.pem`），**私钥不在仓库里**：它们只在生成 `aws-uefi-data.b64` 和将来修改 db 时需要，必须离线保存。R 是本模块的发布信任根，下面给出它的完整生成步骤；从零部署时 PK/KEK 也要一起生成，把命令里的 `R` 换成 `PK`/`KEK` 即可。所有命令在 `deploy/secure-boot/` 目录内执行。
 
 第一步，生成 R 的 RSA-3072 私钥。SEV-SNP 实例（AMD EPYC 7003 系列）的固件要求 db 签名者使用 RSA 2048 或 3072 位密钥，3072 是当前强度下的稳妥选择：
 
@@ -59,21 +59,34 @@ openssl pkey -in R.key -pubout -out R.pub.pem
 cert-to-efi-sig-list -g "$(cat GUID.txt)" R.crt.pem R.esl
 ```
 
-第四步，同步发布公钥。`shared/secure_boot_release_pub.pem` 是验证方持有的 R 公钥，构建脚本会强制校验它与 `deploy/secure-boot/R.pub.pem` 完全一致（`cmp -s`），两者不一致构建直接失败，这是防止"签名密钥与验证密钥分叉"的护栏：
+第四步，同步发布公钥。`shared/secure_boot_release_pub.pem` 是验证方持有的 R 公钥，编译期经 `//go:embed` 嵌进 Hub 二进制（`shared/secure_boot.go`），Hub 用它在固件事件日志里核对 "R-only" 的 Secure Boot 策略。**构建脚本不会替你校验两者一致**：`snp-build.sh` 只检查 `deploy/secure-boot/R.pub.pem` 是否存在，不会和嵌入副本比对。所以这一步必须手工核对，否则构建照样成功，Hub 会在运行期以 `event log does not prove an R-only post-separator Secure Boot policy` 拒绝 TEE：
 
 ```bash
 cp R.pub.pem ../../shared/secure_boot_release_pub.pem
+# 两行 sha256 必须相同
+openssl pkey -pubin -in R.pub.pem -outform DER | openssl dgst -sha256
+openssl pkey -pubin -in ../../shared/secure_boot_release_pub.pem -outform DER | openssl dgst -sha256
 ```
 
-第五步，重建 AWS 的 UEFI 变量存储 `aws-uefi-data.b64`。AWS EC2 的 `register-image --uefi-data` 参数接受一段 base64 编码的 NVRAM（非易失随机存取存储器）变量二进制，内含 PK、KEK、db 三组变量；db 中放入的就是上一步的 R.esl。用 python-uefivars 工具（pip 安装）把三个 ESL 按 UEFI 规范的 NVRAM 布局序列化，再 base64 编码写入该文件。注意这一步替换的是整个变量存储，PK 与 KEK 的内容保持不变，只更新 db 中的 R 证书：
+第五步，重建 AWS 的 UEFI 变量存储 `aws-uefi-data.b64`。AWS EC2 的 `register-image --uefi-data` 参数接受一段 base64 编码的 NVRAM（非易失随机存取存储器）变量二进制，内含 PK、KEK、db 三组变量；db 中放入的就是上一步的 R.esl。用 `uefivars` 工具（PyPI 包名就是 `uefivars`）把三个 ESL 按 UEFI 规范的 NVRAM 布局序列化，再 base64 编码写入该文件。`--PK/--KEK/--db` 会覆盖这三个变量：从零部署时三份都用新生成的 ESL；只轮换 R 时，PK/KEK 用原值即可。
 
 ```bash
-pip install python-uefivars
-# 用 uefivars 把 PK.esl、KEK.esl、R.esl 组装为 NVRAM 变量存储（db ← R.esl）
-# 输出二进制经 base64 编码后写入 aws-uefi-data.b64
+pip install uefivars
+# 有旧 store 就以它为容器（它已带 SecureBootEnable 等非密钥变量）；
+# 没有就用发行版的 OVMF_VARS.fd，路径随包而异
+if [ -f aws-uefi-data.b64 ]; then
+  base64 -d aws-uefi-data.b64 > base.aws
+  uefivars -i aws -o edk2 -I base.aws -O vars.fd
+else
+  cp /usr/share/OVMF/OVMF_VARS.fd vars.fd
+fi
+
+uefivars -i edk2 -o aws -I vars.fd \
+  --PK PK.esl --KEK KEK.esl --db R.esl -O new.aws
+base64 -w0 new.aws > aws-uefi-data.b64
 ```
 
-R.key 是唯一的秘密：它必须只存在于本机与构建机，绝不能进入版本库。仓库的 .gitignore 已用 `deploy/secure-boot/*.key` 模式将其排除；其余 R.crt.pem、R.crt.der、R.pub.pem、R.esl、aws-uefi-data.b64 均为公钥/证书材料，是分发物，与 PK、KEK 一样纳入版本管理，保证任何克隆仓库的人都能复现构建与验证。
+`R.key` 是发布签名私钥；`PK.key` 与 `KEK.key` 同样不能进入版本库。三把私钥只应存在于构建机与离线密钥库。仓库的 `.gitignore` 已用 `deploy/secure-boot/*.key` 模式排除所有 `.key`；其余 R.crt.pem、R.crt.der、R.pub.pem、R.esl、aws-uefi-data.b64 均为公钥/证书材料，是分发物，与 PK、KEK 的公开材料一样纳入版本管理，保证任何克隆仓库的人都能复现构建与验证。
 
 ---
 
@@ -81,7 +94,7 @@ R.key 是唯一的秘密：它必须只存在于本机与构建机，绝不能�
 
 ### 3.1 区域与实例约束
 
-AWS 的 SEV-SNP 支持区域目前只有两个：eu-west-1（爱尔兰）与 us-east-2（俄亥俄）。其他区域即使启动成功也只是普通实例，没有硬件机密内存，因此区域是硬约束，配置在 `deploy/.env` 的 `AWS_SNP_REGION` 与 `cloudtest/.env` 的 `TOKENHIVE_REGION`，两者必须一致。实例类型限定 AMD EPYC 7003 系列的 m6a、c6a、r6a 家族，默认 c6a.large。
+`cloudtest` 把区域固定在 eu-west-1（`cloudtest/config.py` 的 `DEFAULT_REGION`），`TOKENHIVE_REGION` 可以覆盖它。区域是硬约束：目标区域的实例族必须支持 `AmdSevSnp`，否则实例即使启动成功也只是普通实例，没有硬件机密内存。区域配置在 `deploy/.env` 的 `AWS_SNP_REGION` 与 `cloudtest/.env` 的 `TOKENHIVE_REGION`，两者必须一致。实例类型限定 AMD EPYC 7003 系列的 m6a、c6a、r6a 家族。本文与当前部署一律使用 `c6a.large`；`cloudtest/config.py` 的代码默认值是 `m6a.large`，因此必须在 `cloudtest/.env` 显式写 `TOKENHIVE_INSTANCE_TYPE=c6a.large`，不能依赖默认值。
 
 ### 3.2 执行身份的最小策略
 
@@ -283,9 +296,9 @@ aws iam put-role-policy --role-name vmimport --policy-name vmimport \
 
 两处配置文件都需要操作者填写，且都被 .gitignore 排除，不会进入版本库；仓库各自保留了模板（`deploy/.env.example` 与 cloudtest 目录内说明）。
 
-`deploy/.env` 是构建侧配置。本模块必填项为 `AWS_SNP_REGION`，限定为 eu-west-1；`GCP_PROJECT` 在 AWS 路径只是占位（构建脚本会强制其非空但实际不用于 AWS）。另一个关键项是 APT 镜像源选择 `SNP_APT_MIRROR`：默认值 `snapshot` 会把 Ubuntu 软件源固定到 snapshot.ubuntu.com 的不可变快照（确定性基础镜像，可复现），当该站点经本地代理访问不稳定（实测大量 502）时，可切换为 `aliyun` 走阿里云实时镜像把构建跑通。这个切换只影响诊断用基础镜像的摘要，信任根 R 与应用 bundle 摘要完全不受影响；生产可复现构建应切回 `snapshot`。
+`deploy/.env` 是构建侧配置。本模块必填项为 `AWS_SNP_REGION`，示例值与 `cloudtest` 的默认值都是 eu-west-1，且必须与 `cloudtest/.env` 的 `TOKENHIVE_REGION` 一致；`GCP_PROJECT` 在 AWS 路径只是占位（构建脚本会强制其非空但实际不用于 AWS）。另一个关键项是 APT 镜像源选择 `SNP_APT_MIRROR`：默认值 `snapshot` 会把 Ubuntu 软件源固定到 snapshot.ubuntu.com 的不可变快照（确定性基础镜像，可复现），当该站点经本地代理访问不稳定（实测大量 502）时，可切换为 `aliyun` 走阿里云实时镜像把构建跑通。这个切换只影响诊断用基础镜像的摘要，信任根 R 与应用 bundle 摘要完全不受影响；生产可复现构建应切回 `snapshot`。
 
-`cloudtest/.env` 是测试侧配置。`TOKENHIVE_USER` 是唯一必填项，它既是实例 Name 前缀的一部分，更是删除安全边界的另一半（`user` tag 的取值），绝不能留空或误填；`TOKENHIVE_REGION` 默认 eu-west-1；`TOKENHIVE_INSTANCE_TYPE` 默认 m6a.large，实测使用 c6a.large。
+`cloudtest/.env` 是测试侧配置。`TOKENHIVE_USER` 是唯一必填项，它既是实例 Name 前缀的一部分，更是删除安全边界的另一半（`user` tag 的取值），绝不能留空或误填；`TOKENHIVE_REGION` 默认 eu-west-1；`TOKENHIVE_INSTANCE_TYPE` 的代码默认值是 m6a.large，但本部署统一使用 c6a.large，必须显式写入 `cloudtest/.env`，不要依赖默认值。
 
 `deploy/snp-image/pins.env` 锁定了构建链上每个工具的精确版本：内核包、systemd 的 stub 与 ukify、zstd、cpio、binutils、sbsigntool、efitools，以及基础镜像摘要与 Go 工具链版本。这些锁定保证同一份源码在任何机器上重建出字节一致的镜像。
 
@@ -449,7 +462,7 @@ mockprovider 也改用固定身份：`-ca/-cert/-key` 三个 flag 让它加载�
 
 **上传 VMDK 报 NoSuchBucket**：几乎总是 `s3:CreateBucket` 权限缺失，而不是桶不存在。按第 3.4 节补权限，脚本现在也会直接把真实错误打出来。
 
-**启动报不支持 SEV-SNP**：区域不对。SEV-SNP 只有 eu-west-1 与 us-east-2；实例类型必须是 m6a/c6a/r6a 家族。
+**启动报不支持 SEV-SNP**：区域或实例类型不对。`TOKENHIVE_REGION` 必须是目标实例族支持 `AmdSevSnp` 的区域（本部署用 eu-west-1）；实例类型必须是 m6a/c6a/r6a 家族（本部署用 c6a.large）。
 
 **本地 aws CLI 崩溃（Python encodings 错误）**：`PYTHONHOME`/`PYTHONPATH` 被外部工具污染。执行前 `env -u PYTHONHOME -u PYTHONPATH` 清空。
 

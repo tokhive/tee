@@ -106,7 +106,7 @@ go test ./hive/internal/teeclient/                   # 应全绿
 
 补丁是针对 Hub 当前 HEAD（`cc1dcbb`）下的 `client.go`/`client_test.go` 生成的。
 
-重启（现状是 tmux 会话 `tokhive` 里的裸进程，没有 systemd 单元）：
+重启（以下是 2026-10 的历史记录；当前部署已改为 systemd 单元 `tokhive-hive`，具体以 Hub 仓库为准）：
 
 ```bash
 tmux capture-pane -t tokhive:0.0 -p | tail -5        # 找到 PID
