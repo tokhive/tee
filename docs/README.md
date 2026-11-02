@@ -12,6 +12,7 @@ the filenames and this index are in English so links and searches stay usable.
 | [`tokenhive-relay-protocol.md`](tokenhive-relay-protocol.md) | The TEE-to-Hub relay WebSocket, written for someone implementing the Hub side. |
 | [`hub-to-new-tee.md`](hub-to-new-tee.md) | The one Hub-side change a receipt that spans a certificate rotation requires. |
 | [`aws-snp-deployment.md`](aws-snp-deployment.md) | The operations manual: provisioning, image build, launch, verification, teardown, and the traps found while doing it for real. |
+| [`ops-handover.md`](ops-handover.md) | The from-zero handover runbook: Secure Boot key hierarchy, mTLS fixtures, whitelist, image build, launch, verification, teardown, and the material operations must custody. |
 | [`tee-timing.md`](tee-timing.md) | Stage instrumentation: what is measured, where the records live, and how to pull them without disturbing the enclave. |
 | [`tee-failure-classes.md`](tee-failure-classes.md) | The unsigned failure frame. Eight classes, the stage that names them, and what the Hub is allowed to conclude from each. |
 | [`cert-lifetime-audit.md`](cert-lifetime-audit.md) | Certificate lifetime audit. Three independent deadlines, the platform's reissue window, and the receipt rules that follow from them. |

@@ -108,14 +108,20 @@ cp cloudtest/.env.example cloudtest/.env # TOKENHIVE_USER: the tag prefix on eve
 
 cd cloudtest/snp
 ./crosshost.sh build                    # bundle + AMI, about 13 minutes
-./crosshost.sh up --tee-only --host-ip <hub-ip>
-./crosshost.sh deploy
+./crosshost.sh up                       # ordinary host + confidential tee
+./crosshost.sh deploy                   # hub/agent/mockprovider onto that host
 ./crosshost.sh verify
-./crosshost.sh down
+./crosshost.sh down                     # terminates both instances it launched
 ```
+
+If the Hub already runs on its own machine, launch only the confidential TEE with
+`./crosshost.sh up --tee-only --host-ip <hub-private-ip>`; `deploy` does not apply
+in that topology because there is no cloudtest host to copy anything onto.
 
 The full operations manual, including what each step creates and the traps found
 while doing it for real, is [`docs/aws-snp-deployment.md`](docs/aws-snp-deployment.md);
+[`docs/ops-handover.md`](docs/ops-handover.md) is the from-zero handover runbook
+(key hierarchy, mTLS fixtures, build, launch, teardown);
 [`cloudtest/snp/README.md`](cloudtest/snp/README.md) documents the cross-host tool itself.
 
 The build prints two values worth recording: the app digest (`snp-app:<sha256>`),
@@ -145,6 +151,6 @@ Pin a commit, not a version range. `hive` and `bee` keep the pinned commit in a
 ## Documentation
 
 `docs/README.md` indexes the design notes, the external interface contract, the
-AWS deployment manual, and the incident audits. Paths in every note are written as
+AWS deployment manual, the from-zero operations handover, and the incident audits. Paths in every note are written as
 they are in this repository; commit hashes in the audit notes predate the move and
 do not resolve here.

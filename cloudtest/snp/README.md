@@ -1,10 +1,12 @@
 # Real SEV-SNP TEE test on AWS (`cloudtest/snp/`)
 
-> **Fork limitation**: `build` requires `deploy/secure-boot/` populated with
-> the original repo's keys (`R.key` etc.), which a fork cannot obtain. In a
-> fork, skip this module and run the main `cloudtest/run.sh` flow with
-> `TOKENHIVE_TEE_PLATFORM=simulated` (the default) — the full business flow on
-> a real SNP instance, without real attestation.
+> **Key material**: `build` requires a complete Secure Boot set in
+> `deploy/secure-boot/` (`PK`, `KEK`, `R` plus `aws-uefi-data.b64`). The
+> repository ships only the public halves; `R.key` is gitignored. A fork can
+> generate its own set once and use it, but must rebuild the Hub with the
+> matching release public key (`shared/secure_boot_release_pub.pem`) or the Hub
+> will reject the attestation. The from-zero procedure is
+> [`docs/ops-handover.md`](../../docs/ops-handover.md).
 
 This module turns the existing `simulated` cloudtest into a **real** TEE run:
 it builds a two-tier SNP loader AMI whose measured app is a TokenHive
@@ -52,7 +54,8 @@ keys. `up`/`verify`/`down` only need boto3 + the EC2 permissions below.
 - `deploy/secure-boot/` populated (`PK`,`KEK`,`R` artifacts + `aws-uefi-data.b64`).
 - `cloudtest/.env` with `TOKENHIVE_USER` (+ optional `TOKENHIVE_REGION`,
   `TOKENHIVE_INSTANCE_TYPE`). SEV-SNP instance types are AMD-only
-  (`m6a`/`c6a`/`r6a` default `m6a.large`).
+  (`m6a`/`c6a`/`r6a`; the code default is `m6a.large`, this deployment sets
+  `c6a.large` explicitly).
 
 ## IAM permissions
 
