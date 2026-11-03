@@ -48,6 +48,14 @@ def _shell_function(name):
     return m.group(0)
 
 
+def _shell_assignment(name):
+    """The literal `NAME=value` line, for the same reason as _shell_function."""
+    m = re.search(rf"^{re.escape(name)}=.*$", SRC, re.M)
+    if not m:
+        raise AssertionError(f"no {name}= in {CROSSHOST}")
+    return m.group(0)
+
+
 class WhitelistLocationTest(unittest.TestCase):
     """Where deploy puts the whitelist and where it tells the Hub to read it."""
 
@@ -406,6 +414,8 @@ with open(path, 'w') as catalog:
         out = self._run("--environment", "production", "--no-commit")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("--application-id snp-app:" + self.digest, self._calls()[1])
+        self.assertIn("(inherited from staging)", out.stdout,
+                      "a digest the operator did not type must say where it came from")
 
     def test_staging_reads_state_rather_than_inheriting_itself(self):
         # Staging is the environment this machine launches. Inheriting its own
@@ -427,6 +437,16 @@ with open(path, 'w') as catalog:
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("no active release", out.stdout + out.stderr)
         self.assertFalse(self.calls.exists(), "nothing may be written with no identity")
+
+    def test_an_empty_flag_value_is_not_an_absent_flag(self):
+        # `--from "$ENV"` with ENV unset expands to nothing. Treating that as
+        # "no --from given" would make production fall back to its staging
+        # default and record a build the operator never named.
+        out = self._run("--environment", "production", "--from", "",
+                        "--application-id", "snp-app:" + self.digest)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("--from needs a value", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists())
 
     def test_identity_sources_are_mutually_exclusive(self):
         out = self._run("--environment", "staging", "--from", "production",
@@ -490,6 +510,7 @@ with open(path, 'w') as catalog:
             'log() { echo "$*"; }',
             'py() { "$PY" "$@"; }',
             _shell_function("archived_bundle"),
+            _shell_function("require_record_environment"),
             _shell_function("cmd_record"),
             # Mirrors crosshost.sh's tee_field, which the extractor cannot lift
             # because it is written on one line.
@@ -499,7 +520,7 @@ with open(path, 'w') as catalog:
             f"BUNDLES_DIR={shlex.quote(str(self.bundles))}",
             f"REPO_ROOT={shlex.quote(str(self.repo))}",
             f"DEPLOY_DIR={shlex.quote(str(self.deploy))}",
-            'RECORD_ENVIRONMENTS="staging production"',
+            _shell_assignment("RECORD_ENVIRONMENTS"),
             "cmd_record " + " ".join(shlex.quote(arg) for arg in args),
         ])
         return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=self._git_env())

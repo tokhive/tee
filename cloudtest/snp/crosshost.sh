@@ -87,6 +87,15 @@ BUNDLES_DIR="${CLOUDTEST}/bin/bundles"
 # otherwise each collect their own history while the page for the environment
 # that is actually deployed keeps showing nothing.
 RECORD_ENVIRONMENTS="staging production"
+# require_record_environment <name> <flag>: both record flags draw from that one
+# list, so a name outside it is rejected before anything is looked up.
+require_record_environment() {
+  case " ${RECORD_ENVIRONMENTS} " in
+    *" $1 "*) return 0 ;;
+  esac
+  log "record: $2 must be one of: ${RECORD_ENVIRONMENTS}"
+  exit 1
+}
 # The layout `deploy` creates on the ordinary host: ./tee (binaries + logs),
 # ./mtls (certs) and ./policy (the whitelist). This is the only place the
 # whitelist's remote location is written down — the upload and the Hub's
@@ -465,11 +474,15 @@ EOF
 # releases/catalog.json. Pushing stays manual: which branch a deploy host sits
 # on is not this script's decision.
 cmd_record() {
-  local env="" app_hash="" from_env="" release_url="" dry_run=0 commit=1
+  # `exported` is declared here so the assignment below stays a plain one: a
+  # failing py would otherwise be swallowed by the `local` builtin's status.
+  local env="" app_hash="" from_env="" release_url="" dry_run=0 commit=1 exported
   while [ $# -gt 0 ]; do
     case "$1" in
       --environment|--application-id|--from|--release-url)
-        [ $# -ge 2 ] || { log "record: $1 needs a value"; exit 1; }
+        # An empty value would be indistinguishable from an absent flag, so
+        # `--from "$ENV"` with ENV unset would silently inherit the default.
+        { [ $# -ge 2 ] && [ -n "$2" ]; } || { log "record: $1 needs a value"; exit 1; }
         case "$1" in
           --environment)    env="$2" ;;
           --application-id) app_hash="${2#snp-app:}" ;;
@@ -482,10 +495,7 @@ cmd_record() {
       *) log "record: unknown argument $1"; exit 1 ;;
     esac
   done
-  case " ${RECORD_ENVIRONMENTS} " in
-    *" ${env} "*) ;;
-    *) log "record: --environment must be one of: ${RECORD_ENVIRONMENTS}"; exit 1 ;;
-  esac
+  require_record_environment "${env}" --environment
   local catalog="${REPO_ROOT}/releases/catalog.json"
   if [ -n "${app_hash}" ] && [ -n "${from_env}" ]; then
     log "record: --application-id and --from name the same thing; pass one"
@@ -502,20 +512,19 @@ cmd_record() {
   # environment is recorded as running is what this one runs now. export_catalog
   # owns the replay that decides that, so ask it instead of re-deriving it here.
   if [ -n "${from_env}" ]; then
-    case " ${RECORD_ENVIRONMENTS} " in
-      *" ${from_env} "*) ;;
-      *) log "record: --from must be one of: ${RECORD_ENVIRONMENTS}"; exit 1 ;;
-    esac
-    app_hash="$(py "${DEPLOY_DIR}/release_catalog.py" export --catalog "${catalog}" --environment "${from_env}" |
+    require_record_environment "${from_env}" --from
+    # Capture, then parse: a failing export should surface the catalog tool's
+    # own complaint instead of a parser traceback over empty input.
+    exported="$(py "${DEPLOY_DIR}/release_catalog.py" export \
+      --catalog "${catalog}" --environment "${from_env}")"
+    app_hash="$(printf '%s' "${exported}" |
       py -c 'import json,sys; print((json.load(sys.stdin)["current_application_id"] or "")[8:])')"
     if [ -z "${app_hash}" ]; then
       log "record: ${from_env} has no active release to copy"
       exit 1
     fi
   fi
-  # Otherwise state names the app this machine launched. A production host is
-  # launched elsewhere, so it is recorded by identity rather than by looking
-  # around.
+  # Only consulted when the two sources above left it empty.
   app_hash="${app_hash:-$(tee_field app_hash 2>/dev/null || true)}"
   if [ -z "${app_hash}" ]; then
     log "record: no app identity; pass --from <environment> or --application-id snp-app:<hex>"
@@ -549,7 +558,10 @@ cmd_record() {
     release_url="$(py -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m["source_repository"] + "/commit/" + m["source_commit"])' "${manifest}")"
   fi
 
-  log "record: ${env} <- ${id} from ${bundle}"
+  # Name the source when the digest was inherited: production defaults to
+  # staging, so the value on this line is usually not one the operator typed.
+  log "record: ${env} <- ${id}${from_env:+ (inherited from ${from_env})}"
+  log "record: bundle ${bundle}"
   if [ "${dry_run}" = 1 ]; then
     log "record: dry-run; nothing written"
     log "  release  --catalog ${catalog} --bundle ${bundle} --manifest ${manifest} --release-url ${release_url}"
