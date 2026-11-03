@@ -12,10 +12,13 @@ IamInstanceProfile is fixed at RunInstances, and boto3 rejects
 asked for one, not a profile whose name happens to be empty.
 """
 
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _DIR = Path(__file__).resolve().parent          # snp/tests
 CLOUDTEST = _DIR.parent.parent                   # cloudtest
@@ -92,6 +95,67 @@ class LocalKeyTest(unittest.TestCase):
             self.assertIn("refusing to generate", str(refused.exception))
             self.assertIn("tokenhive-tee-chenxinghao", str(refused.exception))
             self.assertFalse(missing.exists(), "a key was generated after all")
+
+
+class LaunchKeyGateTest(unittest.TestCase):
+    """A launch with no ordinary host must not demand SSH key material.
+
+    Only the ordinary host is launched with a key pair (run_ordinary) and later
+    reached over SSH by deploy/verify/fetch/run. --single and --tee-only launch
+    the confidential instance without KeyName, so there is nothing to log into;
+    requiring the private half there refused a launch that could not use a key
+    at all (2026-11-03).
+    """
+
+    def _run_through_dry_run(self, *flags: str, key_dir: str) -> None:
+        """Run main() to the dry-run return with AWS stubbed out.
+
+        --dry-run returns right after the key gate, so this pins the gate
+        without launching anything or touching instance state.
+        """
+        patches = [
+            mock.patch.object(crosshost, "load", return_value=Config(user="chenxinghao")),
+            mock.patch.object(crosshost, "boto3", return_value=object()),
+            mock.patch.object(crosshost, "ensure_vpc", return_value="vpc-1"),
+            mock.patch.object(crosshost, "ensure_subnet", return_value="subnet-1"),
+            mock.patch.object(crosshost, "ensure_igw"),
+            mock.patch.object(crosshost, "ensure_sg", return_value="sg-1"),
+            mock.patch.object(crosshost, "open_cross_ports"),
+            mock.patch.object(
+                crosshost, "ensure_key",
+                side_effect=AssertionError("ensure_key ran without an ordinary host")),
+            mock.patch.object(crosshost, "KEY_FILE", Path(key_dir) / "ssh-key.pem"),
+            mock.patch.object(sys, "argv", ["crosshost.py", "ami-9", "--dry-run", *flags]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ]
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            crosshost.main()
+
+    def test_tee_only_needs_no_key_material(self):
+        # No ssh-key.pem and no .pub anywhere: the gate must not run, and the
+        # unpatched ensure_local_key would sys.exit if it did.
+        with tempfile.TemporaryDirectory() as d:
+            self._run_through_dry_run("--tee-only", key_dir=d)
+
+    def test_single_needs_no_key_material(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._run_through_dry_run("--single", key_dir=d)
+
+    def test_cross_host_still_requires_the_private_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            patches = [
+                mock.patch.object(crosshost, "load", return_value=Config(user="chenxinghao")),
+                mock.patch.object(crosshost, "KEY_FILE", Path(d) / "ssh-key.pem"),
+                mock.patch.object(sys, "argv", ["crosshost.py", "ami-9", "--dry-run"]),
+            ]
+            with contextlib.ExitStack() as stack:
+                for patch in patches:
+                    stack.enter_context(patch)
+                with self.assertRaises(SystemExit) as refused:
+                    crosshost.main()
+            self.assertIn("refusing to generate", str(refused.exception))
 
 
 if __name__ == "__main__":

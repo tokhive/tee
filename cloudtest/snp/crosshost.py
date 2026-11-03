@@ -332,7 +332,13 @@ def main() -> None:
     cfg = load()
     if not cfg.user:
         sys.exit("TOKENHIVE_USER is empty; refusing to launch untagged instances")
-    ensure_local_key(cfg.key_name)
+    # Only the ordinary host is launched with a key pair (run_ordinary) and
+    # later reached over SSH by deploy/verify/fetch/run. --single and --tee-only
+    # launch the confidential instance with no KeyName, so neither the private
+    # half nor the public one is ever used: demanding them would refuse a
+    # launch that cannot use a key at all.
+    if not no_host:
+        ensure_local_key(cfg.key_name)
     ec2 = boto3("ec2")
 
     print(f"==> ensuring infrastructure in {cfg.region} (user tag: {cfg.user})")
@@ -341,7 +347,8 @@ def main() -> None:
     ensure_igw(ec2, cfg, vpc_id)
     sg_id = ensure_sg(ec2, cfg, vpc_id)
     open_cross_ports(ec2, cfg, sg_id)
-    ensure_key(ec2, cfg, public_key=(KEY_FILE).with_suffix(".pem.pub").read_text().strip())
+    if not no_host:
+        ensure_key(ec2, cfg, public_key=(KEY_FILE).with_suffix(".pem.pub").read_text().strip())
     if dry_run:
         label = "confidential tee (single-mode)" if single else (
             "confidential tee only (tee-only, no ordinary host)" if tee_only
