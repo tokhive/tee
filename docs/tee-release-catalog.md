@@ -16,7 +16,7 @@
 | `policy_hash` | 归档内实际 `policy/policy.cbor` 的回执策略哈希，对应 verifier 的 `Expected policy hash`。 |
 | `policy_file_sha256` | 策略文件原始字节的普通 SHA-256，用于产物核对；不能代替 `policy_hash`。 |
 | `ca_bundle_sha256` | 归档内实际公共根证书包的摘要。 |
-| `source_repository`、`source_commit`、`source_dirty` | 编译前捕获并在编译后复核的源码来源；登记时不会改成当前检出的提交。 |
+| `source_repository`、`source_commit`、`source_dirty` | 编译前捕获并在编译后复核的源码来源；登记时不会改成当前检出的提交。`source_dirty` 只表示“被编译的源码与该提交不一致”：密钥证书（`*.pem`／`*.key`／`*.crt`／`*.der`／`*.esl` 等）、`releases/`、`docs/`、`.env` 的改动以及未被编译读取的未跟踪文件（本地笔记、`.workbuddy/` 等）不计入；新的 `*.go`、`go.mod`／`go.sum`、`policy/` 文件仍计入。 |
 | `built_at`、`bundle_kind` | 构建结束时间与 `tee`／`single`／`stub` 类型。 |
 
 策略哈希通过 `cmd/tee-policy-info` 复用 TEE 的规范 CBOR 解码和 `policy.Hash()` 计算，计算形式为 `SHA-256("TokenHive.Policy.v1" || canonical_policy_bytes)`。不使用当前源码中的默认策略替代归档内策略；自定义策略也按实际携带的字节核验。单独检查某份归档时可运行：
@@ -25,7 +25,9 @@
 tar -xOf "$TEE_BUNDLE" ./policy/policy.cbor | go run ./cmd/tee-policy-info -
 ```
 
-构建成功只生成候选清单，**不等于正式发布或已经启用**。缺少 Git 来源、源码不干净、缺失生产策略或公共根证书包，以及 `single`／`stub` 诊断构建均不能登记为正式发布。日常本机调试仍可生成带有不完整来源或 `source_dirty: true` 的构建清单。
+构建成功只生成候选清单，**不等于正式发布或已经启用**。缺少 Git 来源、被编译源码未提交、缺失生产策略或公共根证书包，以及 `single`／`stub` 诊断构建均不能登记为正式发布。日常本机调试仍可生成带有不完整来源或 `source_dirty: true` 的构建清单。
+
+“源码不干净”专指会影响被编译产物的改动（Go 源码、模块元数据、策略文档）。运维本地的密钥轮换、证书更新和笔记不会让 `crosshost.sh record` 被拒绝：这些字节若进入 bundle，只能通过 `SNP_*` 指定路径进入，而 bundle 摘要（即应用身份）本身已经把它们固定下来；`record` 也始终只提交 `releases/catalog.json` 这一个文件，其余本地改动既不进提交、也不阻止登记。构建时若存在影响来源的未提交改动，`pack.sh` 的日志会列出具体文件。
 
 需要 Unix 环境、Python 3.9+、Git 和本仓库要求的 Go 工具链。除 Go 模块依赖外，登记工具不需要 Python 第三方包，也不调用 AWS、GCP 或 Hive API。
 
@@ -150,6 +152,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s deploy/tests -v
 python3 deploy/release_catalog.py validate
 ```
 
-测试使用临时 Git 仓库、合成 tar 和真实策略哈希实现；实际执行 `pack.sh` 的归档及 sidecar 生成流程时，只替换编译器为本地桩，不调用云 API。覆盖构建来源、策略规范编码、产物不符拒绝、诊断／脏源码拒绝、发布记录不被覆盖、回滚多区间、环境隔离、撤销及历史追加约束。这些结果不代替真实镜像构建、硬件证明或云部署验收。
+测试使用临时 Git 仓库、合成 tar 和真实策略哈希实现；实际执行 `pack.sh` 的归档及 sidecar 生成流程时，只替换编译器为本地桩，不调用云 API。覆盖构建来源、策略规范编码、产物不符拒绝、诊断／脏源码拒绝、密钥证书与未跟踪文件不阻塞登记、发布记录不被覆盖、回滚多区间、环境隔离、撤销及历史追加约束。这些结果不代替真实镜像构建、硬件证明或云部署验收。
 
 2026-11-03 本地验证：15 个发布清单测试、`cmd/tee-policy-info`／`policy`／`internal/canonical` 三个 Go 包测试，以及现有 16 个跨主机脚本测试、6 个镜像打包测试通过；shell 语法检查、空清单校验和公开视图导出通过。所有镜像和部署相关测试均使用本地桩，未调用云 API；未构建、发布或切换真实 TEE 镜像。

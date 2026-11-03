@@ -153,6 +153,56 @@ class ReleaseCatalogTest(unittest.TestCase):
                  "--release-url", "https://example.com/release", success=False)
         self.assertEqual(catalog_tool.load_json(self.catalog), empty_catalog())
 
+    def test_operator_material_and_untracked_files_do_not_block_a_release(self):
+        # Operators rotate keys where the keys live: tracked secure-boot
+        # material, a client key dropped next to the checkout, a regenerated CA
+        # fixture, local notes, the catalog itself. None of it is compiled, and
+        # a bundle that carries any of it carries it under a SNP_* path — so the
+        # digest, not the commit, is what pins those bytes.
+        for path, content in {"deploy/secure-boot/PK.crt.pem": "original key",
+                              "docs/notes.md": "original notes",
+                              "releases/catalog.json": "{}"}.items():
+            (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / path).write_text(content)
+        self.run_git("add", "-A")
+        self.run_git("commit", "-qm", "keys, notes and catalog")
+        (self.repo / "deploy/secure-boot/PK.crt.pem").write_text("rotated key")
+        (self.repo / "deploy/secure-boot/PK.esl").write_text("regenerated ESL")
+        (self.repo / "docs/notes.md").write_text("local notes")
+        (self.repo / "releases/catalog.json").write_text('{"version": 1}')
+        (self.repo / "hub-client-key.pem").write_text("private key")
+        (self.repo / ".workbuddy").mkdir()
+        (self.repo / ".workbuddy/session.json").write_text("{}")
+        bundle = self.bundle()
+        manifest = self.manifest(bundle)
+        self.assertFalse(manifest["source_dirty"])
+        self.cli("release", "--catalog", self.catalog, "--bundle", bundle,
+                 "--release-url", "https://github.com/tokhive/tee/releases/tag/rotated")
+        releases = catalog_tool.load_json(self.catalog)["releases"]
+        self.assertEqual([release["application_id"] for release in releases], [manifest["application_id"]])
+
+    def test_compiled_source_additions_still_block_a_release(self):
+        # Untracked files are not described by the commit either, but a compile
+        # picks these up silently, so the recorded commit would not describe the
+        # bytes. Reporting them is why they are not simply filtered out.
+        (self.repo / "extra.go").write_text("package main")
+        snapshot = self.root / "snapshot.json"
+        result = self.cli("source", "--repo", self.repo, "--output", snapshot)
+        self.assertIn("extra.go", result.stderr, "the build log has to name what made the source stale")
+        bundle = self.bundle()
+        self.assertTrue(self.manifest(bundle)["source_dirty"])
+        refused = self.cli("release", "--catalog", self.catalog, "--bundle", bundle,
+                           "--release-url", "https://example.com/release", success=False)
+        self.assertIn("dirty or unknown", refused.stderr)
+        self.assertIn("rebuild", refused.stderr)
+
+    def test_a_rename_is_a_source_change(self):
+        # NUL-separated porcelain reports a rename's origin in a second field;
+        # reading that field as a status would file the change under a path
+        # nobody edited and, worse, under the wrong status.
+        self.run_git("mv", "source.txt", "renamed.txt")
+        self.assertTrue(self.manifest(self.bundle())["source_dirty"])
+
     def test_bundle_tampering_and_missing_production_inputs_are_rejected(self):
         bundle = self.bundle()
         self.manifest(bundle)
