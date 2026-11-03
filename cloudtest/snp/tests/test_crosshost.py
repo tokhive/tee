@@ -261,6 +261,17 @@ class RecordTest(unittest.TestCase):
         self.assertIn("--environment staging", activate)
         self.assertIn("--application-id snp-app:" + self.digest, activate)
 
+    def test_dry_run_resolves_the_inputs_without_writing(self):
+        # --dry-run exists so the real digest and release URL can be read before
+        # anything is committed to history.
+        self._state(self.digest)
+        out = self._run("--environment", "staging", "--dry-run")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(self.calls.exists(), "dry-run must not reach the catalog")
+        self.assertIn("  release  --catalog", out.stdout)
+        self.assertIn("--application-id snp-app:" + self.digest, out.stdout)
+        self.assertIn("https://github.com/tokhive/tee/commit/" + "1" * 40, out.stdout)
+
     def test_environment_name_must_match_the_published_view(self):
         # 'prod' would not fail anywhere on its own: it would start a second
         # history that no page reads, while 'production' kept showing nothing.
