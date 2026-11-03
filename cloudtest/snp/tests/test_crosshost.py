@@ -14,11 +14,19 @@ document the running app was measured with. Two ways that broke, both by hand:
 These tests hold the properties that fix depends on: one place says where the
 whitelist lives, deploy derives it from the running app's bundle, and the
 bundle it picks is verified rather than trusted from its filename.
+
+`record` is held to the same rule from the other side. It may only describe an
+app whose archived bundle still hashes to the identity it is filed under, it may
+only use an environment name Hive renders a page for, and recording is never a
+side effect of a launch: a smoke test stays out of the history by not asking.
 """
 
 import hashlib
+import json
 import re
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -205,6 +213,113 @@ class SwapWiringTest(unittest.TestCase):
         # check a swap leans on to decide the new enclave is serving.
         body = _shell_function("dump_tee_console")
         self.assertIn("Latest=True", body)
+
+
+class RecordTest(unittest.TestCase):
+    """record turns a deployed identity into catalog history, and refuses the
+    identities it cannot vouch for."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.repo = root / "repo"
+        (self.repo / "releases").mkdir(parents=True)
+        self.catalog = self.repo / "releases" / "catalog.json"
+        self.catalog.write_text('{"version":1,"releases":[],"deployment_events":[],"revocations":[]}\n')
+        self.bundles = root / "bundles"
+        self.bundles.mkdir()
+        self.deploy = root / "deploy"
+        self.deploy.mkdir()
+        self.calls = root / "calls.log"
+        # Stand-in for release_catalog.py that logs the argv it was handed. The
+        # catalog tool's own behaviour is deploy/tests' subject; here the point
+        # is the contract record passes it.
+        self.deploy.joinpath("release_catalog.py").write_text(
+            "import sys\n"
+            f"open({str(self.calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n")
+        self.hosts = root / "crosshost.json"
+        payload = b"the bundle the enclave is measured with"
+        self.digest = hashlib.sha256(payload).hexdigest()
+        self.bundle = self.bundles / f"{self.digest}.tar"
+        self.bundle.write_bytes(payload)
+        self.sidecar = self.bundles / f"{self.digest}.tar.build.json"
+        self.sidecar.write_text(json.dumps({
+            "source_repository": "https://github.com/tokhive/tee",
+            "source_commit": "1" * 40,
+        }))
+
+    def test_records_the_bundle_state_says_is_running(self):
+        self._state(self.digest)
+        out = self._run("--environment", "staging")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        release, activate = self._calls()
+        self.assertIn(f"--catalog {self.catalog}", release)
+        self.assertIn(f"--bundle {self.bundle}", release)
+        self.assertIn(f"--manifest {self.sidecar}", release)
+        self.assertIn("https://github.com/tokhive/tee/commit/" + "1" * 40, release)
+        self.assertIn("--environment staging", activate)
+        self.assertIn("--application-id snp-app:" + self.digest, activate)
+
+    def test_environment_name_must_match_the_published_view(self):
+        # 'prod' would not fail anywhere on its own: it would start a second
+        # history that no page reads, while 'production' kept showing nothing.
+        self._state(self.digest)
+        out = self._run("--environment", "prod")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("staging production", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists(), "a rejected name must not reach the catalog")
+
+    def test_records_a_build_this_machine_did_not_launch(self):
+        # No state file: production hosts are launched elsewhere, so the identity
+        # has to be acceptable from the command line.
+        out = self._run("--environment", "production", "--application-id", "snp-app:" + self.digest)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(len(self._calls()), 2)
+
+    def test_refuses_a_bundle_without_a_sidecar(self):
+        # No sidecar means no source commit and no policy hash, which is exactly
+        # what the catalog entry exists to state.
+        self._state(self.digest)
+        self.sidecar.unlink()
+        out = self._run("--environment", "staging")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("sidecar", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_refuses_a_bundle_that_does_not_measure_the_identity(self):
+        self._state(self.digest)
+        self.bundle.write_bytes(b"a different build")
+        out = self._run("--environment", "staging")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("no archived bundle measures", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def _state(self, app_hash):
+        self.hosts.write_text(json.dumps({"tee": {"app_hash": app_hash}}))
+
+    def _calls(self):
+        return self.calls.read_text().splitlines()
+
+    def _run(self, *args):
+        script = "\n".join([
+            "set -euo pipefail",
+            'log() { echo "$*"; }',
+            'py() { "$PY" "$@"; }',
+            _shell_function("archived_bundle"),
+            _shell_function("cmd_record"),
+            # Mirrors crosshost.sh's tee_field, which the extractor cannot lift
+            # because it is written on one line.
+            'tee_field() { "$PY" -c "import json,sys; print(json.load(open(sys.argv[1]))[\'tee\'][\'$1\'])" "$HOSTS"; }',
+            f"PY={shlex.quote(sys.executable)}",
+            f"HOSTS={shlex.quote(str(self.hosts))}",
+            f"BUNDLES_DIR={shlex.quote(str(self.bundles))}",
+            f"REPO_ROOT={shlex.quote(str(self.repo))}",
+            f"DEPLOY_DIR={shlex.quote(str(self.deploy))}",
+            'RECORD_ENVIRONMENTS="staging production"',
+            "cmd_record " + " ".join(shlex.quote(arg) for arg in args),
+        ])
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
 
 
 if __name__ == "__main__":

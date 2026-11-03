@@ -42,6 +42,11 @@
 #               recorded as superseded, and only after checking the current tee
 #               is recorded and running. Never enumerates by tag.
 #   ./crosshost.sh down --dry-run   list what would be terminated, delete nothing
+#   ./crosshost.sh record --environment staging|production
+#               append the app an environment runs to releases/catalog.json:
+#               `release` registers the measured bundle once, `activate` moves
+#               the environment onto it. Run it after that environment is
+#               serving the app; nothing in build/up/deploy calls it.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # cloudtest/snp
 # The host shell may carry PYTHONHOME/PYTHONPATH injected by an unrelated tool
@@ -73,6 +78,11 @@ POLICY_DIR="${SNP_POLICY_DIR:-${CERTS_DIR}/policy}"
 # overwritten everything else. A single mutable policy directory cannot answer
 # that question (see cmd_deploy).
 BUNDLES_DIR="${CLOUDTEST}/bin/bundles"
+# The catalog only knows the environments Hive renders a page for. Keeping the
+# list here makes a typo fail at the call site: 'prod' and 'production' would
+# otherwise each collect their own history while the page for the environment
+# that is actually deployed keeps showing nothing.
+RECORD_ENVIRONMENTS="staging production"
 # The layout `deploy` creates on the ordinary host: ./tee (binaries + logs),
 # ./mtls (certs) and ./policy (the whitelist). This is the only place the
 # whitelist's remote location is written down — the upload and the Hub's
@@ -427,6 +437,76 @@ EOF
   sleep 4
 }
 
+# cmd_record --environment staging|production [--application-id snp-app:<hex>]
+#            [--release-url <url>]
+#
+# Appends the bundle an environment runs to releases/catalog.json. `release`
+# registers the measured bytes once, keyed by the digest the enclave is measured
+# to; `activate` then records which of those bytes this environment runs. Both
+# are idempotent, so re-running after a no-op deploy leaves the history alone.
+#
+# Run it once the environment is actually serving that app. The catalog holds an
+# expectation, and writing it before the instance exists turns a plan into a
+# claim nobody checked. Nothing in build/up/deploy calls this: a smoke test, or
+# a host that belongs to no catalogued environment, simply never records.
+cmd_record() {
+  local env="" app_hash="" release_url=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --environment|--application-id|--release-url)
+        [ $# -ge 2 ] || { log "record: $1 needs a value"; exit 1; }
+        case "$1" in
+          --environment)    env="$2" ;;
+          --application-id) app_hash="${2#snp-app:}" ;;
+          --release-url)    release_url="$2" ;;
+        esac
+        shift 2 ;;
+      *) log "record: unknown argument $1"; exit 1 ;;
+    esac
+  done
+  case " ${RECORD_ENVIRONMENTS} " in
+    *" ${env} "*) ;;
+    *) log "record: --environment must be one of: ${RECORD_ENVIRONMENTS}"; exit 1 ;;
+  esac
+  # State names the app this machine launched. A production host is not launched
+  # from here, so it is recorded by identity rather than by looking around.
+  if [ -z "${app_hash}" ] && [ -f "${HOSTS}" ]; then
+    app_hash="$(tee_field app_hash 2>/dev/null || true)"
+  fi
+  if [ -z "${app_hash}" ]; then
+    log "record: no app identity in state; pass --application-id snp-app:<hex>"
+    exit 1
+  fi
+  # archived_bundle re-hashes the file it returns, so a bundle filed under the
+  # wrong name cannot be recorded under this identity.
+  local bundle manifest
+  if ! bundle="$(archived_bundle "${app_hash}")"; then
+    log "record: no archived bundle measures snp-app:${app_hash}"
+    log "record: build it again (./crosshost.sh build) to file the bundle and its sidecar"
+    exit 1
+  fi
+  manifest="${BUNDLES_DIR}/${app_hash}.tar.build.json"
+  if [ ! -f "${manifest}" ]; then
+    log "record: ${manifest} is missing"
+    log "record: only bundles built since the release catalog carry a sidecar"
+    exit 1
+  fi
+  # A release URL is required and has to stay the same across re-registrations,
+  # so the default is a pure function of the manifest. Pass a PR or announcement
+  # link when reviewers should land somewhere more useful than the commit.
+  if [ -z "${release_url}" ]; then
+    release_url="$(py -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m["source_repository"] + "/commit/" + m["source_commit"])' "${manifest}")"
+  fi
+
+  local catalog="${REPO_ROOT}/releases/catalog.json" id="snp-app:${app_hash}"
+  log "record: ${env} <- ${id} from ${bundle}"
+  py "${DEPLOY_DIR}/release_catalog.py" release --catalog "${catalog}" \
+    --bundle "${bundle}" --manifest "${manifest}" --release-url "${release_url}"
+  py "${DEPLOY_DIR}/release_catalog.py" activate --catalog "${catalog}" \
+    --environment "${env}" --application-id "${id}"
+  log "record: ${catalog#"${REPO_ROOT}"/} updated"
+}
+
 cmd_drive() {
   log "step: drive 2 chat requests via host Hub"
   remote_exec "$(host_field public_ip)" bash <<'EOF'
@@ -553,6 +633,7 @@ case "${1:-}" in
   deploy)  cmd_deploy ;;
   drive)   cmd_drive ;;
   verify)  cmd_verify ;;
+  record)  cmd_record "${@:2}" ;;
   down)    cmd_down "${@:2}" ;;
   *)
     awk 'NR==1{next} /^set -euo/{exit} {sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}"
