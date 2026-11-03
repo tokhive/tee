@@ -518,7 +518,9 @@ cmd_record() {
     --bundle "${bundle}" --manifest "${manifest}" --release-url "${release_url}"
   py "${DEPLOY_DIR}/release_catalog.py" activate --catalog "${catalog}" \
     --environment "${env}" --application-id "${id}"
-  log "record: ${catalog#"${REPO_ROOT}"/} updated"
+  # States what the file holds rather than claiming a write: the catalog tool
+  # skips the write when nothing changed, which is the normal case for a repeat.
+  log "record: ${catalog#"${REPO_ROOT}"/} holds ${env} -> ${id}"
   if [ "${commit}" = 0 ]; then
     log "record: --no-commit; review the catalog and commit it yourself"
     return 0
