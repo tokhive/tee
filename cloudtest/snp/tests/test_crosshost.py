@@ -14,11 +14,20 @@ document the running app was measured with. Two ways that broke, both by hand:
 These tests hold the properties that fix depends on: one place says where the
 whitelist lives, deploy derives it from the running app's bundle, and the
 bundle it picks is verified rather than trusted from its filename.
+
+`record` is held to the same rule from the other side. It may only describe an
+app whose archived bundle still hashes to the identity it is filed under, it may
+only use an environment name Hive renders a page for, and recording is never a
+side effect of a launch: a smoke test stays out of the history by not asking.
 """
 
 import hashlib
+import json
+import os
 import re
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,6 +45,14 @@ def _shell_function(name):
     m = re.search(rf"^{re.escape(name)}\(\) \{{.*?^\}}", SRC, re.M | re.S)
     if not m:
         raise AssertionError(f"no {name}() in {CROSSHOST}")
+    return m.group(0)
+
+
+def _shell_assignment(name):
+    """The literal `NAME=value` line, for the same reason as _shell_function."""
+    m = re.search(rf"^{re.escape(name)}=.*$", SRC, re.M)
+    if not m:
+        raise AssertionError(f"no {name}= in {CROSSHOST}")
     return m.group(0)
 
 
@@ -205,6 +222,313 @@ class SwapWiringTest(unittest.TestCase):
         # check a swap leans on to decide the new enclave is serving.
         body = _shell_function("dump_tee_console")
         self.assertIn("Latest=True", body)
+
+
+class RecordTest(unittest.TestCase):
+    """record turns a deployed identity into catalog history, and refuses the
+    identities it cannot vouch for."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.repo = root / "repo"
+        (self.repo / "releases").mkdir(parents=True)
+        self.catalog = self.repo / "releases" / "catalog.json"
+        self.catalog.write_text('{"version":1,"releases":[],"deployment_events":[],"revocations":[]}\n')
+        self.bundles = root / "bundles"
+        self.bundles.mkdir()
+        self.deploy = root / "deploy"
+        self.deploy.mkdir()
+        self.calls = root / "calls.log"
+        # Stand-in for release_catalog.py: logs the argv it was handed and keeps
+        # the catalog in the shape record reads back (a digest keeps the URL it
+        # was published under, activating what is already active changes
+        # nothing). The tool's real behaviour is deploy/tests' subject; here the
+        # point is the contract record passes it.
+        stub = """import json, os, sys
+argv = sys.argv[1:]
+if argv[0] == 'export':
+    data = json.load(open(argv[argv.index('--catalog') + 1]))
+    active = {e['environment']: e['application_id'] for e in data['deployment_events']}
+    print(json.dumps({'current_application_id': active.get(argv[argv.index('--environment') + 1])}))
+    sys.exit(0)
+with open(@CALLS@, 'a') as log:
+    log.write(' '.join(argv) + '\\n')
+if '--catalog' not in argv:
+    sys.exit(0)
+path = argv[argv.index('--catalog') + 1]
+data = json.load(open(path))
+if argv[0] == 'release':
+    identity = 'snp-app:' + os.path.basename(argv[argv.index('--manifest') + 1]).split('.')[0]
+    if not any(r['application_id'] == identity for r in data['releases']):
+        data['releases'].append({'application_id': identity,
+                                 'release_url': argv[argv.index('--release-url') + 1]})
+else:
+    identity = argv[argv.index('--application-id') + 1]
+    environment = argv[argv.index('--environment') + 1]
+    active = {e['environment']: e['application_id'] for e in data['deployment_events']}
+    if active.get(environment) != identity:
+        data['deployment_events'].append({'environment': environment, 'application_id': identity})
+with open(path, 'w') as catalog:
+    json.dump(data, catalog)
+"""
+        self.deploy.joinpath("release_catalog.py").write_text(stub.replace("@CALLS@", repr(str(self.calls))))
+        self.hosts = root / "crosshost.json"
+        payload = b"the bundle the enclave is measured with"
+        self.digest = hashlib.sha256(payload).hexdigest()
+        self.bundle = self.bundles / f"{self.digest}.tar"
+        self.bundle.write_bytes(payload)
+        self.sidecar = self.bundles / f"{self.digest}.tar.build.json"
+        self.sidecar.write_text(json.dumps({
+            "source_repository": "https://github.com/tokhive/tee",
+            "source_commit": "1" * 40,
+            "policy_hash": "2" * 64,
+        }))
+        self._init_repo()
+
+    def test_records_the_bundle_state_says_is_running(self):
+        self._state(self.digest)
+        out = self._run("--environment", "staging")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        release, activate = self._calls()
+        self.assertIn(f"--catalog {self.catalog}", release)
+        self.assertIn(f"--bundle {self.bundle}", release)
+        self.assertIn(f"--manifest {self.sidecar}", release)
+        self.assertIn("https://github.com/tokhive/tee/commit/" + "1" * 40, release)
+        self.assertIn("--environment staging", activate)
+        self.assertIn("--application-id snp-app:" + self.digest, activate)
+
+    def test_dry_run_resolves_the_inputs_without_writing(self):
+        # --dry-run exists so the real digest and release URL can be read before
+        # anything is committed to history.
+        self._state(self.digest)
+        out = self._run("--environment", "staging", "--dry-run")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(self.calls.exists(), "dry-run must not reach the catalog")
+        self.assertIn("  release  --catalog", out.stdout)
+        self.assertIn("--application-id snp-app:" + self.digest, out.stdout)
+        self.assertIn("https://github.com/tokhive/tee/commit/" + "1" * 40, out.stdout)
+
+    def test_environment_name_must_match_the_published_view(self):
+        # 'prod' would not fail anywhere on its own: it would start a second
+        # history that no page reads, while 'production' kept showing nothing.
+        self._state(self.digest)
+        out = self._run("--environment", "prod")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("staging production", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists(), "a rejected name must not reach the catalog")
+
+    def test_records_a_build_this_machine_did_not_launch(self):
+        # No state file: production hosts are launched elsewhere, so the identity
+        # has to be acceptable from the command line.
+        out = self._run("--environment", "production", "--application-id", "snp-app:" + self.digest)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(len(self._calls()), 2)
+
+    def test_refuses_a_bundle_without_a_sidecar(self):
+        # No sidecar means no source commit and no policy hash, which is exactly
+        # what the catalog entry exists to state.
+        self._state(self.digest)
+        self.sidecar.unlink()
+        out = self._run("--environment", "staging")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("sidecar", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_refuses_a_bundle_that_does_not_measure_the_identity(self):
+        self._state(self.digest)
+        self.bundle.write_bytes(b"a different build")
+        out = self._run("--environment", "staging")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("no archived bundle measures", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_commit_lands_only_the_catalog(self):
+        # The deploy host is somebody's working tree. Committing whatever else
+        # they had staged would attach unrelated work to a release record, so
+        # the staged README below has to survive the commit untouched.
+        (self.repo / "README").write_text("an unrelated local edit\n")
+        self._git("add", "README")
+        self._state(self.digest)
+        out = self._run("--environment", "staging")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "2")
+        self.assertEqual(self._git("show", "--name-only", "--pretty=format:", "HEAD").stdout.split(),
+                         ["releases/catalog.json"])
+        self.assertIn("README", self._git("status", "--porcelain").stdout)
+
+    def test_no_commit_leaves_the_entry_for_review(self):
+        self._state(self.digest)
+        out = self._run("--environment", "staging", "--no-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "1")
+        self.assertIn("releases/catalog.json", self._git("status", "--porcelain").stdout)
+
+    def test_repeating_a_record_does_not_add_an_empty_commit(self):
+        # The catalog tool is idempotent for a digest already registered and an
+        # environment already running it, so the second run has nothing to say.
+        # Turning that into a commit would fill the history with no-ops.
+        self._state(self.digest)
+        self._run("--environment", "staging")
+        out = self._run("--environment", "staging")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("nothing to commit", out.stdout)
+        self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "2")
+
+    def test_record_reuses_the_url_of_an_already_published_build(self):
+        # register_release refuses to relabel a digest, so the default here must
+        # not be derived fresh: promoting a build that was recorded with an
+        # announcement link would otherwise fail on a URL nobody changed.
+        self.catalog.write_text(json.dumps({
+            "version": 1, "releases": [self._release()],
+            "deployment_events": [], "revocations": []}))
+        self._state(self.digest)
+        out = self._run("--environment", "staging", "--no-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("--release-url https://example.invalid/announcement", self._calls()[0])
+
+    def test_promotes_what_another_environment_is_recorded_as_running(self):
+        # A promotion should not need a digest copied out of a log: the catalog
+        # already says what staging runs.
+        self.catalog.write_text(json.dumps({
+            "version": 1, "releases": [self._release()],
+            "deployment_events": [{"environment": "staging", "action": "activate",
+                                   "application_id": "snp-app:" + self.digest,
+                                   "at": "2026-11-03T08:00:00Z"}],
+            "revocations": []}))
+        out = self._run("--environment", "production", "--from", "staging", "--no-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("--environment production", self._calls()[1])
+        self.assertIn("--application-id snp-app:" + self.digest, self._calls()[1])
+
+    def test_production_inherits_staging_without_naming_it(self):
+        # The promotion command is the common one, so it should not carry a flag
+        # that always says the same thing.
+        self.catalog.write_text(json.dumps({
+            "version": 1, "releases": [self._release()],
+            "deployment_events": [{"environment": "staging", "action": "activate",
+                                   "application_id": "snp-app:" + self.digest,
+                                   "at": "2026-11-03T08:00:00Z"}],
+            "revocations": []}))
+        out = self._run("--environment", "production", "--no-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("--application-id snp-app:" + self.digest, self._calls()[1])
+        self.assertIn("(inherited from staging)", out.stdout,
+                      "a digest the operator did not type must say where it came from")
+
+    def test_staging_reads_state_rather_than_inheriting_itself(self):
+        # Staging is the environment this machine launches. Inheriting its own
+        # record would turn the command into a no-op that reads like a success.
+        other = "9" * 64
+        self.catalog.write_text(json.dumps({
+            "version": 1, "releases": [self._release(digest=other)],
+            "deployment_events": [{"environment": "staging", "action": "activate",
+                                   "application_id": "snp-app:" + other,
+                                   "at": "2026-11-03T08:00:00Z"}],
+            "revocations": []}))
+        self._state(self.digest)
+        out = self._run("--environment", "staging", "--no-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("--application-id snp-app:" + self.digest, self._calls()[1])
+
+    def test_from_refuses_an_environment_that_runs_nothing(self):
+        out = self._run("--environment", "production", "--from", "staging")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("no active release", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists(), "nothing may be written with no identity")
+
+    def test_an_empty_flag_value_is_not_an_absent_flag(self):
+        # `--from "$ENV"` with ENV unset expands to nothing. Treating that as
+        # "no --from given" would make production fall back to its staging
+        # default and record a build the operator never named.
+        out = self._run("--environment", "production", "--from", "",
+                        "--application-id", "snp-app:" + self.digest)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("--from needs a value", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_identity_sources_are_mutually_exclusive(self):
+        out = self._run("--environment", "staging", "--from", "production",
+                        "--application-id", "snp-app:" + self.digest)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("pass one", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_refuses_to_commit_an_untracked_catalog(self):
+        # git reports no diff for a path it does not track, so without this the
+        # run would claim "already recorded" and leave the entry out of history.
+        # The check also has to come before the write: with the file missing
+        # altogether the catalog tool's complaint is a bare ENOENT.
+        self._git("rm", "-q", "--cached", "releases/catalog.json")
+        self._git("commit", "-q", "-m", "drop the catalog")
+        self.catalog.unlink()
+        self._state(self.digest)
+        out = self._run("--environment", "staging")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("not tracked", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists(), "the refusal must precede the write")
+        self.assertFalse(self.catalog.exists(), "no catalog may be created here")
+        self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "2")
+
+    def _release(self, url="https://example.invalid/announcement", digest=None):
+        # A complete record: export_catalog validates the whole catalog before
+        # answering, so a partial entry would fail for the wrong reason.
+        digest = digest or self.digest
+        return {"version": 1, "application_id": "snp-app:" + digest,
+                "bundle_sha256": digest, "bundle_size_bytes": 29886464,
+                "app_binary_sha256": "3" * 64, "policy_hash": "2" * 64,
+                "policy_file_sha256": "4" * 64, "ca_bundle_sha256": "5" * 64,
+                "bundle_kind": "tee", "source_dirty": False,
+                "source_repository": "https://github.com/tokhive/tee",
+                "source_commit": "1" * 40,
+                "built_at": "2026-11-03T07:00:00Z", "release_url": url,
+                "published_at": "2026-11-03T07:30:00Z"}
+
+    def _state(self, app_hash):
+        self.hosts.write_text(json.dumps({"tee": {"app_hash": app_hash}}))
+
+    def _calls(self):
+        return self.calls.read_text().splitlines()
+
+    def _git_env(self):
+        # A throwaway repository must not inherit the operator's signing setup
+        # or identity, or the commit under test would depend on this machine.
+        return {**os.environ,
+                "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_AUTHOR_NAME": "record test", "GIT_AUTHOR_EMAIL": "record@example.invalid",
+                "GIT_COMMITTER_NAME": "record test", "GIT_COMMITTER_EMAIL": "record@example.invalid"}
+
+    def _git(self, *args):
+        return subprocess.run(["git", "-C", str(self.repo), *args],
+                              capture_output=True, text=True, env=self._git_env(), check=True)
+
+    def _init_repo(self):
+        self._git("init", "-q")
+        (self.repo / "README").write_text("the deploy host's working tree\n")
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", "initial")
+
+    def _run(self, *args):
+        script = "\n".join([
+            "set -euo pipefail",
+            'log() { echo "$*"; }',
+            'py() { "$PY" "$@"; }',
+            _shell_function("archived_bundle"),
+            _shell_function("require_record_environment"),
+            _shell_function("cmd_record"),
+            # Mirrors crosshost.sh's tee_field, which the extractor cannot lift
+            # because it is written on one line.
+            'tee_field() { "$PY" -c "import json,sys; print(json.load(open(sys.argv[1]))[\'tee\'][\'$1\'])" "$HOSTS"; }',
+            f"PY={shlex.quote(sys.executable)}",
+            f"HOSTS={shlex.quote(str(self.hosts))}",
+            f"BUNDLES_DIR={shlex.quote(str(self.bundles))}",
+            f"REPO_ROOT={shlex.quote(str(self.repo))}",
+            f"DEPLOY_DIR={shlex.quote(str(self.deploy))}",
+            _shell_assignment("RECORD_ENVIRONMENTS"),
+            "cmd_record " + " ".join(shlex.quote(arg) for arg in args),
+        ])
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=self._git_env())
 
 
 if __name__ == "__main__":

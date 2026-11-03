@@ -42,6 +42,15 @@
 #               recorded as superseded, and only after checking the current tee
 #               is recorded and running. Never enumerates by tag.
 #   ./crosshost.sh down --dry-run   list what would be terminated, delete nothing
+#   ./crosshost.sh record --environment staging|production
+#               append the app an environment runs to releases/catalog.json:
+#               `release` registers the measured bundle once, `activate` moves
+#               the environment onto it, and the entry is committed on its own.
+#               Run it after that environment is serving the app; nothing in
+#               build/up/deploy calls it. Production inherits staging's release
+#               when no identity is given; --from <env> names a different
+#               source. --dry-run prints the calls instead of writing them,
+#               --no-commit leaves the commit to the operator.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # cloudtest/snp
 # The host shell may carry PYTHONHOME/PYTHONPATH injected by an unrelated tool
@@ -73,6 +82,20 @@ POLICY_DIR="${SNP_POLICY_DIR:-${CERTS_DIR}/policy}"
 # overwritten everything else. A single mutable policy directory cannot answer
 # that question (see cmd_deploy).
 BUNDLES_DIR="${CLOUDTEST}/bin/bundles"
+# The catalog only knows the environments Hive renders a page for. Keeping the
+# list here makes a typo fail at the call site: 'prod' and 'production' would
+# otherwise each collect their own history while the page for the environment
+# that is actually deployed keeps showing nothing.
+RECORD_ENVIRONMENTS="staging production"
+# require_record_environment <name> <flag>: both record flags draw from that one
+# list, so a name outside it is rejected before anything is looked up.
+require_record_environment() {
+  case " ${RECORD_ENVIRONMENTS} " in
+    *" $1 "*) return 0 ;;
+  esac
+  log "record: $2 must be one of: ${RECORD_ENVIRONMENTS}"
+  exit 1
+}
 # The layout `deploy` creates on the ordinary host: ./tee (binaries + logs),
 # ./mtls (certs) and ./policy (the whitelist). This is the only place the
 # whitelist's remote location is written down — the upload and the Hub's
@@ -427,6 +450,162 @@ EOF
   sleep 4
 }
 
+# cmd_record --environment staging|production
+#            [--from <environment> | --application-id snp-app:<hex>]
+#            [--release-url <url>] [--dry-run] [--no-commit]
+#
+# Appends the bundle an environment runs to releases/catalog.json. `release`
+# registers the measured bytes once, keyed by the digest the enclave is measured
+# to; `activate` then records which of those bytes this environment runs. Both
+# are idempotent, so re-running after a no-op deploy leaves the history alone.
+#
+# The identity comes from one of three places: --application-id when it is
+# already known, --from <environment> to inherit what another environment is
+# recorded as running, otherwise the app_hash this machine launched last.
+# Production inherits from staging when neither flag is given: this machine
+# never launches it, and that is where its builds come from.
+#
+# Run it once the environment is actually serving that app. The catalog holds an
+# expectation, and writing it before the instance exists turns a plan into a
+# claim nobody checked. Nothing in build/up/deploy calls this: a smoke test, or
+# a host that belongs to no catalogued environment, simply never records.
+#
+# The entry is committed by path (--only), so the release record carries only
+# releases/catalog.json. Pushing stays manual: which branch a deploy host sits
+# on is not this script's decision.
+cmd_record() {
+  # `exported` is declared here so the assignment below stays a plain one: a
+  # failing py would otherwise be swallowed by the `local` builtin's status.
+  local env="" app_hash="" from_env="" release_url="" dry_run=0 commit=1 exported
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --environment|--application-id|--from|--release-url)
+        # An empty value would be indistinguishable from an absent flag, so
+        # `--from "$ENV"` with ENV unset would silently inherit the default.
+        { [ $# -ge 2 ] && [ -n "$2" ]; } || { log "record: $1 needs a value"; exit 1; }
+        case "$1" in
+          --environment)    env="$2" ;;
+          --application-id) app_hash="${2#snp-app:}" ;;
+          --from)           from_env="$2" ;;
+          --release-url)    release_url="$2" ;;
+        esac
+        shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      --no-commit) commit=0; shift ;;
+      *) log "record: unknown argument $1"; exit 1 ;;
+    esac
+  done
+  require_record_environment "${env}" --environment
+  local catalog="${REPO_ROOT}/releases/catalog.json"
+  if [ -n "${app_hash}" ] && [ -n "${from_env}" ]; then
+    log "record: --application-id and --from name the same thing; pass one"
+    exit 1
+  fi
+  # Staging is the environment this machine launches, so state is the right
+  # default there. Production is never launched from here by definition, and its
+  # usual content is the build staging just proved, so it inherits by default.
+  # A third environment gets no default: it has to say where its identity is.
+  if [ -z "${app_hash}" ] && [ -z "${from_env}" ] && [ "${env}" = "production" ]; then
+    from_env="staging"
+  fi
+  # A promotion should not need a digest copied out of a log: what the other
+  # environment is recorded as running is what this one runs now. export_catalog
+  # owns the replay that decides that, so ask it instead of re-deriving it here.
+  if [ -n "${from_env}" ]; then
+    require_record_environment "${from_env}" --from
+    # Capture, then parse: a failing export should surface the catalog tool's
+    # own complaint instead of a parser traceback over empty input.
+    exported="$(py "${DEPLOY_DIR}/release_catalog.py" export \
+      --catalog "${catalog}" --environment "${from_env}")"
+    app_hash="$(printf '%s' "${exported}" |
+      py -c 'import json,sys; print((json.load(sys.stdin)["current_application_id"] or "")[8:])')"
+    if [ -z "${app_hash}" ]; then
+      log "record: ${from_env} has no active release to copy"
+      exit 1
+    fi
+  fi
+  # Only consulted when the two sources above left it empty.
+  app_hash="${app_hash:-$(tee_field app_hash 2>/dev/null || true)}"
+  if [ -z "${app_hash}" ]; then
+    log "record: no app identity; pass --from <environment> or --application-id snp-app:<hex>"
+    exit 1
+  fi
+  # archived_bundle re-hashes the file it returns, so a bundle filed under the
+  # wrong name cannot be recorded under this identity.
+  local bundle manifest
+  if ! bundle="$(archived_bundle "${app_hash}")"; then
+    log "record: no archived bundle measures snp-app:${app_hash}"
+    log "record: build it again (./crosshost.sh build) to file the bundle and its sidecar"
+    exit 1
+  fi
+  manifest="${BUNDLES_DIR}/${app_hash}.tar.build.json"
+  if [ ! -f "${manifest}" ]; then
+    log "record: ${manifest} is missing"
+    log "record: only bundles built since the release catalog carry a sidecar"
+    exit 1
+  fi
+  local id="snp-app:${app_hash}"
+  # register_release refuses to relabel a digest, so a build that is already
+  # published keeps the URL it was published under. Deriving a fresh default
+  # here would collide with an explicit one the operator passed once, which is
+  # exactly what promoting the same build from staging to production looks like.
+  if [ -z "${release_url}" ] && [ -f "${catalog}" ]; then
+    release_url="$(py -c 'import json,sys; print(next((r.get("release_url", "") for r in json.load(open(sys.argv[1]))["releases"] if r["application_id"] == sys.argv[2]), ""))' "${catalog}" "${id}")"
+  fi
+  # Otherwise fall back to the build's own commit: a URL is required, and it has
+  # to be a pure function of the manifest to stay stable across rebuilds.
+  if [ -z "${release_url}" ]; then
+    release_url="$(py -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m["source_repository"] + "/commit/" + m["source_commit"])' "${manifest}")"
+  fi
+
+  # Name the source when the digest was inherited: production defaults to
+  # staging, so the value on this line is usually not one the operator typed.
+  log "record: ${env} <- ${id}${from_env:+ (inherited from ${from_env})}"
+  log "record: bundle ${bundle}"
+  if [ "${dry_run}" = 1 ]; then
+    log "record: dry-run; nothing written"
+    log "  release  --catalog ${catalog} --bundle ${bundle} --manifest ${manifest} --release-url ${release_url}"
+    log "  activate --catalog ${catalog} --environment ${env} --application-id ${id}"
+    return 0
+  fi
+  # Checked before writing, not after: an untracked catalog cannot take the
+  # commit below, and one this branch does not carry is missing outright, which
+  # the catalog tool reports as a bare ENOENT. Refuse with the reason instead.
+  # --no-commit is exempt: there the operator adds and commits the file.
+  if [ "${commit}" = 1 ] &&
+    ! git -C "${REPO_ROOT}" ls-files --error-unmatch -- "${catalog}" >/dev/null 2>&1; then
+    log "record: ${catalog#"${REPO_ROOT}"/} is not tracked on this branch"
+    log "record: switch to the branch that carries it, or add the file yourself"
+    exit 1
+  fi
+  py "${DEPLOY_DIR}/release_catalog.py" release --catalog "${catalog}" \
+    --bundle "${bundle}" --manifest "${manifest}" --release-url "${release_url}"
+  py "${DEPLOY_DIR}/release_catalog.py" activate --catalog "${catalog}" \
+    --environment "${env}" --application-id "${id}"
+  # States what the file holds rather than claiming a write: the catalog tool
+  # skips the write when nothing changed, which is the normal case for a repeat.
+  log "record: ${catalog#"${REPO_ROOT}"/} holds ${env} -> ${id}"
+  if [ "${commit}" = 0 ]; then
+    log "record: --no-commit; review the catalog and commit it yourself"
+    return 0
+  fi
+  # Compare against HEAD, not the index. A copy staged by an earlier attempt
+  # must not make an unchanged catalog look dirty, and 'git commit --only'
+  # below takes this path from the working tree either way.
+  if git -C "${REPO_ROOT}" diff --quiet HEAD -- "${catalog}"; then
+    log "record: catalog already records ${env} -> ${id}; nothing to commit"
+    return 0
+  fi
+  # --only keeps whatever else the operator had staged out of the history: a
+  # release record should carry one app, not somebody's half-finished edit.
+  local subject body
+  subject="chore(release): record ${env} as ${id}"
+  body="$(py -c 'import json,sys; m=json.load(open(sys.argv[1])); print("policy  " + m["policy_hash"]); print("source  " + m["source_commit"])' "${manifest}")"
+  git -C "${REPO_ROOT}" --no-pager diff --stat HEAD -- "${catalog}"
+  git -C "${REPO_ROOT}" commit --only --quiet -m "${subject}" -m "${body}" -- "${catalog}"
+  log "record: committed $(git -C "${REPO_ROOT}" --no-pager log --oneline -1)"
+}
+
 cmd_drive() {
   log "step: drive 2 chat requests via host Hub"
   remote_exec "$(host_field public_ip)" bash <<'EOF'
@@ -553,6 +732,7 @@ case "${1:-}" in
   deploy)  cmd_deploy ;;
   drive)   cmd_drive ;;
   verify)  cmd_verify ;;
+  record)  cmd_record "${@:2}" ;;
   down)    cmd_down "${@:2}" ;;
   *)
     awk 'NR==1{next} /^set -euo/{exit} {sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}"

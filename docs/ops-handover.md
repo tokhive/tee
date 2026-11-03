@@ -1,6 +1,6 @@
 # 从零部署 TEE：运维移交手册
 
-本文是移交给运维的从零部署手册，覆盖四件事：造信任根、造证书、打镜像、起机密实例。读者不需要读过本仓库的其它文档，但需要一台 Linux 构建机和 AWS 权限。
+本文是移交给运维的从零部署手册，覆盖四件事：造信任根、造证书、打镜像、起机密实例；最后说明每次发版怎么留记录。读者不需要读过本仓库的其它文档，但需要一台 Linux 构建机和 AWS 权限。
 
 适用范围：双机部署，一台普通机器跑 Hub（仓库 `tokhive-hive`），一台 SEV-SNP 机密实例跑 TEE。本仓库只交付 TEE 侧；Hub 的代码与进程管理在另一个仓库。
 
@@ -96,7 +96,7 @@ TOKENHIVE_INSTANCE_TYPE=c6a.large
 
 ## 2. 从零造 Secure Boot 信任根
 
-**只在还没有任何 AMI 时做这一步。** 一旦有镜像在跑，轮换 R 就要连同 Hub 一起重编（见 §11）。
+**只在还没有任何 AMI 时做这一步。** 一旦有镜像在跑，轮换 R 就要连同 Hub 一起重编（见 §12）。
 
 所有命令在 `deploy/secure-boot/` 内执行：
 
@@ -152,7 +152,7 @@ uefivars -i edk2 -o aws -I vars.fd \
 
 - `PK.key`、`KEK.key`、`R.key` 只存离线密钥库，至少两份、不同介质。
 - 证书、`.crt.der`、`.pub.pem`、`.esl`、`GUID.txt`、`aws-uefi-data.b64` 是公开材料，留在仓库。
-- `R.key` 是发布签名私钥，丢了就造不出同身份的新镜像；没泄露就没有安全问题，但恢复要轮换 R 并重编 Hub（见 §11）。
+- `R.key` 是发布签名私钥，丢了就造不出同身份的新镜像；没泄露就没有安全问题，但恢复要轮换 R 并重编 Hub（见 §12）。
 
 ## 3. 从零造 mTLS 证书
 
@@ -276,7 +276,39 @@ TOKENHIVE_TEE_TIMING=summary \
 
 `down --superseded` 会先确认当前 TEE 已记录且在运行，再按记录逐个核对双 tag；它从不按 tag 枚举。Hub 是否真的切过去了，它看不到，所以第 2 步必须人工确认。
 
-## 8. 拆除与安全边界
+## 8. 记录每次发版
+
+环境开始服务某个构建之后，把这件事记一笔。手工跑一次 `record`：`build`、`up`、`deploy` 都不调用它，没在某个环境真正服务过的构建不会进历史。记的是期望；写早一步，就是一句没人核对过的话。
+
+```bash
+cd cloudtest/snp
+
+# 测试版：身份取 crosshost.json 里本机最后起的构建
+./crosshost.sh record --environment staging
+
+# 生产版：默认沿用测试版当前启用的那个构建
+./crosshost.sh record --environment production
+
+# 来源没登记过、或要记另一个构建时，才显式给身份
+./crosshost.sh record --environment production --application-id 'snp-app:<sha256>'
+```
+
+一条命令做三件事：`release` 按摘要登记被测量的 bundle，`activate` 标记该环境在跑它，最后 `git commit --only releases/catalog.json`。提交只含这一个文件，已暂存的其它改动不会被卷进来；推送留给人工决定。
+
+生产版的默认来源是 `staging`：本机从不启动生产机，而生产跑的就是测试版验证过的那个构建。要换来源用 `--from <环境>`，它读的是清单里已有的记录，所以那个环境必须先登记过。
+
+在打包并起机的那台机器上跑：它要用 `cloudtest/bin/bundles/<sha256>.tar` 与同名 `.tar.build.json` 侧车重算哈希并取来源、策略哈希，缺任何一样都只能重新 `build`。分支上没有 `releases/catalog.json` 会被直接拒绝，先换到带着它的分支。
+
+环境名只接受 `staging` 与 `production`，与 Hive 页面读的导出视图同名；拼成 `prod` 不会报错，只会另起一段没人看的历史。
+
+```bash
+./crosshost.sh record --environment staging --dry-run     # 只打印解析结果，不写文件
+./crosshost.sh record --environment staging --no-commit   # 写清单但不提交，diff 自己看
+```
+
+不想留下提交，就用上面两条里的任意一条；完全不想记录就别跑 `record`，其余流程不受影响。清单的字段、只追加规则与 `validate` / `export` 的用法见 `docs/tee-release-catalog.md`。
+
+## 9. 拆除与安全边界
 
 ```bash
 ./crosshost.sh down --dry-run     # 只列出会删什么
@@ -286,7 +318,7 @@ TOKENHIVE_TEE_TIMING=summary \
 
 **不要跑裸 `down`。** 它按 `tokenhive-TEE: true` 与 `user: <值>` 删除该用户名下所有 cloudtest 实例；如果 Hub 也带同一组 tag，它会一起消失。Hub 独立部署时永远用 `--tee-only`。
 
-## 9. 交接清单
+## 10. 交接清单
 
 | 物品 | 位置 | 性质 | 交接要求 |
 | --- | --- | --- | --- |
@@ -297,9 +329,9 @@ TOKENHIVE_TEE_TIMING=summary \
 | `cloudtest/bin/bundles/<digest>.tar` | `bin/bundles/` | 公开 | 保留与在跑 TEE 匹配的那份 |
 | `cloudtest/crosshost.json` | `cloudtest/` | 状态 | 含 `tee.app_hash`、实例 ID，随部署保留 |
 | `deploy/.env`、`cloudtest/.env` | 各自目录 | 含秘密 | 密码库；不入库 |
-| AMI ID + `snp-app` 标签 | AWS | 状态 | 记入部署台账 |
+| AMI ID + `snp-app` 标签 | AWS | 状态 | 记下 AMI ID；`snp-app` 摘要用 `record` 落进 `releases/catalog.json`（§8） |
 
-## 10. 验收与排障速查
+## 11. 验收与排障速查
 
 | 现象 | 先看哪里 | 结论 |
 | --- | --- | --- |
@@ -311,7 +343,7 @@ TOKENHIVE_TEE_TIMING=summary \
 | 串口被 handshake 错误刷屏 | `cmd/tee/listenerlog.go` | 已折叠为每分钟一行计数；看第一行原因 |
 | 一条日志都没有 | 实例是否有 instance profile | 没有 profile 只有串口；挂 `TOKENHIVE_TEE_INSTANCE_PROFILE` |
 
-## 11. 四条硬约束
+## 12. 四条硬约束
 
 1. **R 公钥没有自动校验。** `snp-build.sh` 只检查 `R.pub.pem` 存在，不比对 `shared/secure_boot_release_pub.pem`。每次动 R 都手工跑一次 §2 的两行 sha256。
 2. **换 R = 重编 Hub。** Hub 的 release 公钥是 `//go:embed`。`crosshost.sh build` 末尾会重编 Hub（`run.sh build`），所以先同步公钥再构建就一致；反过来就会运行期被拒。
