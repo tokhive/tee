@@ -24,7 +24,7 @@
 ```bash
 sudo apt-get update
 sudo apt-get install -y openssl efitools docker.io qemu-utils python3-venv
-# 另需：AWS CLI v2、Go 1.27.3+、GNU tar
+# 另需：AWS CLI（v1、v2 均可）、Go 1.27.3+、GNU tar
 
 # uefivars 装进独立 venv，再软链到 /usr/local/bin。
 # Ubuntu 24.04 的系统 Python 受 PEP 668 保护，直接 pip install 会被

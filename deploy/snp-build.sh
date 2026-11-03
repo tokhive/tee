@@ -163,23 +163,35 @@ PY
     fi
     rm -f /tmp/snp-mb.err
     # A single PUT rather than `s3 cp`: cp switches to a multipart upload above
-    # 8 MB, and S3 then reports a composite checksum (sha256 of the part
-    # checksums, suffixed "-N") which can never equal the file's own digest.
-    # The VMDK is ~31 MB, far below the 5 GB single-PUT limit.
+    # 8 MB and prints nothing verifiable. The VMDK is ~31 MB, far below the 5 GB
+    # single-PUT limit, so one request is simpler and leaves nothing for the
+    # read-back below to reassemble.
     aws --region "${region}" s3api put-object \
-        --bucket "${bucket}" --key "${key}" --body "${vmdk}" --checksum-algorithm SHA256 >/dev/null
-    # Fail closed. import-snapshot reads whatever sits at this key, so prove the
-    # object is the bytes we just wrote before paying for an import and before
-    # registering an AMI that claims a digest. This is the check whose absence
-    # turned a silent no-op upload into a mislabelled image.
-    local want got
-    want="$(python3 -c 'import base64,hashlib,sys; print(base64.b64encode(hashlib.sha256(open(sys.argv[1],"rb").read()).digest()).decode())' "${vmdk}")"
+        --bucket "${bucket}" --key "${key}" --body "${vmdk}" >/dev/null
+    # Fail closed. import-snapshot reads whatever sits at this key, so read the
+    # object back and compare it to the bytes we just wrote before paying for an
+    # import and before registering an AMI that claims a digest. This is the
+    # check whose absence turned a silent no-op upload into a mislabelled image.
+    #
+    # Read back and hash locally rather than asking S3 through
+    # `put-object --checksum-algorithm` + `head-object --checksum-mode`: both
+    # arrived with S3's additional checksums at the end of 2021, and an older
+    # client rejects them as unknown options before sending any request, which
+    # is how the build died on a box with a distro-provided awscli. A download
+    # needs nothing that has not existed since 2006, and unlike a presence or
+    # size check it also catches a stale object sitting at the same key.
+    local want got=""
+    want="$(sha256sum "${vmdk}" | cut -d' ' -f1)"
+    echo "[image] verifying the object reads back byte for byte..."
+    if aws --region "${region}" s3api get-object \
+        --bucket "${bucket}" --key "${key}" "${tmp}/echo.vmdk" >/dev/null 2>&1; then
+        got="$(sha256sum "${tmp}/echo.vmdk" | cut -d' ' -f1)"
+    fi
     rm -rf "${tmp}"
-    got="$(aws --region "${region}" s3api head-object --bucket "${bucket}" --key "${key}" --checksum-mode ENABLED --query ChecksumSHA256 --output text 2>/dev/null || true)"
     [[ -n "${got}" && "${got}" == "${want}" ]] || {
         echo "[image] upload verification failed for s3://${bucket}/${key}" >&2
-        echo "[image]   object checksum = ${got:-<unreadable>}" >&2
-        echo "[image]   local  checksum = ${want}" >&2
+        echo "[image]   object sha256 = ${got:-<unreadable>}" >&2
+        echo "[image]   local  sha256 = ${want}" >&2
         echo "[image] refusing to import: the image would not measure the digest it is tagged with" >&2
         exit 1
     }

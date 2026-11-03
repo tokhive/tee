@@ -19,7 +19,7 @@ the two properties that close the hole: the staging key names the app, and the
 bytes at that key are proven to be this build's before an import is paid for.
 """
 
-import base64
+import hashlib
 import json
 import os
 import re
@@ -40,14 +40,15 @@ KEY = f"snp-tokenhive-{HEX}.vmdk"
 # A previous build with the same app can have left an object at this same
 # content-addressed key: the disk is not byte-deterministic (the ESP carries FAT
 # timestamps), so "same key" does not imply "same bytes".
-STALE_CHECKSUM = base64.b64encode(b"\x00" * 32).decode()
+STALE_CHECKSUM = hashlib.sha256(b"\x00" * 32).hexdigest()
 
 # Stub `aws`. Keeps a tiny object store on disk so that "the upload did not
 # land" and "the object is stale" are states the test can actually produce.
 AWS_STUB = r'''#!/usr/bin/env python3
-import base64, hashlib, json, os, sys
+import hashlib, json, os, shutil, sys
 
 store_path, log_path = os.environ["AWS_STUB_STORE"], os.environ["AWS_STUB_LOG"]
+blob_dir = os.environ["AWS_STUB_BLOBS"]
 with open(store_path) as f:
     store = json.load(f)
 args = sys.argv[1:]
@@ -61,8 +62,8 @@ def save():
     with open(store_path, "w") as f:
         json.dump(store, f)
 
-def checksum(path):
-    return base64.b64encode(hashlib.sha256(open(path, "rb").read()).digest()).decode()
+def digest(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
 
 def query_of(args):
     return args[args.index("--query") + 1] if "--query" in args else ""
@@ -77,16 +78,19 @@ elif service == "s3api" and args[1] == "put-object":
     if os.environ.get("AWS_STUB_NOOP") == "1":
         pass                      # the bug under test: the upload does nothing
     else:
-        store[key] = checksum(body)
+        store[key] = digest(body)
+        shutil.copyfile(body, os.path.join(blob_dir, key))
         save()
 elif service == "s3" and args[1] == "rm":
-    store.pop(args[2].split("/", 3)[3], None)
+    key = args[2].split("/", 3)[3]
+    if store.pop(key, None) is not None:
+        os.remove(os.path.join(blob_dir, key))
     save()
-elif service == "s3api" and args[1] == "head-object":
+elif service == "s3api" and args[1] == "get-object":
     key = args[args.index("--key") + 1]
     if key not in store:
         sys.exit(254)             # aws exits non-zero: no such object
-    print(store[key])
+    shutil.copyfile(os.path.join(blob_dir, key), args[-1])
 elif service == "ec2" and args[1] == "import-snapshot":
     print("import-snap-0test")
 elif service == "ec2" and args[1] == "describe-import-snapshot-tasks":
@@ -145,9 +149,15 @@ class PackageAwsTest(unittest.TestCase):
         secure_boot.mkdir()
         (secure_boot / "aws-uefi-data.b64").write_text("dGVzdA==\n")
 
+        blobs = tmp / "blobs"
+        blobs.mkdir()
         store, log = tmp / "store.json", tmp / "aws.log"
         store.write_text(json.dumps({KEY: STALE_CHECKSUM}) if preexisting else "{}")
         log.write_text("")
+        if preexisting:
+            # The stale object's bytes: 32 zero bytes, whose sha256 is
+            # STALE_CHECKSUM. Nothing else about it matches this build's disk.
+            (blobs / KEY).write_bytes(b"\x00" * 32)
 
         driver = tmp / "driver.sh"
         driver.write_text(
@@ -165,6 +175,7 @@ class PackageAwsTest(unittest.TestCase):
         env = dict(os.environ)
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
         env["AWS_STUB_STORE"], env["AWS_STUB_LOG"] = str(store), str(log)
+        env["AWS_STUB_BLOBS"] = str(blobs)
         if noop_upload:
             env["AWS_STUB_NOOP"] = "1"
         p = subprocess.run(["/bin/bash", str(driver)], capture_output=True, text=True, env=env)
@@ -216,10 +227,12 @@ class PackageAwsTest(unittest.TestCase):
 
     def test_upload_is_verified_against_the_object(self):
         p, calls, _ = self._run()
-        self.assertTrue(self._calls(calls, "s3api", "head-object"),
-                        "the build must read the object back, not assume the cp landed")
-        self.assertTrue(any("--checksum-algorithm" in c for c in calls),
-                        "the upload must request a checksum to verify against")
+        self.assertTrue(self._calls(calls, "s3api", "get-object"),
+                        "the build must read the object back, not assume the put landed")
+        # The verification must survive a stock Ubuntu awscli, which rejects
+        # both flags as unknown options before sending a request.
+        self.assertFalse(any("--checksum-algorithm" in c or "--checksum-mode" in c for c in calls),
+                         "verification must not depend on the 2021-12 checksum flags")
 
     def test_an_upload_that_did_not_land_never_becomes_an_image(self):
         # cp does nothing, as it silently did in the field.
