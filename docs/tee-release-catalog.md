@@ -1,6 +1,6 @@
 # TEE 应用身份发布清单
 
-`releases/catalog.json` 是供 Hive 用户页面及独立核对使用的版本化发布记录。它保存应用身份、策略哈希、构建来源、各环境的使用历史及撤销公告；通过 Git 提交和审查发布。`deploy/release_catalog.py` 负责生成构建清单、登记和校验记录，并导出指定环境的公开视图。工具仅操作本机文件，不创建云资源，也不自动提交、推送或发布文件。
+`releases/catalog.json` 是供 Hive 用户页面及独立核对使用的版本化发布记录。它保存应用身份、策略哈希、构建来源、各环境的使用历史及撤销公告；通过 Git 提交和审查发布。`deploy/release_catalog.py` 负责生成构建清单、登记和校验记录，并导出指定环境的公开视图。该工具仅操作本机文件，不创建云资源，也不自动提交或推送；需要在部署机上一条命令完成“登记并提交”时用 `cloudtest/snp/crosshost.sh record`，它只提交 `releases/catalog.json` 这一个文件，且从不推送。
 
 ## 构建记录与正式发布
 
@@ -60,7 +60,7 @@ python3 deploy/release_catalog.py activate \
   --application-id 'snp-app:<64-character-lowercase-hex>'
 ```
 
-默认记录当前 UTC 时间。补录时可显式传入 `--at '2026-11-03T08:00:00Z'` 或其他带时区的 RFC 3339 时间。时间应为 Hive 实际切换并确认使用该 TEE 的时间；启动实例、注册 AMI 或构建完成都不证明 Hive 已经切换，因此现有云启动工具不会自动执行 `activate`。
+默认记录当前 UTC 时间。补录时可显式传入 `--at '2026-11-03T08:00:00Z'` 或其他带时区的 RFC 3339 时间。时间应为 Hive 实际切换并确认使用该 TEE 的时间；启动实例、注册 AMI 或构建完成都不证明 Hive 已经切换，因此 `up`／`deploy` 都不会自动执行 `activate`。下一节的 `record` 把这两步合起来，同样需要人工触发。
 
 切换到不同版本时，工具先追加旧版本的停用事件，再追加新版本的启用事件，两者使用同一个切换时间。回滚时重新引用旧版本，产生新的使用区间，不覆盖旧区间。各环境的状态相互独立。
 
@@ -73,6 +73,30 @@ python3 deploy/release_catalog.py deactivate \
 ```
 
 工具拒绝未知发布身份、与当前身份不符的停用、早于正式发布的部署，以及倒序插入同一环境的切换事件。它记录操作人声明的部署事实，不会自行检查远端 Hive 是否健康，也不会替操作人执行切换。
+
+## 从部署机一键记录
+
+`cloudtest/snp/crosshost.sh record` 把“登记发布”和“启用环境”合成一次操作，测试版与生产版都用它：
+
+```bash
+# 本机启动过、状态里记着 app_hash 的环境
+./crosshost.sh record --environment staging
+
+# 生产机不由本机启动时，身份从命令行给
+./crosshost.sh record --environment production --application-id 'snp-app:<hex>'
+```
+
+它按顺序做五件事：从 `cloudtest/crosshost.json` 取 `app_hash`（或读 `--application-id`）；用 `archived_bundle` 取回归档并重算 SHA-256 核对；要求存在 `<sha256>.tar.build.json` 侧车文件；依次调用 `release` 与 `activate`；最后 `git commit --only releases/catalog.json`。`--release-url` 缺省为构建来源的提交链接，要指向发布说明或 PR 就显式传入；同一应用身份的链接必须保持不变，否则工具拒绝重新登记。
+
+`--only` 意味着提交只含这一个文件，运维已经暂存的其它改动不会被卷进发布记录。提交后不推送：部署机在哪个分支上、什么时候推，不该由脚本决定。
+
+不想记录时有三种做法，都不影响已有流程：
+
+- `build`、`up`、`deploy` 从不调用 `record`。没有在某个环境真正服务过的构建不会进历史。
+- `--dry-run` 只打印两条调用及其解析结果，不写文件也不提交，用来核对身份和链接。
+- `--no-commit` 写清单但不提交，先看 diff 再决定。
+
+环境名只接受 `staging` 与 `production`。名字是 Hive 导出视图的连接键，拼成 `prod` 不会报错，只会另起一段没人读的历史。只有侧车文件出现之后构建的 bundle 才能登记，更早的归档要重新构建一次才能拿到构建来源与策略哈希。
 
 ## 撤销与历史保留
 
