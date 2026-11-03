@@ -16,7 +16,7 @@
 | `policy_hash` | 归档内实际 `policy/policy.cbor` 的回执策略哈希，对应 verifier 的 `Expected policy hash`。 |
 | `policy_file_sha256` | 策略文件原始字节的普通 SHA-256，用于产物核对；不能代替 `policy_hash`。 |
 | `ca_bundle_sha256` | 归档内实际公共根证书包的摘要。 |
-| `source_repository`、`source_commit`、`source_dirty` | 编译前捕获并在编译后复核的源码来源；登记时不会改成当前检出的提交。`source_dirty` 只表示“被编译的源码与该提交不一致”：密钥证书（`*.pem`／`*.key`／`*.crt`／`*.der`／`*.esl` 等）、`releases/`、`docs/`、`.env` 的改动以及未被编译读取的未跟踪文件（本地笔记、`.workbuddy/` 等）不计入；新的 `*.go`、`go.mod`／`go.sum`、`policy/` 文件仍计入。 |
+| `source_repository`、`source_commit`、`source_dirty` | 编译前捕获并在编译后复核的源码来源；登记时不会改成当前检出的提交。`source_dirty` 只表示“被编译的源码与该提交不一致”：密钥证书（`*.pem`／`*.key`／`*.crt`／`*.der`／`*.esl` 等）、Secure Boot 注册材料整目录（`deploy/secure-boot/`，含 UEFI 变量存储 `aws-uefi-data.b64`、`vars.fd` 与 GUID）、`releases/`、`docs/`、`.env` 的改动以及未被编译读取的未跟踪文件（本地笔记、`.workbuddy/` 等）不计入；新的 `*.go`、`go.mod`／`go.sum`、`policy/` 文件仍计入。 |
 | `built_at`、`bundle_kind` | 构建结束时间与 `tee`／`single`／`stub` 类型。 |
 
 策略哈希通过 `cmd/tee-policy-info` 复用 TEE 的规范 CBOR 解码和 `policy.Hash()` 计算，计算形式为 `SHA-256("TokenHive.Policy.v1" || canonical_policy_bytes)`。不使用当前源码中的默认策略替代归档内策略；自定义策略也按实际携带的字节核验。单独检查某份归档时可运行：

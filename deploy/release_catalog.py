@@ -104,15 +104,19 @@ def git(repo, *arguments):
 # were reproducible bit for bit:
 #
 # Key and certificate material is operator property, rotated in the working tree
-# as ordinary business (deploy/secure-boot/*.pem, the .certs fixtures `build`
-# generates, a provider's client key dropped next to the checkout). A bundle
-# only ever receives those bytes through a SNP_* path, and when it does, the
+# as ordinary business (the deploy/secure-boot enrollment set, the .certs
+# fixtures `build` generates, a provider's client key dropped next to the
+# checkout). Secure Boot material is the whole directory on purpose: beside the
+# keys and certificates it holds the enrollment artifacts key rotation
+# regenerates with them — the UEFI variable store (aws-uefi-data.b64, vars.fd)
+# and the GUID — and it feeds the base image, never the app bundle. A bundle
+# only ever receives operator bytes through a SNP_* path, and when it does, the
 # bundle digest — which IS the application identity — pins them, so no claim in
 # the catalog is lost by ignoring their edits. The catalog itself, the docs and
 # local notes never reach the measured bytes at all.
 OPERATOR_MATERIAL = (
     "*.pem", "*.key", "*.crt", "*.der", "*.esl", "*.p12", "*.jks",
-    "*.env", "releases/*", "docs/*",
+    "*.env", "deploy/secure-boot/*", "releases/*", "docs/*",
 )
 # An untracked file is invisible to every commit, so it cannot contradict the
 # commit the catalog names. Only the ones a compile would silently pick up are

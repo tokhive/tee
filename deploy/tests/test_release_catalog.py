@@ -160,6 +160,7 @@ class ReleaseCatalogTest(unittest.TestCase):
         # a bundle that carries any of it carries it under a SNP_* path — so the
         # digest, not the commit, is what pins those bytes.
         for path, content in {"deploy/secure-boot/PK.crt.pem": "original key",
+                              "deploy/secure-boot/aws-uefi-data.b64": "original UEFI store",
                               "docs/notes.md": "original notes",
                               "releases/catalog.json": "{}"}.items():
             (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
@@ -168,6 +169,8 @@ class ReleaseCatalogTest(unittest.TestCase):
         self.run_git("commit", "-qm", "keys, notes and catalog")
         (self.repo / "deploy/secure-boot/PK.crt.pem").write_text("rotated key")
         (self.repo / "deploy/secure-boot/PK.esl").write_text("regenerated ESL")
+        (self.repo / "deploy/secure-boot/aws-uefi-data.b64").write_text("re-enrolled UEFI store")
+        (self.repo / "deploy/secure-boot/vars.fd").write_text("fresh NVRAM")
         (self.repo / "docs/notes.md").write_text("local notes")
         (self.repo / "releases/catalog.json").write_text('{"version": 1}')
         (self.repo / "hub-client-key.pem").write_text("private key")
