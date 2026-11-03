@@ -119,6 +119,29 @@ connection, proxy-authorization, te, upgrade
 
 TEE **不感知模型**：JobSpec 无模型字段，回执也不含模型。模型→价格的映射由 Hub 侧维护（卖家报价表），因此**回执不能证明"用了哪个模型"**，只能证明"发生了这次字节交换、多少字节、什么完成状态"。若你的业务需要价格审计，请在 Hub 侧留痕。
 
+### 3.3 OpenAI Platform API Key 接入
+
+内置策略 `policy/whitelist.json` 允许 `api.openai.com:443` 上的以下调用：
+
+| 方法与路径 | 用途 | 流式响应 |
+|---|---|---|
+| `POST /v1/responses` | Responses 推理 | 允许 |
+| `POST /v1/chat/completions` | Chat Completions 推理 | 允许 |
+| `GET /v1/models` | 查询该凭据可用的模型 | 不允许 |
+| `GET /v1/models/{model}` | 查询单个模型信息 | 不允许 |
+
+路径按现有的**段前缀**规则匹配：`/v1/models` 也覆盖非空子路径；它不是精确到上述两个模型查询路径的匹配。模型查询规则不允许任何 query 参数，且只允许 `GET`，不放行删除模型、账单、项目管理或 API Key 管理接口。
+
+API Key 继续走现有密封凭据链路：卖家 Agent 将 `Secret{Token: <API Key>, Header: "authorization", Scheme: "Bearer"}` 密封到 TEE 收件公钥，Hub 只转发信封；TEE 解密后注入 `Authorization: Bearer <API Key>`。不要把 Key 放入 `JobSpec.Headers`；调用方设置 `Authorization` 仍会被拒绝。
+
+需要指定组织／项目时，`JobSpec.Headers` 可携带 `OpenAI-Organization` 和 `OpenAI-Project`。两者均可省略；TEE 只校验头名是否允许并原样转发，组织／项目访问权限由 OpenAI 校验。若市场需要将卖家额度绑定到特定组织／项目，Hub 应按卖家登记信息构造这些头。策略的 hosts、路径规则和请求头是全局集合，本次新增的规则与请求头同样适用于其他已允许的 host，不构成按 host 隔离的权限。
+
+这只补齐 TEE 的出口策略；Hive／Bee 仍需实现官方 API Key 的登记、凭据密封、路由和额度／价格处理。TEE 不查询或承诺 Key 的剩余额度。
+
+**部署**：白名单被嵌入测量 bundle，修改后必须重建并部署 TEE，记录新的 `Policy.Hash()` 和应用身份；`Policy.Hash()` 使用协议定义的 canonical CBOR 与域分离，不能用 JSON 文件的 SHA-256 代替。Hive 应升级固定的 TEE 依赖以加载同一白名单，并将 `HIVE_TEE_EXPECTED_APP` 更新为新镜像的可信应用身份；验证端也应使用对应的新身份。发布记录中保留旧身份与策略哈希的关联，供历史回执核验。
+
+官方协议参考：[鉴权与组织／项目请求头](https://developers.openai.com/api/reference/overview#authentication)、[模型列表](https://developers.openai.com/api/reference/resources/models/methods/list)。
+
 ---
 
 ## 4. `POST /v1/execute` 协议
