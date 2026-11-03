@@ -48,6 +48,12 @@ jobs:
           go-version: '1.27.3'
       - name: Test canonical policy inspection
         run: go test ./cmd/tee-policy-info
+      # The narrow step names a policy-hash regression straight in the Checks
+      # list; the broad one then reuses its cached result and proves the rest of
+      # the module still builds. Both stay on purpose: dropping either one loses
+      # either the attribution or the coverage, and the overlap is cached.
+      - name: Test the Go module
+        run: go test ./...
       - name: Test build provenance and release history
         run: python3 -m unittest discover -s deploy/tests -v
       - name: Validate catalog and preserve published history

@@ -116,7 +116,7 @@ Hive 后续应固定或记录读取的清单 Git 提交，把该环境的登记�
 ## 本地验证
 
 ```bash
-go test ./cmd/tee-policy-info
+go test ./...
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s deploy/tests -v
 python3 deploy/release_catalog.py validate
 ```
