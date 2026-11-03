@@ -233,21 +233,34 @@ class RecordTest(unittest.TestCase):
         self.deploy = root / "deploy"
         self.deploy.mkdir()
         self.calls = root / "calls.log"
-        # Stand-in for release_catalog.py that logs the argv it was handed and
-        # marks the catalog, once per subcommand, as the real tool would append
-        # an event. The tool's own behaviour is deploy/tests' subject; here the
+        # Stand-in for release_catalog.py: logs the argv it was handed and keeps
+        # the catalog in the shape record reads back (a digest keeps the URL it
+        # was published under, activating what is already active changes
+        # nothing). The tool's real behaviour is deploy/tests' subject; here the
         # point is the contract record passes it.
-        self.deploy.joinpath("release_catalog.py").write_text(
-            "import os, sys\n"
-            "argv = sys.argv[1:]\n"
-            f"with open({str(self.calls)!r}, 'a') as log:\n"
-            "    log.write(' '.join(argv) + '\\n')\n"
-            "if '--catalog' in argv:\n"
-            "    path = argv[argv.index('--catalog') + 1]\n"
-            "    line = argv[0] + '\\n'\n"
-            "    if not (os.path.exists(path) and line in open(path).read()):\n"
-            "        with open(path, 'a') as catalog:\n"
-            "            catalog.write(line)\n")
+        stub = """import json, os, sys
+argv = sys.argv[1:]
+with open(@CALLS@, 'a') as log:
+    log.write(' '.join(argv) + '\\n')
+if '--catalog' not in argv:
+    sys.exit(0)
+path = argv[argv.index('--catalog') + 1]
+data = json.load(open(path))
+if argv[0] == 'release':
+    identity = 'snp-app:' + os.path.basename(argv[argv.index('--manifest') + 1]).split('.')[0]
+    if not any(r['application_id'] == identity for r in data['releases']):
+        data['releases'].append({'application_id': identity,
+                                 'release_url': argv[argv.index('--release-url') + 1]})
+else:
+    identity = argv[argv.index('--application-id') + 1]
+    environment = argv[argv.index('--environment') + 1]
+    active = {e['environment']: e['application_id'] for e in data['deployment_events']}
+    if active.get(environment) != identity:
+        data['deployment_events'].append({'environment': environment, 'application_id': identity})
+with open(path, 'w') as catalog:
+    json.dump(data, catalog)
+"""
+        self.deploy.joinpath("release_catalog.py").write_text(stub.replace("@CALLS@", repr(str(self.calls))))
         self.hosts = root / "crosshost.json"
         payload = b"the bundle the enclave is measured with"
         self.digest = hashlib.sha256(payload).hexdigest()
@@ -348,6 +361,31 @@ class RecordTest(unittest.TestCase):
         out = self._run("--environment", "staging")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("nothing to commit", out.stdout)
+        self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "2")
+
+    def test_record_reuses_the_url_of_an_already_published_build(self):
+        # register_release refuses to relabel a digest, so the default here must
+        # not be derived fresh: promoting a build that was recorded with an
+        # announcement link would otherwise fail on a URL nobody changed.
+        self.catalog.write_text(json.dumps({
+            "version": 1,
+            "releases": [{"application_id": "snp-app:" + self.digest,
+                          "release_url": "https://example.invalid/announcement"}],
+            "deployment_events": [], "revocations": []}))
+        self._state(self.digest)
+        out = self._run("--environment", "production", "--no-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("--release-url https://example.invalid/announcement", self._calls()[0])
+
+    def test_refuses_to_commit_an_untracked_catalog(self):
+        # git reports no diff for a path it does not track, so without this the
+        # run would claim "already recorded" and leave the entry out of history.
+        self._git("rm", "-q", "--cached", "releases/catalog.json")
+        self._git("commit", "-q", "-m", "drop the catalog")
+        self._state(self.digest)
+        out = self._run("--environment", "staging")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("not tracked", out.stdout + out.stderr)
         self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "2")
 
     def _state(self, app_hash):

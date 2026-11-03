@@ -476,11 +476,9 @@ cmd_record() {
     *" ${env} "*) ;;
     *) log "record: --environment must be one of: ${RECORD_ENVIRONMENTS}"; exit 1 ;;
   esac
-  # State names the app this machine launched. A production host is not launched
-  # from here, so it is recorded by identity rather than by looking around.
-  if [ -z "${app_hash}" ] && [ -f "${HOSTS}" ]; then
-    app_hash="$(tee_field app_hash 2>/dev/null || true)"
-  fi
+  # State names the app this machine launched. A production host is launched
+  # elsewhere, so it is recorded by identity rather than by looking around.
+  app_hash="${app_hash:-$(tee_field app_hash 2>/dev/null || true)}"
   if [ -z "${app_hash}" ]; then
     log "record: no app identity in state; pass --application-id snp-app:<hex>"
     exit 1
@@ -499,14 +497,20 @@ cmd_record() {
     log "record: only bundles built since the release catalog carry a sidecar"
     exit 1
   fi
-  # A release URL is required and has to stay the same across re-registrations,
-  # so the default is a pure function of the manifest. Pass a PR or announcement
-  # link when reviewers should land somewhere more useful than the commit.
+  local catalog="${REPO_ROOT}/releases/catalog.json" id="snp-app:${app_hash}"
+  # register_release refuses to relabel a digest, so a build that is already
+  # published keeps the URL it was published under. Deriving a fresh default
+  # here would collide with an explicit one the operator passed once, which is
+  # exactly what promoting the same build from staging to production looks like.
+  if [ -z "${release_url}" ] && [ -f "${catalog}" ]; then
+    release_url="$(py -c 'import json,sys; print(next((r.get("release_url", "") for r in json.load(open(sys.argv[1]))["releases"] if r["application_id"] == sys.argv[2]), ""))' "${catalog}" "${id}")"
+  fi
+  # Otherwise fall back to the build's own commit: a URL is required, and it has
+  # to be a pure function of the manifest to stay stable across rebuilds.
   if [ -z "${release_url}" ]; then
     release_url="$(py -c 'import json,sys; m=json.load(open(sys.argv[1])); print(m["source_repository"] + "/commit/" + m["source_commit"])' "${manifest}")"
   fi
 
-  local catalog="${REPO_ROOT}/releases/catalog.json" id="snp-app:${app_hash}"
   log "record: ${env} <- ${id} from ${bundle}"
   if [ "${dry_run}" = 1 ]; then
     log "record: dry-run; nothing written"
@@ -524,6 +528,15 @@ cmd_record() {
   if [ "${commit}" = 0 ]; then
     log "record: --no-commit; review the catalog and commit it yourself"
     return 0
+  fi
+  # git reports no diff for a path it does not track, so an untracked catalog
+  # would read as "already recorded" and leave the entry out of history without
+  # anyone noticing. Say so instead: a checkout that predates the catalog has to
+  # be moved onto one that carries it.
+  if ! git -C "${REPO_ROOT}" ls-files --error-unmatch -- "${catalog}" >/dev/null 2>&1; then
+    log "record: ${catalog#"${REPO_ROOT}"/} is not tracked on this branch"
+    log "record: switch to the branch that carries it, or add the file yourself"
+    exit 1
   fi
   # Compare against HEAD, not the index. A copy staged by an earlier attempt
   # must not make an unchanged catalog look dirty, and 'git commit --only'
