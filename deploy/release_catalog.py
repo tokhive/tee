@@ -304,6 +304,10 @@ def export_catalog(catalog, environment):
         if event["action"] == "activate":
             periods.append({"application_id": event["application_id"], "activated_at": event["at"], "retired_at": None})
         else:
+            # validate_catalog guarantees a deactivation always follows the
+            # activation it retires, so this only guards against a future
+            # caller reaching export with an unvalidated catalog.
+            require(periods, "deactivation without an activation period")
             periods[-1]["retired_at"] = event["at"]
     return {
         "version": 1, "environment": environment, "current_application_id": active.get(environment),
