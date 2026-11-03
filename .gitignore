@@ -25,3 +25,7 @@ deploy/secure-boot/*.key
 .vscode/
 *.swp
 *.swo
+
+# Release catalog writer locks; public history itself is tracked.
+/releases/.*.lock
+__pycache__/
