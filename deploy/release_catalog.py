@@ -9,6 +9,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -97,10 +98,71 @@ def git(repo, *arguments):
     return result.stdout.strip()
 
 
-def capture_source(repo):
+# `source_dirty` answers exactly one question: does the commit the catalog names
+# describe the code the bundle was compiled from? Two kinds of content cannot
+# change that answer, and counting them made `record` refuse builds whose bytes
+# were reproducible bit for bit:
+#
+# Key and certificate material is operator property, rotated in the working tree
+# as ordinary business (deploy/secure-boot/*.pem, the .certs fixtures `build`
+# generates, a provider's client key dropped next to the checkout). A bundle
+# only ever receives those bytes through a SNP_* path, and when it does, the
+# bundle digest — which IS the application identity — pins them, so no claim in
+# the catalog is lost by ignoring their edits. The catalog itself, the docs and
+# local notes never reach the measured bytes at all.
+OPERATOR_MATERIAL = (
+    "*.pem", "*.key", "*.crt", "*.der", "*.esl", "*.p12", "*.jks",
+    "*.env", "releases/*", "docs/*",
+)
+# An untracked file is invisible to every commit, so it cannot contradict the
+# commit the catalog names. Only the ones a compile would silently pick up are
+# still reported: a new Go file, a module edit, a new policy document.
+COMPILED_UNTRACKED = ("*.go", "go.mod", "go.sum", "go.work", "policy/*")
+
+
+def matches(path, patterns):
+    # fnmatch's `*` spans `/`, so a pattern matches at any depth, which is what
+    # "any private key anywhere in the tree" has to mean.
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+
+
+def working_tree_changes(repo):
+    """(status, path) for every change git reports, untracked files included.
+
+    NUL-separated porcelain is the machine-readable form: it neither quotes nor
+    escapes paths, and `git()` cannot be reused here because stripping the
+    leading space of " M path" would shift the status code.
+    """
+    result = subprocess.run(["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all", "-z"],
+                            capture_output=True, text=True)
+    require(result.returncode == 0, "could not read build source from Git")
+    fields = [field for field in result.stdout.split("\0") if field]
+    changes, index = [], 0
+    while index < len(fields):
+        status, path = fields[index][:2], fields[index][3:]
+        changes.append((status, path))
+        # A rename or copy consumes its origin path in the following field,
+        # which would otherwise be misread as a status and a path of its own.
+        index += 2 if "R" in status or "C" in status else 1
+    return changes
+
+
+def stale_source(repo):
+    """Paths whose working-tree content the recorded commit does not describe."""
+    stale = []
+    for status, path in working_tree_changes(repo):
+        if status == "??":
+            if matches(path, COMPILED_UNTRACKED):
+                stale.append(path)
+        elif not matches(path, OPERATOR_MATERIAL):
+            stale.append(path)
+    return stale
+
+
+def capture_source(repo, report=False):
     try:
         commit = git(repo, "rev-parse", "HEAD")
-        dirty = bool(git(repo, "status", "--porcelain", "--untracked-files=normal"))
+        stale = stale_source(repo)
         remote = git(repo, "remote", "get-url", "origin")
         if remote.startswith("git@") and ":" in remote:
             host, repository = remote[4:].split(":", 1)
@@ -108,7 +170,10 @@ def capture_source(repo):
         remote = remote.removesuffix(".git")
         https_url(remote)
         require(COMMIT.fullmatch(commit), "invalid Git commit")
-        return {"source_repository": remote, "source_commit": commit, "source_dirty": dirty}
+        if stale and report:
+            print("release-catalog: working tree differs from " + commit[:12] + " in: "
+                  + ", ".join(stale[:10]) + (" ..." if len(stale) > 10 else ""), file=sys.stderr)
+        return {"source_repository": remote, "source_commit": commit, "source_dirty": bool(stale)}
     except (ValueError, FileNotFoundError):
         # Source archives and local diagnostic builds may have no Git metadata.
         # They remain buildable, but cannot be registered as public releases.
@@ -188,7 +253,9 @@ def validate_manifest(value):
     require(value["bundle_sha256"] == value["application_id"][8:], "bundle digest does not match application identity")
     require(type(value["bundle_size_bytes"]) is int and value["bundle_size_bytes"] > 0, "invalid bundle size")
     require(value["bundle_kind"] == "tee", "only real TEE bundles can be registered as releases")
-    require(value["source_dirty"] is False, "dirty or unknown source cannot be registered as a release")
+    require(value["source_dirty"] is False,
+            "dirty or unknown source cannot be registered as a release: commit the source it was built "
+            "from and rebuild (keys, certificates, docs and untracked files no longer count)")
     require(isinstance(value["source_commit"], str) and COMMIT.fullmatch(value["source_commit"]), "missing source commit")
     https_url(value["source_repository"])
     for key in ("app_binary_sha256", "policy_hash", "policy_file_sha256", "ca_bundle_sha256"):
@@ -354,7 +421,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "source":
-            write_json(args.output, capture_source(args.repo))
+            write_json(args.output, capture_source(args.repo, report=True))
         elif args.command == "build-manifest":
             output = args.output or Path(str(args.bundle) + ".build.json")
             require(output.resolve() not in {args.bundle.resolve(), args.source_snapshot.resolve()}, "sidecar output would overwrite build input")
