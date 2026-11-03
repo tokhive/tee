@@ -82,11 +82,16 @@ python3 deploy/release_catalog.py deactivate \
 # 本机启动过、状态里记着 app_hash 的环境
 ./crosshost.sh record --environment staging
 
-# 生产机不由本机启动时，身份从命令行给
+# 生产版通常就是测试版跑过的那份构建，不必再抄一遍摘要
+./crosshost.sh record --environment production --from staging
+
+# 来源环境还没登记、或要记录另一个构建时，才显式给身份
 ./crosshost.sh record --environment production --application-id 'snp-app:<hex>'
 ```
 
-它按顺序做五件事：从 `cloudtest/crosshost.json` 取 `app_hash`（或读 `--application-id`）；用 `archived_bundle` 取回归档并重算 SHA-256 核对；要求存在 `<sha256>.tar.build.json` 侧车文件；依次调用 `release` 与 `activate`；最后 `git commit --only releases/catalog.json`。`--release-url` 缺省为构建来源的提交链接，要指向发布说明或 PR 就显式传入；同一应用身份的链接必须保持不变，否则工具拒绝重新登记。
+它先确定要记录的身份，来源按顺序是三选一：`--application-id`；`--from <环境>`，沿用另一个环境当前启用的身份；否则读 `cloudtest/crosshost.json` 里本机最后启动的 `app_hash`。然后用 `archived_bundle` 取回归档并重算 SHA-256 核对，要求存在 `<sha256>.tar.build.json` 侧车文件，依次调用 `release` 与 `activate`，最后 `git commit --only releases/catalog.json`。`--release-url` 缺省为构建来源的提交链接，要指向发布说明或 PR 就显式传入；同一应用身份的链接必须保持不变，否则工具拒绝重新登记。
+
+`--from` 读的是清单里已有的记录，所以来源环境必须先登记过，它只决定“记哪个身份”，归档、哈希和侧车校验一样不少。两个来源同时给会直接被拒，不会静默取其中一个。
 
 `--only` 意味着提交只含这一个文件，运维已经暂存的其它改动不会被卷进发布记录。提交后不推送：部署机在哪个分支上、什么时候推，不该由脚本决定。
 

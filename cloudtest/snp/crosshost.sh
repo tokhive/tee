@@ -47,8 +47,10 @@
 #               `release` registers the measured bundle once, `activate` moves
 #               the environment onto it, and the entry is committed on its own.
 #               Run it after that environment is serving the app; nothing in
-#               build/up/deploy calls it. --dry-run prints the calls instead of
-#               writing them, --no-commit leaves the commit to the operator.
+#               build/up/deploy calls it. --from <env> copies what another
+#               environment runs, so promoting staging to production needs no
+#               digest typed in. --dry-run prints the calls instead of writing
+#               them, --no-commit leaves the commit to the operator.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # cloudtest/snp
 # The host shell may carry PYTHONHOME/PYTHONPATH injected by an unrelated tool
@@ -439,13 +441,18 @@ EOF
   sleep 4
 }
 
-# cmd_record --environment staging|production [--application-id snp-app:<hex>]
-#            [--release-url <url>]
+# cmd_record --environment staging|production
+#            [--from <environment> | --application-id snp-app:<hex>]
+#            [--release-url <url>] [--dry-run] [--no-commit]
 #
 # Appends the bundle an environment runs to releases/catalog.json. `release`
 # registers the measured bytes once, keyed by the digest the enclave is measured
 # to; `activate` then records which of those bytes this environment runs. Both
 # are idempotent, so re-running after a no-op deploy leaves the history alone.
+#
+# The identity comes from one of three places: --application-id when it is
+# already known, --from <environment> to inherit what another environment is
+# recorded as running, otherwise the app_hash this machine launched last.
 #
 # Run it once the environment is actually serving that app. The catalog holds an
 # expectation, and writing it before the instance exists turns a plan into a
@@ -456,14 +463,15 @@ EOF
 # releases/catalog.json. Pushing stays manual: which branch a deploy host sits
 # on is not this script's decision.
 cmd_record() {
-  local env="" app_hash="" release_url="" dry_run=0 commit=1
+  local env="" app_hash="" from_env="" release_url="" dry_run=0 commit=1
   while [ $# -gt 0 ]; do
     case "$1" in
-      --environment|--application-id|--release-url)
+      --environment|--application-id|--from|--release-url)
         [ $# -ge 2 ] || { log "record: $1 needs a value"; exit 1; }
         case "$1" in
           --environment)    env="$2" ;;
           --application-id) app_hash="${2#snp-app:}" ;;
+          --from)           from_env="$2" ;;
           --release-url)    release_url="$2" ;;
         esac
         shift 2 ;;
@@ -476,11 +484,32 @@ cmd_record() {
     *" ${env} "*) ;;
     *) log "record: --environment must be one of: ${RECORD_ENVIRONMENTS}"; exit 1 ;;
   esac
-  # State names the app this machine launched. A production host is launched
-  # elsewhere, so it is recorded by identity rather than by looking around.
+  local catalog="${REPO_ROOT}/releases/catalog.json"
+  if [ -n "${app_hash}" ] && [ -n "${from_env}" ]; then
+    log "record: --application-id and --from name the same thing; pass one"
+    exit 1
+  fi
+  # A promotion should not need a digest copied out of a log: what the other
+  # environment is recorded as running is what this one runs now. export_catalog
+  # owns the replay that decides that, so ask it instead of re-deriving it here.
+  if [ -n "${from_env}" ]; then
+    case " ${RECORD_ENVIRONMENTS} " in
+      *" ${from_env} "*) ;;
+      *) log "record: --from must be one of: ${RECORD_ENVIRONMENTS}"; exit 1 ;;
+    esac
+    app_hash="$(py "${DEPLOY_DIR}/release_catalog.py" export --catalog "${catalog}" --environment "${from_env}" |
+      py -c 'import json,sys; print((json.load(sys.stdin)["current_application_id"] or "")[8:])')"
+    if [ -z "${app_hash}" ]; then
+      log "record: ${from_env} has no active release to copy"
+      exit 1
+    fi
+  fi
+  # Otherwise state names the app this machine launched. A production host is
+  # launched elsewhere, so it is recorded by identity rather than by looking
+  # around.
   app_hash="${app_hash:-$(tee_field app_hash 2>/dev/null || true)}"
   if [ -z "${app_hash}" ]; then
-    log "record: no app identity in state; pass --application-id snp-app:<hex>"
+    log "record: no app identity; pass --from <environment> or --application-id snp-app:<hex>"
     exit 1
   fi
   # archived_bundle re-hashes the file it returns, so a bundle filed under the
@@ -497,7 +526,7 @@ cmd_record() {
     log "record: only bundles built since the release catalog carry a sidecar"
     exit 1
   fi
-  local catalog="${REPO_ROOT}/releases/catalog.json" id="snp-app:${app_hash}"
+  local id="snp-app:${app_hash}"
   # register_release refuses to relabel a digest, so a build that is already
   # published keeps the URL it was published under. Deriving a fresh default
   # here would collide with an explicit one the operator passed once, which is

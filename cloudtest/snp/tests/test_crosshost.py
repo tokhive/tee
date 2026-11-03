@@ -240,6 +240,11 @@ class RecordTest(unittest.TestCase):
         # point is the contract record passes it.
         stub = """import json, os, sys
 argv = sys.argv[1:]
+if argv[0] == 'export':
+    data = json.load(open(argv[argv.index('--catalog') + 1]))
+    active = {e['environment']: e['application_id'] for e in data['deployment_events']}
+    print(json.dumps({'current_application_id': active.get(argv[argv.index('--environment') + 1])}))
+    sys.exit(0)
 with open(@CALLS@, 'a') as log:
     log.write(' '.join(argv) + '\\n')
 if '--catalog' not in argv:
@@ -368,14 +373,39 @@ with open(path, 'w') as catalog:
         # not be derived fresh: promoting a build that was recorded with an
         # announcement link would otherwise fail on a URL nobody changed.
         self.catalog.write_text(json.dumps({
-            "version": 1,
-            "releases": [{"application_id": "snp-app:" + self.digest,
-                          "release_url": "https://example.invalid/announcement"}],
+            "version": 1, "releases": [self._release()],
             "deployment_events": [], "revocations": []}))
         self._state(self.digest)
         out = self._run("--environment", "production", "--no-commit")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("--release-url https://example.invalid/announcement", self._calls()[0])
+
+    def test_promotes_what_another_environment_is_recorded_as_running(self):
+        # A promotion should not need a digest copied out of a log: the catalog
+        # already says what staging runs.
+        self.catalog.write_text(json.dumps({
+            "version": 1, "releases": [self._release()],
+            "deployment_events": [{"environment": "staging", "action": "activate",
+                                   "application_id": "snp-app:" + self.digest,
+                                   "at": "2026-11-03T08:00:00Z"}],
+            "revocations": []}))
+        out = self._run("--environment", "production", "--from", "staging", "--no-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("--environment production", self._calls()[1])
+        self.assertIn("--application-id snp-app:" + self.digest, self._calls()[1])
+
+    def test_from_refuses_an_environment_that_runs_nothing(self):
+        out = self._run("--environment", "production", "--from", "staging")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("no active release", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists(), "nothing may be written with no identity")
+
+    def test_identity_sources_are_mutually_exclusive(self):
+        out = self._run("--environment", "staging", "--from", "production",
+                        "--application-id", "snp-app:" + self.digest)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("pass one", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists())
 
     def test_refuses_to_commit_an_untracked_catalog(self):
         # git reports no diff for a path it does not track, so without this the
@@ -387,6 +417,19 @@ with open(path, 'w') as catalog:
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("not tracked", out.stdout + out.stderr)
         self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "2")
+
+    def _release(self, url="https://example.invalid/announcement"):
+        # A complete record: export_catalog validates the whole catalog before
+        # answering, so a partial entry would fail for the wrong reason.
+        return {"version": 1, "application_id": "snp-app:" + self.digest,
+                "bundle_sha256": self.digest, "bundle_size_bytes": 29886464,
+                "app_binary_sha256": "3" * 64, "policy_hash": "2" * 64,
+                "policy_file_sha256": "4" * 64, "ca_bundle_sha256": "5" * 64,
+                "bundle_kind": "tee", "source_dirty": False,
+                "source_repository": "https://github.com/tokhive/tee",
+                "source_commit": "1" * 40,
+                "built_at": "2026-11-03T07:00:00Z", "release_url": url,
+                "published_at": "2026-11-03T07:30:00Z"}
 
     def _state(self, app_hash):
         self.hosts.write_text(json.dumps({"tee": {"app_hash": app_hash}}))
