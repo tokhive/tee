@@ -196,11 +196,19 @@ build_single() {
 }
 
 build() {
-    local stage; stage="$(mktemp -d)"
-    trap 'rm -rf "${stage}"' EXIT
+    local stage source_info kind="tee"
+    stage="$(mktemp -d)"
+    source_info="$(mktemp)"
+    trap 'rm -rf "${stage}"; rm -f "${source_info}"' EXIT
+    # Provenance is captured before compiling, and the completed manifest stays
+    # outside the tar: putting its own digest inside the measured bytes would
+    # create a circular identity and change SNP_APP_HASH.
+    python3 "${REPO_ROOT}/deploy/release_catalog.py" source --repo "${REPO_ROOT}" --output "${source_info}"
     if [[ "${TOKENHIVE_BUILD_SINGLE:-0}" == "1" ]]; then
+        kind="single"
         build_single "${stage}"
     elif [[ "${TOKENHIVE_BUILD_STUB:-0}" == "1" ]]; then
+        kind="stub"
         gobuild ./cloudtest/snp/stub "${stage}/app"
     else
         echo "[pack] compiling cmd/tee (sevsnp) -> app"
@@ -239,6 +247,10 @@ with tarfile.open(out, "w", format=tarfile.GNU_FORMAT) as tar:
             p = os.path.join(dirpath, name)
             tar.add(p, arcname="./" + os.path.relpath(p, src), recursive=False, filter=norm)
 PY
+    python3 "${REPO_ROOT}/deploy/release_catalog.py" build-manifest \
+        --repo "${REPO_ROOT}" --bundle "${OUT_BUNDLE}" --source-snapshot "${source_info}" --kind "${kind}"
+    echo "[pack] build manifest -> ${OUT_BUNDLE}.build.json (not a published release)"
+    rm -f "${source_info}"
     rm -rf "${stage}"; trap - EXIT
     digest
 }
@@ -253,7 +265,7 @@ case "${1:-build}" in
     build) build ;;
     digest) digest "${2:-}" ;;
     clean)
-        rm -f "${OUT_BUNDLE}"
+        rm -f "${OUT_BUNDLE}" "${OUT_BUNDLE}.build.json"
         echo "[pack] removed ${OUT_BUNDLE}"
         ;;
     *) echo "usage: $0 {build [OUT]|digest [TAR]|clean}" >&2; exit 1 ;;

@@ -128,6 +128,13 @@ The build prints two values worth recording: the app digest (`snp-app:<sha256>`)
 which the Hub must pin via `HIVE_TEE_EXPECTED_APP`, and the base UKI hash, which
 must not change when only the app changes.
 
+`pack.sh` also writes a build manifest next to the measured bundle, preserving
+its source revision, application identity, and the receipt policy hash computed
+from the policy inside that archive. Reviewed releases and deployment history
+live in `releases/catalog.json`; builds do not publish or activate themselves.
+See [the release catalog guide](docs/tee-release-catalog.md) for registration,
+rollbacks, revocation, and a public export for Hive's user interface.
+
 Structured logs ship to CloudWatch Logs under `/tokhive/tee/snp` when the instance
 carries an IAM profile. Without one they only reach the serial console, which keeps
 a few minutes.

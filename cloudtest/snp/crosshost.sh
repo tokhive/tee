@@ -192,6 +192,7 @@ archive_bundle() {
   local bundle="$1" digest="${2#snp-app:}"
   mkdir -p "${BUNDLES_DIR}"
   cp "${bundle}" "${BUNDLES_DIR}/${digest}.tar"
+  cp "${bundle}.build.json" "${BUNDLES_DIR}/${digest}.tar.build.json"
   log "bundle archived -> ${BUNDLES_DIR}/${digest}.tar"
 }
 

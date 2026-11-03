@@ -1,0 +1,71 @@
+name: Release catalog
+
+on:
+  pull_request:
+    paths:
+      - 'releases/**'
+      - 'deploy/release_catalog.py'
+      - 'deploy/tests/**'
+      - 'cmd/tee-policy-info/**'
+      - 'policy/**'
+      - 'internal/canonical/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cloudtest/snp/pack.sh'
+      - 'cloudtest/snp/crosshost.sh'
+      - '.github/workflows/release-catalog.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'releases/**'
+      - 'deploy/release_catalog.py'
+      - 'deploy/tests/**'
+      - 'cmd/tee-policy-info/**'
+      - 'policy/**'
+      - 'internal/canonical/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'cloudtest/snp/pack.sh'
+      - 'cloudtest/snp/crosshost.sh'
+      - '.github/workflows/release-catalog.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+      - name: Test canonical policy inspection
+        run: go test ./cmd/tee-policy-info
+      # The narrow step names a policy-hash regression straight in the Checks
+      # list; the broad one then reuses its cached result and proves the rest of
+      # the module still builds. Both stay on purpose: dropping either one loses
+      # either the attribution or the coverage, and the overlap is cached.
+      - name: Test the Go module
+        run: go test ./...
+      - name: Test build provenance and release history
+        run: python3 -m unittest discover -s deploy/tests -v
+      - name: Validate catalog and preserve published history
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        shell: bash
+        run: |
+          python3 deploy/release_catalog.py validate
+          if [[ -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]]; then
+            git cat-file -e "${BASE_SHA}^{commit}"
+            if git cat-file -e "${BASE_SHA}:releases/catalog.json" 2>/dev/null; then
+              git show "${BASE_SHA}:releases/catalog.json" > /tmp/previous-release-catalog.json
+              python3 deploy/release_catalog.py validate --previous /tmp/previous-release-catalog.json
+            fi
+          fi
