@@ -458,12 +458,17 @@ with open(path, 'w') as catalog:
     def test_refuses_to_commit_an_untracked_catalog(self):
         # git reports no diff for a path it does not track, so without this the
         # run would claim "already recorded" and leave the entry out of history.
+        # The check also has to come before the write: with the file missing
+        # altogether the catalog tool's complaint is a bare ENOENT.
         self._git("rm", "-q", "--cached", "releases/catalog.json")
         self._git("commit", "-q", "-m", "drop the catalog")
+        self.catalog.unlink()
         self._state(self.digest)
         out = self._run("--environment", "staging")
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("not tracked", out.stdout + out.stderr)
+        self.assertFalse(self.calls.exists(), "the refusal must precede the write")
+        self.assertFalse(self.catalog.exists(), "no catalog may be created here")
         self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "2")
 
     def _release(self, url="https://example.invalid/announcement", digest=None):

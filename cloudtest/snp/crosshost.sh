@@ -568,6 +568,16 @@ cmd_record() {
     log "  activate --catalog ${catalog} --environment ${env} --application-id ${id}"
     return 0
   fi
+  # Checked before writing, not after: an untracked catalog cannot take the
+  # commit below, and one this branch does not carry is missing outright, which
+  # the catalog tool reports as a bare ENOENT. Refuse with the reason instead.
+  # --no-commit is exempt: there the operator adds and commits the file.
+  if [ "${commit}" = 1 ] &&
+    ! git -C "${REPO_ROOT}" ls-files --error-unmatch -- "${catalog}" >/dev/null 2>&1; then
+    log "record: ${catalog#"${REPO_ROOT}"/} is not tracked on this branch"
+    log "record: switch to the branch that carries it, or add the file yourself"
+    exit 1
+  fi
   py "${DEPLOY_DIR}/release_catalog.py" release --catalog "${catalog}" \
     --bundle "${bundle}" --manifest "${manifest}" --release-url "${release_url}"
   py "${DEPLOY_DIR}/release_catalog.py" activate --catalog "${catalog}" \
@@ -578,15 +588,6 @@ cmd_record() {
   if [ "${commit}" = 0 ]; then
     log "record: --no-commit; review the catalog and commit it yourself"
     return 0
-  fi
-  # git reports no diff for a path it does not track, so an untracked catalog
-  # would read as "already recorded" and leave the entry out of history without
-  # anyone noticing. Say so instead: a checkout that predates the catalog has to
-  # be moved onto one that carries it.
-  if ! git -C "${REPO_ROOT}" ls-files --error-unmatch -- "${catalog}" >/dev/null 2>&1; then
-    log "record: ${catalog#"${REPO_ROOT}"/} is not tracked on this branch"
-    log "record: switch to the branch that carries it, or add the file yourself"
-    exit 1
   fi
   # Compare against HEAD, not the index. A copy staged by an earlier attempt
   # must not make an unchanged catalog look dirty, and 'git commit --only'
