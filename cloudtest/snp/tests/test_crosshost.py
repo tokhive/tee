@@ -376,7 +376,7 @@ with open(path, 'w') as catalog:
             "version": 1, "releases": [self._release()],
             "deployment_events": [], "revocations": []}))
         self._state(self.digest)
-        out = self._run("--environment", "production", "--no-commit")
+        out = self._run("--environment", "staging", "--no-commit")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("--release-url https://example.invalid/announcement", self._calls()[0])
 
@@ -392,6 +392,34 @@ with open(path, 'w') as catalog:
         out = self._run("--environment", "production", "--from", "staging", "--no-commit")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("--environment production", self._calls()[1])
+        self.assertIn("--application-id snp-app:" + self.digest, self._calls()[1])
+
+    def test_production_inherits_staging_without_naming_it(self):
+        # The promotion command is the common one, so it should not carry a flag
+        # that always says the same thing.
+        self.catalog.write_text(json.dumps({
+            "version": 1, "releases": [self._release()],
+            "deployment_events": [{"environment": "staging", "action": "activate",
+                                   "application_id": "snp-app:" + self.digest,
+                                   "at": "2026-11-03T08:00:00Z"}],
+            "revocations": []}))
+        out = self._run("--environment", "production", "--no-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("--application-id snp-app:" + self.digest, self._calls()[1])
+
+    def test_staging_reads_state_rather_than_inheriting_itself(self):
+        # Staging is the environment this machine launches. Inheriting its own
+        # record would turn the command into a no-op that reads like a success.
+        other = "9" * 64
+        self.catalog.write_text(json.dumps({
+            "version": 1, "releases": [self._release(digest=other)],
+            "deployment_events": [{"environment": "staging", "action": "activate",
+                                   "application_id": "snp-app:" + other,
+                                   "at": "2026-11-03T08:00:00Z"}],
+            "revocations": []}))
+        self._state(self.digest)
+        out = self._run("--environment", "staging", "--no-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("--application-id snp-app:" + self.digest, self._calls()[1])
 
     def test_from_refuses_an_environment_that_runs_nothing(self):
@@ -418,11 +446,12 @@ with open(path, 'w') as catalog:
         self.assertIn("not tracked", out.stdout + out.stderr)
         self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "2")
 
-    def _release(self, url="https://example.invalid/announcement"):
+    def _release(self, url="https://example.invalid/announcement", digest=None):
         # A complete record: export_catalog validates the whole catalog before
         # answering, so a partial entry would fail for the wrong reason.
-        return {"version": 1, "application_id": "snp-app:" + self.digest,
-                "bundle_sha256": self.digest, "bundle_size_bytes": 29886464,
+        digest = digest or self.digest
+        return {"version": 1, "application_id": "snp-app:" + digest,
+                "bundle_sha256": digest, "bundle_size_bytes": 29886464,
                 "app_binary_sha256": "3" * 64, "policy_hash": "2" * 64,
                 "policy_file_sha256": "4" * 64, "ca_bundle_sha256": "5" * 64,
                 "bundle_kind": "tee", "source_dirty": False,

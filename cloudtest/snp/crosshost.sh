@@ -47,10 +47,10 @@
 #               `release` registers the measured bundle once, `activate` moves
 #               the environment onto it, and the entry is committed on its own.
 #               Run it after that environment is serving the app; nothing in
-#               build/up/deploy calls it. --from <env> copies what another
-#               environment runs, so promoting staging to production needs no
-#               digest typed in. --dry-run prints the calls instead of writing
-#               them, --no-commit leaves the commit to the operator.
+#               build/up/deploy calls it. Production inherits staging's release
+#               when no identity is given; --from <env> names a different
+#               source. --dry-run prints the calls instead of writing them,
+#               --no-commit leaves the commit to the operator.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # cloudtest/snp
 # The host shell may carry PYTHONHOME/PYTHONPATH injected by an unrelated tool
@@ -453,6 +453,8 @@ EOF
 # The identity comes from one of three places: --application-id when it is
 # already known, --from <environment> to inherit what another environment is
 # recorded as running, otherwise the app_hash this machine launched last.
+# Production inherits from staging when neither flag is given: this machine
+# never launches it, and that is where its builds come from.
 #
 # Run it once the environment is actually serving that app. The catalog holds an
 # expectation, and writing it before the instance exists turns a plan into a
@@ -488,6 +490,13 @@ cmd_record() {
   if [ -n "${app_hash}" ] && [ -n "${from_env}" ]; then
     log "record: --application-id and --from name the same thing; pass one"
     exit 1
+  fi
+  # Staging is the environment this machine launches, so state is the right
+  # default there. Production is never launched from here by definition, and its
+  # usual content is the build staging just proved, so it inherits by default.
+  # A third environment gets no default: it has to say where its identity is.
+  if [ -z "${app_hash}" ] && [ -z "${from_env}" ] && [ "${env}" = "production" ]; then
+    from_env="staging"
   fi
   # A promotion should not need a digest copied out of a log: what the other
   # environment is recorded as running is what this one runs now. export_catalog
