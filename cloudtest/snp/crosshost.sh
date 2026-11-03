@@ -45,9 +45,10 @@
 #   ./crosshost.sh record --environment staging|production
 #               append the app an environment runs to releases/catalog.json:
 #               `release` registers the measured bundle once, `activate` moves
-#               the environment onto it. Run it after that environment is
-#               serving the app; nothing in build/up/deploy calls it. --dry-run
-#               prints the two catalog calls without writing.
+#               the environment onto it, and the entry is committed on its own.
+#               Run it after that environment is serving the app; nothing in
+#               build/up/deploy calls it. --dry-run prints the calls instead of
+#               writing them, --no-commit leaves the commit to the operator.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # cloudtest/snp
 # The host shell may carry PYTHONHOME/PYTHONPATH injected by an unrelated tool
@@ -450,8 +451,12 @@ EOF
 # expectation, and writing it before the instance exists turns a plan into a
 # claim nobody checked. Nothing in build/up/deploy calls this: a smoke test, or
 # a host that belongs to no catalogued environment, simply never records.
+#
+# The entry is committed by path (--only), so the release record carries only
+# releases/catalog.json. Pushing stays manual: which branch a deploy host sits
+# on is not this script's decision.
 cmd_record() {
-  local env="" app_hash="" release_url="" dry_run=0
+  local env="" app_hash="" release_url="" dry_run=0 commit=1
   while [ $# -gt 0 ]; do
     case "$1" in
       --environment|--application-id|--release-url)
@@ -463,6 +468,7 @@ cmd_record() {
         esac
         shift 2 ;;
       --dry-run) dry_run=1; shift ;;
+      --no-commit) commit=0; shift ;;
       *) log "record: unknown argument $1"; exit 1 ;;
     esac
   done
@@ -513,6 +519,25 @@ cmd_record() {
   py "${DEPLOY_DIR}/release_catalog.py" activate --catalog "${catalog}" \
     --environment "${env}" --application-id "${id}"
   log "record: ${catalog#"${REPO_ROOT}"/} updated"
+  if [ "${commit}" = 0 ]; then
+    log "record: --no-commit; review the catalog and commit it yourself"
+    return 0
+  fi
+  # Compare against HEAD, not the index. A copy staged by an earlier attempt
+  # must not make an unchanged catalog look dirty, and 'git commit --only'
+  # below takes this path from the working tree either way.
+  if git -C "${REPO_ROOT}" diff --quiet HEAD -- "${catalog}"; then
+    log "record: catalog already records ${env} -> ${id}; nothing to commit"
+    return 0
+  fi
+  # --only keeps whatever else the operator had staged out of the history: a
+  # release record should carry one app, not somebody's half-finished edit.
+  local subject body
+  subject="chore(release): record ${env} as ${id}"
+  body="$(py -c 'import json,sys; m=json.load(open(sys.argv[1])); print("policy  " + m["policy_hash"]); print("source  " + m["source_commit"])' "${manifest}")"
+  git -C "${REPO_ROOT}" --no-pager diff --stat HEAD -- "${catalog}"
+  git -C "${REPO_ROOT}" commit --only --quiet -m "${subject}" -m "${body}" -- "${catalog}"
+  log "record: committed $(git -C "${REPO_ROOT}" --no-pager log --oneline -1)"
 }
 
 cmd_drive() {

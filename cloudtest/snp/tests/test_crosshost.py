@@ -23,6 +23,7 @@ side effect of a launch: a smoke test stays out of the history by not asking.
 
 import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -232,12 +233,21 @@ class RecordTest(unittest.TestCase):
         self.deploy = root / "deploy"
         self.deploy.mkdir()
         self.calls = root / "calls.log"
-        # Stand-in for release_catalog.py that logs the argv it was handed. The
-        # catalog tool's own behaviour is deploy/tests' subject; here the point
-        # is the contract record passes it.
+        # Stand-in for release_catalog.py that logs the argv it was handed and
+        # marks the catalog, once per subcommand, as the real tool would append
+        # an event. The tool's own behaviour is deploy/tests' subject; here the
+        # point is the contract record passes it.
         self.deploy.joinpath("release_catalog.py").write_text(
-            "import sys\n"
-            f"open({str(self.calls)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n")
+            "import os, sys\n"
+            "argv = sys.argv[1:]\n"
+            f"with open({str(self.calls)!r}, 'a') as log:\n"
+            "    log.write(' '.join(argv) + '\\n')\n"
+            "if '--catalog' in argv:\n"
+            "    path = argv[argv.index('--catalog') + 1]\n"
+            "    line = argv[0] + '\\n'\n"
+            "    if not (os.path.exists(path) and line in open(path).read()):\n"
+            "        with open(path, 'a') as catalog:\n"
+            "            catalog.write(line)\n")
         self.hosts = root / "crosshost.json"
         payload = b"the bundle the enclave is measured with"
         self.digest = hashlib.sha256(payload).hexdigest()
@@ -247,7 +257,9 @@ class RecordTest(unittest.TestCase):
         self.sidecar.write_text(json.dumps({
             "source_repository": "https://github.com/tokhive/tee",
             "source_commit": "1" * 40,
+            "policy_hash": "2" * 64,
         }))
+        self._init_repo()
 
     def test_records_the_bundle_state_says_is_running(self):
         self._state(self.digest)
@@ -306,11 +318,61 @@ class RecordTest(unittest.TestCase):
         self.assertIn("no archived bundle measures", out.stdout + out.stderr)
         self.assertFalse(self.calls.exists())
 
+    def test_commit_lands_only_the_catalog(self):
+        # The deploy host is somebody's working tree. Committing whatever else
+        # they had staged would attach unrelated work to a release record, so
+        # the staged README below has to survive the commit untouched.
+        (self.repo / "README").write_text("an unrelated local edit\n")
+        self._git("add", "README")
+        self._state(self.digest)
+        out = self._run("--environment", "staging")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "2")
+        self.assertEqual(self._git("show", "--name-only", "--pretty=format:", "HEAD").stdout.split(),
+                         ["releases/catalog.json"])
+        self.assertIn("README", self._git("status", "--porcelain").stdout)
+
+    def test_no_commit_leaves_the_entry_for_review(self):
+        self._state(self.digest)
+        out = self._run("--environment", "staging", "--no-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "1")
+        self.assertIn("releases/catalog.json", self._git("status", "--porcelain").stdout)
+
+    def test_repeating_a_record_does_not_add_an_empty_commit(self):
+        # The catalog tool is idempotent for a digest already registered and an
+        # environment already running it, so the second run has nothing to say.
+        # Turning that into a commit would fill the history with no-ops.
+        self._state(self.digest)
+        self._run("--environment", "staging")
+        out = self._run("--environment", "staging")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("nothing to commit", out.stdout)
+        self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "2")
+
     def _state(self, app_hash):
         self.hosts.write_text(json.dumps({"tee": {"app_hash": app_hash}}))
 
     def _calls(self):
         return self.calls.read_text().splitlines()
+
+    def _git_env(self):
+        # A throwaway repository must not inherit the operator's signing setup
+        # or identity, or the commit under test would depend on this machine.
+        return {**os.environ,
+                "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_AUTHOR_NAME": "record test", "GIT_AUTHOR_EMAIL": "record@example.invalid",
+                "GIT_COMMITTER_NAME": "record test", "GIT_COMMITTER_EMAIL": "record@example.invalid"}
+
+    def _git(self, *args):
+        return subprocess.run(["git", "-C", str(self.repo), *args],
+                              capture_output=True, text=True, env=self._git_env(), check=True)
+
+    def _init_repo(self):
+        self._git("init", "-q")
+        (self.repo / "README").write_text("the deploy host's working tree\n")
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", "initial")
 
     def _run(self, *args):
         script = "\n".join([
@@ -330,7 +392,7 @@ class RecordTest(unittest.TestCase):
             'RECORD_ENVIRONMENTS="staging production"',
             "cmd_record " + " ".join(shlex.quote(arg) for arg in args),
         ])
-        return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=self._git_env())
 
 
 if __name__ == "__main__":
