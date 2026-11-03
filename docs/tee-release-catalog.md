@@ -56,7 +56,7 @@ python3 deploy/release_catalog.py release \
 
 ```bash
 python3 deploy/release_catalog.py activate \
-  --environment dev \
+  --environment staging \
   --application-id 'snp-app:<64-character-lowercase-hex>'
 ```
 
@@ -68,7 +68,7 @@ python3 deploy/release_catalog.py activate \
 
 ```bash
 python3 deploy/release_catalog.py deactivate \
-  --environment dev \
+  --environment staging \
   --application-id 'snp-app:<currently-active-identity>'
 ```
 
@@ -125,7 +125,7 @@ python3 deploy/release_catalog.py validate --previous /tmp/previous-release-cata
 可直接读取经审查的清单，也可按环境导出公开视图：
 
 ```bash
-python3 deploy/release_catalog.py export --environment dev --output /tmp/tee-dev.json
+python3 deploy/release_catalog.py export --environment staging --output /tmp/tee-staging.json
 ```
 
 输出契约为：
