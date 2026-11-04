@@ -6,6 +6,7 @@
 
 - [应用发布与环境历史](../releases/catalog.json)：构建摘要、源码 commit、策略哈希、启用／停用事件与撤销记录。
 - [构建和登记流程](tee-release-catalog.md)：实际 bundle 与构建 sidecar 的来源核对。
+- [构建、部署与签名发布协作](release-publishing.md)：两人分工、源码与清单提交、tag 顺序和 Release 附件交接。
 - [白名单源码](../policy/whitelist.json)：正式核对使用对应发布的源码 commit 及 bundle 内 `policy/policy.cbor`，不能把 `main` 的策略当作历史版本策略。
 - [独立 verifier](https://github.com/tokhive/verifier)、[固定版本下载](https://github.com/tokhive/verifier/releases)、[网页验证器](https://verifier.tokhive.ai/)。
 - [验证契约](https://github.com/tokhive/verifier/blob/main/API.md)、[可信边界](#可信边界)。
