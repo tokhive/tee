@@ -5,6 +5,7 @@ on:
     paths:
       - 'releases/**'
       - 'deploy/release_catalog.py'
+      - 'deploy/signed_release.py'
       - 'deploy/tests/**'
       - 'cmd/tee-policy-info/**'
       - 'policy/**'
@@ -19,6 +20,7 @@ on:
     paths:
       - 'releases/**'
       - 'deploy/release_catalog.py'
+      - 'deploy/signed_release.py'
       - 'deploy/tests/**'
       - 'cmd/tee-policy-info/**'
       - 'policy/**'
