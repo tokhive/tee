@@ -1,6 +1,31 @@
 {
   "version": 1,
-  "releases": [],
-  "deployment_events": [],
+  "releases": [
+    {
+      "version": 1,
+      "application_id": "snp-app:43c434cbc1b6a4d11b057d54ff50e3144e9371bb4ab3fb8a785f68c07c65dcf4",
+      "bundle_sha256": "43c434cbc1b6a4d11b057d54ff50e3144e9371bb4ab3fb8a785f68c07c65dcf4",
+      "bundle_size_bytes": 29911040,
+      "app_binary_sha256": "8071a7cba7e06061b722d9248bf7ec4a5ec924438beafc5203ef7cec3c997f19",
+      "policy_hash": "2942cd0ef830e8f993d4c6ae23b143b0bd4af54a05875082a31893a862dfc822",
+      "policy_file_sha256": "e02f85db2a0740451528d25b790e564c7d06121098a263c2dcd62aaff7530d6e",
+      "ca_bundle_sha256": "61efbd6d3f829f71039c57b29dd37d15ac7f33c4ece861aaef8c7d7a519cd1d9",
+      "source_repository": "https://github.com/tokhive/tee",
+      "source_commit": "d4aa6ed1bec9d2020240119d04d7bff2ec818a43",
+      "source_dirty": false,
+      "bundle_kind": "tee",
+      "built_at": "2026-11-04T05:47:59Z",
+      "release_url": "https://github.com/tokhive/tee/commit/d4aa6ed1bec9d2020240119d04d7bff2ec818a43",
+      "published_at": "2026-11-04T05:55:05Z"
+    }
+  ],
+  "deployment_events": [
+    {
+      "environment": "production",
+      "application_id": "snp-app:43c434cbc1b6a4d11b057d54ff50e3144e9371bb4ab3fb8a785f68c07c65dcf4",
+      "action": "activate",
+      "at": "2026-11-04T05:55:06Z"
+    }
+  ],
   "revocations": []
 }
