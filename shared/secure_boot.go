@@ -312,17 +312,33 @@ func verifyReleaseSecureBootEventLog(raw []byte, pcrs map[uint32][]byte, bank cr
 		postAuthorities:        len(state.PostSeparatorAuthority),
 		releasePostAuthorities: postMatches,
 	}
+	fingerprint := sha256.Sum256(releaseSPKI)
 	if !secureBootAuthorityPolicyOK(policy) {
-		return nil, fmt.Errorf("event log does not prove an R-only post-separator Secure Boot policy")
+		// The sentence alone cannot be acted on: "db still holds the old
+		// release certificate" and "the log records no post-separator authority
+		// at all" fail the same clause check and read identically. The counts
+		// come from the signed event log and are the only place the distinction
+		// surfaces, so they travel with the refusal. Nothing secret is added:
+		// they are counts plus the fingerprint of a public key the caller
+		// already trusts.
+		return nil, fmt.Errorf("event log does not prove an R-only post-separator Secure Boot policy: %s releaseKey=%x",
+			secureBootPolicyReport(policy), fingerprint[:8])
 	}
 
-	fingerprint := sha256.Sum256(releaseSPKI)
 	return &SecureBootResult{
 		EventLogBytes:          len(raw),
 		VerifiedEvents:         len(events),
 		PostSeparatorUses:      postMatches,
 		ReleasePublicKeySHA256: fmt.Sprintf("%x", fingerprint[:]),
 	}, nil
+}
+
+// secureBootPolicyReport renders every count secureBootAuthorityPolicyOK reads,
+// in the order it reads them, so a refusal names the clause that failed.
+func secureBootPolicyReport(policy secureBootAuthorityPolicy) string {
+	return fmt.Sprintf("enabled=%t dbKeys=%d dbHashes=%d dbR=%d dbxR=%d preAuthorities=%d postAuthorities=%d postR=%d",
+		policy.enabled, policy.permittedKeys, policy.permittedHashes, policy.releaseDBEntries,
+		policy.releaseDBXEntries, policy.preAuthorities, policy.postAuthorities, policy.releasePostAuthorities)
 }
 
 func secureBootAuthorityPolicyOK(policy secureBootAuthorityPolicy) bool {
@@ -345,6 +361,22 @@ func releasePublicKeySPKI() ([]byte, error) {
 		return nil, fmt.Errorf("parse embedded Secure Boot release public key: %w", err)
 	}
 	return block.Bytes, nil
+}
+
+// ReleasePublicKeySHA256 is the hex SHA-256 of the DER SubjectPublicKeyInfo of
+// the release key compiled into this build. The key belongs to the binary, not
+// to any one attestation, so a verifier can log it beside a successful proof
+// without threading it out of the verification result. The refusal path already
+// carries releaseKey=, so both paths name the same thing: a Hub reporting a
+// value other than the AMI's R.pub.pem is a Hub that was not rebuilt after the
+// rotation.
+func ReleasePublicKeySHA256() (string, error) {
+	spki, err := releasePublicKeySPKI()
+	if err != nil {
+		return "", err
+	}
+	fingerprint := sha256.Sum256(spki)
+	return fmt.Sprintf("%x", fingerprint), nil
 }
 
 func countCertificatesWithSPKI(certs []x509.Certificate, trustedSPKI []byte) (int, error) {

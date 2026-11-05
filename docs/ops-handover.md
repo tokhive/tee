@@ -119,14 +119,16 @@ cp R.pub.pem ../../shared/secure_boot_release_pub.pem
 
 `GUID.txt` 沿用仓库固定值，不要重新随机：变量身份变了，事件日志里的条目也跟着变。
 
-**手工核对公钥同步**（`snp-build.sh` 不会替你校验，它只检查 `R.pub.pem` 是否存在）：
+**顺序不能反：造密钥 → 公钥进 commit → 编译。** 镜像用 `R.key` 签名，而 Hub 的公钥是编译期从某个 commit 里 `//go:embed` 进去的（§12），所以公钥这一半必须先在 HEAD 里，编译才有意义。`crosshost.sh build` 在打包前会把这份公开材料封进一个 commit（`chore(secure-boot): seal R public material before build`，只含 `shared/secure_boot_release_pub.pem` 与 `deploy/secure-boot/`，`R.key` 被 gitignore 排除，不 push），`record` 也会封一次。所以造完密钥直接 `./crosshost.sh build` 即可，不需要手工 `git add`。
+
+**公钥同步**：`deploy/secure-boot-check.sh` 比对整套材料的 DER SPKI sha256——`R.key`（若在本机）、`R.crt.pem`、`R.crt.der`、`R.pub.pem`、`shared/secure_boot_release_pub.pem`，任何一处不同就失败；它还会检查 `R.esl` 里确实装着当前 `R.crt.der`（漏跑 `cert-to-efi-sig-list` 会在这里被拦下）。`snp-build.sh` 在构建前跑它，`crosshost.sh record` 在封存 key 之前也跑它；另外 `snp-build.sh` 还要求这两个路径相对 HEAD 没有未提交改动（`SNP_ALLOW_DIRTY=1` 不放行）。`aws-uefi-data.b64` 是 AWS 自己的容器格式，脚本不解析它，重建后仍按下一节用 `uefivars -i aws -o json` 人工确认。只想看两把公钥是否同一把：
 
 ```bash
 openssl pkey -pubin -in R.pub.pem -outform DER | openssl dgst -sha256
 openssl pkey -pubin -in ../../shared/secure_boot_release_pub.pem -outform DER | openssl dgst -sha256
 ```
 
-两行必须相同。不同就直接停：构建能过，但 Hub 会在运行期以 `event log does not prove an R-only post-separator Secure Boot policy` 拒绝 TEE。
+两行必须相同。不同就直接停：Hub 会在运行期以 `event log does not prove an R-only post-separator Secure Boot policy` 拒绝 TEE。
 
 最后重建 UEFI 变量存储：
 
@@ -193,14 +195,17 @@ cd cloudtest/snp
 ./crosshost.sh build        # 约 10-18 分钟
 ```
 
+唯一的例外是 Secure Boot 公开材料：`build` 会先把它封进 commit 再打包（§2），所以刚造完 `R.key` 也能直接构建，不必手工暂存。
+
 如果 `snapshot.ubuntu.com` 经代理大量 502，先在 `deploy/.env` 设 `SNP_APT_MIRROR=aliyun` 重跑；它只影响基础镜像的构建源，不改信任根与 bundle 摘要。生产可复现构建应切回 `snapshot`。
 
 构建做的事：
 
-1. 生成/复用 `.certs/` 与 `policy.cbor`；
-2. `pack.sh` 打确定性 bundle（文件排序、owner/group 固定、mtime 固定为 `2025-01-01`）；
-3. `snp-build.sh` 在 Docker 里组装两层镜像，用 `R.key` 签 UKI，注册 AMI；
-4. `run.sh build` 交叉编译 `hub`、`agent`、`mockprovider`、`tee`。
+1. 把 `shared/secure_boot_release_pub.pem` 与 `deploy/secure-boot/` 的未提交改动封进一个 commit（§2）；
+2. 生成/复用 `.certs/` 与 `policy.cbor`；
+3. `pack.sh` 打确定性 bundle（文件排序、owner/group 固定、mtime 固定为 `2025-01-01`）；
+4. `snp-build.sh` 在 Docker 里组装两层镜像，用 `R.key` 签 UKI，注册 AMI；
+5. `run.sh build` 交叉编译 `hub`、`agent`、`mockprovider`、`tee`。
 
 产出四样，全部要记录：
 
@@ -293,7 +298,7 @@ cd cloudtest/snp
 ./crosshost.sh record --environment production --application-id 'snp-app:<sha256>'
 ```
 
-一条命令做三件事：`release` 按摘要登记被测量的 bundle，`activate` 标记该环境在跑它，最后 `git commit --only releases/catalog.json`。提交只含这一个文件，已暂存的其它改动不会被卷进来；推送留给人工决定。
+一条命令做三件事：`release` 按摘要登记被测量的 bundle，`activate` 标记该环境在跑它，最后 `git commit --only releases/catalog.json`。若 Secure Boot 公开材料与 HEAD 不一致（轮换 R 之后就是这种情况），它先单独提交这一份再写清单——否则「镜像用新 R 签名、Hub 从旧 commit 里取公钥」会漏到运行期。两次提交都只含各自路径，已暂存的其它改动不会被卷进来；推送留给人工决定。
 
 生产版的默认来源是 `staging`：本机从不启动生产机，而生产跑的就是测试版验证过的那个构建。要换来源用 `--from <环境>`，它读的是清单里已有的记录，所以那个环境必须先登记过。
 
@@ -335,7 +340,7 @@ cd cloudtest/snp
 
 | 现象 | 先看哪里 | 结论 |
 | --- | --- | --- |
-| Hub 拒 TEE，`R-only ... policy` | 两处 R 公钥 sha256 | §2 的公钥没同步，或换了 R 没重编 Hub |
+| Hub 拒 TEE，`R-only ... policy` | `./deploy/secure-boot-check.sh` | 公钥没同步（脚本会指出是哪一份），或换了 R 没重编 Hub；Hub 拒信里的 `releaseKey=` 是它自己那把的指纹 |
 | `up` 报 `carries no snp-app tag` | AMI 标签 | 镜像不是本流水线注册的，重建 |
 | `deploy` 报 `no archived bundle` | `bin/bundles/` | 该摘要的归档丢了；重建或重新 `up` |
 | Hub 报 `attestation does not match` | 串口 `[loader] app_sha256` | 对齐 `crosshost.json` 的 `app_hash` 与 Hub 的 `-expected-app` |
@@ -345,7 +350,7 @@ cd cloudtest/snp
 
 ## 12. 四条硬约束
 
-1. **R 公钥没有自动校验。** `snp-build.sh` 只检查 `R.pub.pem` 存在，不比对 `shared/secure_boot_release_pub.pem`。每次动 R 都手工跑一次 §2 的两行 sha256。
+1. **R 公钥必须在 HEAD 里。** 镜像用 `R.key` 签名，Hub 的同一把公钥是编译期 `//go:embed` 进去的，所以公钥半必须在编译前就在 commit 里——这是"先生成、再提交、最后编译"的来源。`crosshost.sh build`/`record` 会自动把它封进 commit（只这两个路径，不 push）；`deploy/secure-boot-check.sh` 在构建与封存前再兜一次底：`R.key`、两张 R 证书、`R.pub.pem` 与 `shared/` 副本必须是同一把钥匙，`R.esl` 必须装着当前证书，`SNP_ALLOW_DIRTY=1` 也不放行这两个路径的脏改动。仍未覆盖的是 Hub 未重编：公钥已提交、Hub 二进制还是旧的，只有运行期才会被拒，所以换完钥匙记得重编 Hub，并跑一次 §2 的两行 sha256。
 2. **换 R = 重编 Hub。** Hub 的 release 公钥是 `//go:embed`。`crosshost.sh build` 末尾会重编 Hub（`run.sh build`），所以先同步公钥再构建就一致；反过来就会运行期被拒。
 3. **CA 只生成一次。** `.certs/` 一旦被烘进 AMI，就不能再跑 `gencerts` 覆盖。轮换要 AMI + Hub 一起重做。
 4. **改任何被测字节都要重新 pin。** 代码、白名单、bundle 内证书，任一变化都改 `snp-app:` 摘要。Hub 的 `-expected-app` 与 `crosshost.json` 的 `tee.app_hash` 必须同步更新。
