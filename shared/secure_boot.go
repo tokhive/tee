@@ -312,17 +312,33 @@ func verifyReleaseSecureBootEventLog(raw []byte, pcrs map[uint32][]byte, bank cr
 		postAuthorities:        len(state.PostSeparatorAuthority),
 		releasePostAuthorities: postMatches,
 	}
+	fingerprint := sha256.Sum256(releaseSPKI)
 	if !secureBootAuthorityPolicyOK(policy) {
-		return nil, fmt.Errorf("event log does not prove an R-only post-separator Secure Boot policy")
+		// The sentence alone cannot be acted on: "db still holds the old
+		// release certificate" and "the log records no post-separator authority
+		// at all" fail the same clause check and read identically. The counts
+		// come from the signed event log and are the only place the distinction
+		// surfaces, so they travel with the refusal. Nothing secret is added:
+		// they are counts plus the fingerprint of a public key the caller
+		// already trusts.
+		return nil, fmt.Errorf("event log does not prove an R-only post-separator Secure Boot policy: %s releaseKey=%x",
+			secureBootPolicyReport(policy), fingerprint[:8])
 	}
 
-	fingerprint := sha256.Sum256(releaseSPKI)
 	return &SecureBootResult{
 		EventLogBytes:          len(raw),
 		VerifiedEvents:         len(events),
 		PostSeparatorUses:      postMatches,
 		ReleasePublicKeySHA256: fmt.Sprintf("%x", fingerprint[:]),
 	}, nil
+}
+
+// secureBootPolicyReport renders every count secureBootAuthorityPolicyOK reads,
+// in the order it reads them, so a refusal names the clause that failed.
+func secureBootPolicyReport(policy secureBootAuthorityPolicy) string {
+	return fmt.Sprintf("enabled=%t dbKeys=%d dbHashes=%d dbR=%d dbxR=%d preAuthorities=%d postAuthorities=%d postR=%d",
+		policy.enabled, policy.permittedKeys, policy.permittedHashes, policy.releaseDBEntries,
+		policy.releaseDBXEntries, policy.preAuthorities, policy.postAuthorities, policy.releasePostAuthorities)
 }
 
 func secureBootAuthorityPolicyOK(policy secureBootAuthorityPolicy) bool {

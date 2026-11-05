@@ -35,6 +35,37 @@ func TestSecureBootAuthorityPolicy(t *testing.T) {
 	}
 }
 
+// A refusal that says only "not R-only" sends the operator back to guessing:
+// the same sentence covers the old certificate still sitting in db and the log
+// recording no post-separator authority at all. The report has to name every
+// count the decision reads, with the failing one visible in it.
+func TestSecureBootPolicyReportNamesTheFailingClause(t *testing.T) {
+	valid := secureBootAuthorityPolicy{
+		enabled: true, permittedKeys: 1, releaseDBEntries: 1,
+		postAuthorities: 1, releasePostAuthorities: 1,
+	}
+	if ok := secureBootAuthorityPolicyOK(valid); !ok {
+		t.Fatal("fixture must be a passing policy")
+	}
+	report := secureBootPolicyReport(valid)
+	for _, want := range []string{"enabled=true", "dbKeys=1", "dbHashes=0", "dbR=1",
+		"dbxR=0", "preAuthorities=0", "postAuthorities=1", "postR=1"} {
+		if !strings.Contains(report, want) {
+			t.Fatalf("report is missing %q: %s", want, report)
+		}
+	}
+
+	// The two failures that read identically in the one-line message must not
+	// read identically here.
+	staleDB := valid
+	staleDB.releaseDBEntries = 0
+	noPost := valid
+	noPost.postAuthorities, noPost.releasePostAuthorities = 0, 0
+	if a, b := secureBootPolicyReport(staleDB), secureBootPolicyReport(noPost); a == b {
+		t.Fatalf("distinct failures produced the same report: %s", a)
+	}
+}
+
 func TestVerifyTypedSNPNonceAttestationDispatch(t *testing.T) {
 	tests := []struct {
 		name            string
