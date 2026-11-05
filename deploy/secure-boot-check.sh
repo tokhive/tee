@@ -73,4 +73,29 @@ if [[ -f "${SECURE_BOOT_DIR}/R.key" ]]; then
         "deploy/secure-boot/R.key" "${key_fp:-<unreadable>}" "${want}")"
 fi
 
+# The image boots only if db trusts the certificate this build signs with, and
+# db is the one artifact whose hash proves nothing: R.esl is a signature list
+# with a header, so its bytes differ from R.crt.der while carrying them verbatim.
+# Containment is the check, and it catches the rotation that re-issued
+# R.crt.pem/R.crt.der but forgot cert-to-efi-sig-list -- which otherwise only
+# shows up as an instance that will not boot.
+#
+# aws-uefi-data.b64 is deliberately not checked here: it is AWS's own container
+# (opaque without uefivars), so the manual `uefivars -i aws -o json` in §2 stays
+# the way to confirm db. The ESL is its input, so the gap is one step wide.
+if [[ -f "${SECURE_BOOT_DIR}/R.esl" ]]; then
+    PY="${PYTHON:-python3}"
+    command -v "${PY}" >/dev/null 2>&1 || fail "${PY} is required to read R.esl"
+    "${PY}" - "${SECURE_BOOT_DIR}/R.crt.der" "${SECURE_BOOT_DIR}/R.esl" <<'PY' || exit 1
+import sys
+
+der_path, esl_path = sys.argv[1:3]
+if open(der_path, "rb").read() not in open(esl_path, "rb").read():
+    sys.exit("secure-boot: deploy/secure-boot/R.esl does not contain the certificate from R.crt.der\n"
+             "secure-boot: re-run cert-to-efi-sig-list for the current R.crt.pem, then rebuild\n"
+             "secure-boot: aws-uefi-data.b64 with uefivars")
+PY
+fi
+
 echo "secure-boot: one key, SPKI sha256 ${want}"
+

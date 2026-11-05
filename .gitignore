@@ -18,6 +18,9 @@ deploy/snp-image/*.zst
 deploy/snp-image/*.blob
 deploy/snp-image/app-bundle.tar
 deploy/secure-boot/*.key
+# The variable store §2 rebuilds aws-uefi-data.b64 from: machine-specific,
+# regenerable, and not something the seal commit should pick up.
+deploy/secure-boot/vars.fd
 
 # Editor and OS noise
 .DS_Store

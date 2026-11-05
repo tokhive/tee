@@ -436,6 +436,24 @@ with open(path, 'w') as catalog:
         self.assertIn("shared/secure_boot_release_pub.pem", self._git("status", "--porcelain").stdout)
         self.assertFalse(self.calls.exists())
 
+    def test_a_rotation_on_a_detached_head_is_refused(self):
+        # CI checks out a commit, not a branch. A commit made there is on no
+        # branch, so TEE_REVISION could never pin the key it carries.
+        keys = self.repo / "shared" / "secure_boot_release_pub.pem"
+        keys.parent.mkdir()
+        keys.write_text("the previous key\n")
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", "keys")
+        keys.write_text("the rotated key\n")
+        self._git("checkout", "-q", "--detach")
+        before = self._git("rev-parse", "HEAD").stdout.strip()
+        self._state(self.digest)
+        out = self._run("--environment", "staging")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("detached", out.stdout + out.stderr)
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), before)
+        self.assertIn("shared/secure_boot_release_pub.pem", self._git("status", "--porcelain").stdout)
+
     def test_no_commit_leaves_the_entry_for_review(self):
         self._state(self.digest)
         out = self._run("--environment", "staging", "--no-commit")

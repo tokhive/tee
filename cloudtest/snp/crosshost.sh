@@ -259,6 +259,14 @@ seal_secure_boot_material() {
   # certificates, R.pub.pem and the embedded copy have to agree first. It lives
   # with the repository it reads, not with the deploy host's state.
   bash "${REPO_ROOT}/deploy/secure-boot-check.sh"
+  # A commit made on a detached HEAD is on no branch, so TEE_REVISION cannot pin
+  # it: the rotation would look committed and still be unreachable. CI checkouts
+  # are detached by construction, which is where this build runs.
+  git -C "${REPO_ROOT}" symbolic-ref -q HEAD >/dev/null || {
+    log "secure-boot: HEAD is detached; a commit here cannot be pinned by TEE_REVISION"
+    log "secure-boot: check out the branch that carries the rotation, then retry"
+    exit 1
+  }
   git -C "${REPO_ROOT}" add -A -- "${SECURE_BOOT_PUBLIC_PATHS[@]}"
   # --only keeps an operator's other staged edits out of this commit, for the
   # same reason record uses it: a key rotation should be one reviewable change.

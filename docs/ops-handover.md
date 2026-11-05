@@ -121,7 +121,7 @@ cp R.pub.pem ../../shared/secure_boot_release_pub.pem
 
 **顺序不能反：造密钥 → 公钥进 commit → 编译。** 镜像用 `R.key` 签名，而 Hub 的公钥是编译期从某个 commit 里 `//go:embed` 进去的（§12），所以公钥这一半必须先在 HEAD 里，编译才有意义。`crosshost.sh build` 在打包前会把这份公开材料封进一个 commit（`chore(secure-boot): seal R public material before build`，只含 `shared/secure_boot_release_pub.pem` 与 `deploy/secure-boot/`，`R.key` 被 gitignore 排除，不 push），`record` 也会封一次。所以造完密钥直接 `./crosshost.sh build` 即可，不需要手工 `git add`。
 
-**公钥同步**：`deploy/secure-boot-check.sh` 比对整套材料的 DER SPKI sha256——`R.key`（若在本机）、`R.crt.pem`、`R.crt.der`、`R.pub.pem`、`shared/secure_boot_release_pub.pem`，任何一处不同就失败。`snp-build.sh` 在构建前跑它，`crosshost.sh record` 在封存 key 之前也跑它；另外 `snp-build.sh` 还要求这两个路径相对 HEAD 没有未提交改动（`SNP_ALLOW_DIRTY=1` 不放行）。只想看两把公钥是否同一把：
+**公钥同步**：`deploy/secure-boot-check.sh` 比对整套材料的 DER SPKI sha256——`R.key`（若在本机）、`R.crt.pem`、`R.crt.der`、`R.pub.pem`、`shared/secure_boot_release_pub.pem`，任何一处不同就失败；它还会检查 `R.esl` 里确实装着当前 `R.crt.der`（漏跑 `cert-to-efi-sig-list` 会在这里被拦下）。`snp-build.sh` 在构建前跑它，`crosshost.sh record` 在封存 key 之前也跑它；另外 `snp-build.sh` 还要求这两个路径相对 HEAD 没有未提交改动（`SNP_ALLOW_DIRTY=1` 不放行）。`aws-uefi-data.b64` 是 AWS 自己的容器格式，脚本不解析它，重建后仍按下一节用 `uefivars -i aws -o json` 人工确认。只想看两把公钥是否同一把：
 
 ```bash
 openssl pkey -pubin -in R.pub.pem -outform DER | openssl dgst -sha256
@@ -350,7 +350,7 @@ cd cloudtest/snp
 
 ## 12. 四条硬约束
 
-1. **R 公钥必须在 HEAD 里。** 镜像用 `R.key` 签名，Hub 的同一把公钥是编译期 `//go:embed` 进去的，所以公钥半必须在编译前就在 commit 里——这是"先生成、再提交、最后编译"的来源。`crosshost.sh build`/`record` 会自动把它封进 commit（只这两个路径，不 push）；`deploy/secure-boot-check.sh` 在构建与封存前再兜一次底：`R.key`、两张 R 证书、`R.pub.pem` 与 `shared/` 副本必须是同一把钥匙，`SNP_ALLOW_DIRTY=1` 也不放行这两个路径的脏改动。仍未覆盖的是 Hub 未重编：公钥已提交、Hub 二进制还是旧的，只有运行期才会被拒，所以换完钥匙记得重编 Hub，并跑一次 §2 的两行 sha256。
+1. **R 公钥必须在 HEAD 里。** 镜像用 `R.key` 签名，Hub 的同一把公钥是编译期 `//go:embed` 进去的，所以公钥半必须在编译前就在 commit 里——这是"先生成、再提交、最后编译"的来源。`crosshost.sh build`/`record` 会自动把它封进 commit（只这两个路径，不 push）；`deploy/secure-boot-check.sh` 在构建与封存前再兜一次底：`R.key`、两张 R 证书、`R.pub.pem` 与 `shared/` 副本必须是同一把钥匙，`R.esl` 必须装着当前证书，`SNP_ALLOW_DIRTY=1` 也不放行这两个路径的脏改动。仍未覆盖的是 Hub 未重编：公钥已提交、Hub 二进制还是旧的，只有运行期才会被拒，所以换完钥匙记得重编 Hub，并跑一次 §2 的两行 sha256。
 2. **换 R = 重编 Hub。** Hub 的 release 公钥是 `//go:embed`。`crosshost.sh build` 末尾会重编 Hub（`run.sh build`），所以先同步公钥再构建就一致；反过来就会运行期被拒。
 3. **CA 只生成一次。** `.certs/` 一旦被烘进 AMI，就不能再跑 `gencerts` 覆盖。轮换要 AMI + Hub 一起重做。
 4. **改任何被测字节都要重新 pin。** 代码、白名单、bundle 内证书，任一变化都改 `snp-app:` 摘要。Hub 的 `-expected-app` 与 `crosshost.json` 的 `tee.app_hash` 必须同步更新。

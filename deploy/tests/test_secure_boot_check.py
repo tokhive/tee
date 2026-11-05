@@ -87,6 +87,28 @@ class SecureBootCheckTest(unittest.TestCase):
         out = self.check()
         self.assertEqual(out.returncode, 0, out.stderr)
 
+    def test_an_esl_built_from_the_current_certificate_passes(self):
+        # An ESL is a header plus the DER certificate verbatim, which is what
+        # makes containment a meaningful check.
+        self.rotate()
+        (self.secure_boot / "R.esl").write_bytes(
+            b"ESLHDR" + (self.secure_boot / "R.crt.der").read_bytes() + b"tail")
+        out = self.check()
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_an_esl_left_over_from_the_previous_certificate_is_refused(self):
+        # cert-to-efi-sig-list is a separate step from re-issuing the
+        # certificate; skipping it leaves db trusting a certificate the build no
+        # longer signs with, and the instance will not boot.
+        self.rotate()
+        (self.secure_boot / "R.esl").write_bytes(
+            b"ESLHDR" + (self.secure_boot / "R.crt.der").read_bytes() + b"tail")
+        self.rotate("the rotated key")
+        out = self.check()
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("R.esl does not contain the certificate", out.stderr)
+        self.assertIn("cert-to-efi-sig-list", out.stderr)
+
     def test_missing_public_material_is_named(self):
         self.rotate()
         (self.secure_boot / "R.crt.der").unlink()
