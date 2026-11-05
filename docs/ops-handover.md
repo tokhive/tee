@@ -119,7 +119,7 @@ cp R.pub.pem ../../shared/secure_boot_release_pub.pem
 
 `GUID.txt` 沿用仓库固定值，不要重新随机：变量身份变了，事件日志里的条目也跟着变。
 
-**手工核对公钥同步**（`snp-build.sh` 不会替你校验，它只检查 `R.pub.pem` 是否存在）：
+**公钥同步**：`snp-build.sh` 现在会在构建期比对两份公钥（`deploy/secure-boot/R.pub.pem` 与 `shared/secure_boot_release_pub.pem` 的 SPKI sha256），不一致直接构建失败。想手工确认同一个指纹：
 
 ```bash
 openssl pkey -pubin -in R.pub.pem -outform DER | openssl dgst -sha256
@@ -345,7 +345,7 @@ cd cloudtest/snp
 
 ## 12. 四条硬约束
 
-1. **R 公钥没有自动校验。** `snp-build.sh` 只检查 `R.pub.pem` 存在，不比对 `shared/secure_boot_release_pub.pem`。每次动 R 都手工跑一次 §2 的两行 sha256。
+1. **R 公钥必须在 HEAD 里。** `snp-build.sh` 比对 `R.pub.pem` 与 `shared/secure_boot_release_pub.pem` 的 SPKI sha256，不一致就失败；并且 `SNP_ALLOW_DIRTY=1` 不放行这两个路径下的未提交改动——Hub 的这份公钥来自某个提交（`//go:embed`），工作区独有的钥匙等于"镜像新、验证方旧"。仍未覆盖的是 Hub 未重编：公钥已提交、Hub 二进制还是旧的，只有运行期才会被拒，所以换完钥匙记得重编 Hub，并跑一次 §2 的两行 sha256。
 2. **换 R = 重编 Hub。** Hub 的 release 公钥是 `//go:embed`。`crosshost.sh build` 末尾会重编 Hub（`run.sh build`），所以先同步公钥再构建就一致；反过来就会运行期被拒。
 3. **CA 只生成一次。** `.certs/` 一旦被烘进 AMI，就不能再跑 `gencerts` 覆盖。轮换要 AMI + Hub 一起重做。
 4. **改任何被测字节都要重新 pin。** 代码、白名单、bundle 内证书，任一变化都改 `snp-app:` 摘要。Hub 的 `-expected-app` 与 `crosshost.json` 的 `tee.app_hash` 必须同步更新。

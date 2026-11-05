@@ -42,6 +42,28 @@ for required in PK.crt.der KEK.crt.der R.crt.der R.crt.pem R.pub.pem R.key aws-u
     }
 done
 
+# This image is signed by R; the Hub checks the boot chain against the R public
+# key compiled into it (`//go:embed secure_boot_release_pub.pem`). Two copies of
+# one key: deploy/secure-boot/R.pub.pem signs, shared/ embeds. If they drift the
+# build still succeeds and the Hub rejects the TEE at run time with
+# "event log does not prove an R-only post-separator Secure Boot policy", which
+# is a ten-minute deployment failing on a mistake that is visible right here.
+key_spki_sha256() {
+    openssl pkey -pubin -in "$1" -outform DER 2>/dev/null |
+        openssl dgst -sha256 | sed -e 's/^.*=[[:space:]]*//'
+}
+RELEASE_PUB="${REPO_ROOT}/shared/secure_boot_release_pub.pem"
+[[ -f "${RELEASE_PUB}" ]] || { echo "[build] missing ${RELEASE_PUB}" >&2; exit 1; }
+r_fp="$(key_spki_sha256 "${SECURE_BOOT_DIR}/R.pub.pem")"
+hub_fp="$(key_spki_sha256 "${RELEASE_PUB}")"
+if [[ -z "${r_fp}" || "${r_fp}" != "${hub_fp}" ]]; then
+    echo "[build] signing key and verifier key are different keys:" >&2
+    echo "[build]   deploy/secure-boot/R.pub.pem         sha256 ${r_fp:-<unreadable>}" >&2
+    echo "[build]   shared/secure_boot_release_pub.pem  sha256 ${hub_fp:-<unreadable>}" >&2
+    echo "[build] rotate them together, commit the public half, and rebuild the Hub" >&2
+    exit 1
+fi
+
 # The AWS steps go through a flaky local proxy; let the CLI retry dropped
 # connections itself so one blip doesn't kill a 10-min VM-import build.
 export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-10}" AWS_RETRY_MODE="${AWS_RETRY_MODE:-standard}"
@@ -267,6 +289,25 @@ if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain 2>/dev/null)" && "${SNP_ALL
     echo "[build] working tree is dirty; the recorded COMMIT would not describe the image." >&2
     echo "[build] commit/stash first, or SNP_ALLOW_DIRTY=1." >&2
     exit 1
+fi
+
+# Secure Boot public material is the exception to SNP_ALLOW_DIRTY: the image
+# embeds it, but the Hub that verifies the image compiles the same key in from a
+# COMMIT (//go:embed), not from this worktree. An uncommitted key change here
+# therefore ships an image whose verifier still holds the old key -- the build is
+# green and the deployment is rejected at run time. Everything else may stay
+# dirty; these files may not.
+if [[ "${SNP_ALLOW_DIRTY:-0}" == 1 ]]; then
+    dirty_keys="$(git -C "${REPO_ROOT}" status --porcelain -- \
+        shared/secure_boot_release_pub.pem deploy/secure-boot 2>/dev/null || true)"
+    if [[ -n "${dirty_keys}" ]]; then
+        echo "[build] Secure Boot public material differs from HEAD:" >&2
+        while IFS= read -r line; do echo "[build]   ${line}" >&2; done <<< "${dirty_keys}"
+        echo "[build] the Hub embeds this key from a commit, so a worktree-only change" >&2
+        echo "[build] ships an image the Hub will reject. Commit it (and rebuild the Hub);" >&2
+        echo "[build] SNP_ALLOW_DIRTY=1 does not cover these paths." >&2
+        exit 1
+    fi
 fi
 
 echo "[build] === tee_${ROLE}@${CLOUD} (tag ${TAG}) ==="
