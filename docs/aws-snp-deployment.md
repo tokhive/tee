@@ -59,7 +59,7 @@ openssl pkey -in R.key -pubout -out R.pub.pem
 cert-to-efi-sig-list -g "$(cat GUID.txt)" R.crt.pem R.esl
 ```
 
-第四步，同步发布公钥。`shared/secure_boot_release_pub.pem` 是验证方持有的 R 公钥，编译期经 `//go:embed` 嵌进 Hub 二进制（`shared/secure_boot.go`），Hub 用它在固件事件日志里核对 "R-only" 的 Secure Boot 策略。`snp-build.sh` 在构建期会比对这两份公钥的 SPKI sha256，不一致直接失败；`SNP_ALLOW_DIRTY=1` 也不会放行这两个文件的未提交改动（Hub 的这份公钥是从某个提交里 `//go:embed` 进去的）。所以公钥改动必须提交并重建 Hub，否则 Hub 仍会在运行期以 `event log does not prove an R-only post-separator Secure Boot policy` 拒绝 TEE：
+第四步，同步发布公钥。`shared/secure_boot_release_pub.pem` 是验证方持有的 R 公钥，编译期经 `//go:embed` 嵌进 Hub 二进制（`shared/secure_boot.go`），Hub 用它在固件事件日志里核对 "R-only" 的 Secure Boot 策略。`snp-build.sh` 在构建期会比对这两份公钥的 SPKI sha256，不一致直接失败；`SNP_ALLOW_DIRTY=1` 也不会放行这两个文件的未提交改动（Hub 的这份公钥是从某个提交里 `//go:embed` 进去的）。走 `cloudtest/snp/crosshost.sh build` 时这一步是自动的：打包前它会先把这份公开材料封进一个 commit，所以造完密钥直接构建即可。但 Hub 仍要重建，否则它会在运行期以 `event log does not prove an R-only post-separator Secure Boot policy` 拒绝 TEE：
 
 ```bash
 cp R.pub.pem ../../shared/secure_boot_release_pub.pem

@@ -358,6 +358,56 @@ with open(path, 'w') as catalog:
                          ["releases/catalog.json"])
         self.assertIn("README", self._git("status", "--porcelain").stdout)
 
+    def test_a_rotated_key_is_committed_ahead_of_the_catalog(self):
+        # The image is signed by R and every verifier embeds R's public key from
+        # a COMMIT, so a rotation left in the worktree produces an image the
+        # rebuilt Hub cannot verify. record seals the public half first, and the
+        # private half never enters the history.
+        keys = self.repo / "shared" / "secure_boot_release_pub.pem"
+        secure_boot = self.repo / "deploy" / "secure-boot"
+        keys.parent.mkdir()
+        secure_boot.mkdir(parents=True)
+        (self.repo / ".gitignore").write_text("deploy/secure-boot/*.key\n")
+        (secure_boot / "R.pub.pem").write_text("the previous key\n")
+        keys.write_text("the previous key\n")
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", "keys")
+        keys.write_text("the rotated key\n")
+        (secure_boot / "R.key").write_text("the private half\n")
+        (self.repo / "README").write_text("an unrelated local edit\n")
+        self._git("add", "README")
+        self._state(self.digest)
+        out = self._run("--environment", "staging")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        sealed = self._git("log", "--format=%H", "--grep", "chore(secure-boot): seal").stdout.split()
+        self.assertEqual(len(sealed), 1, "the rotation must be committed")
+        self.assertEqual(
+            self._git("show", "--name-only", "--pretty=format:", sealed[0]).stdout.split(),
+            ["shared/secure_boot_release_pub.pem"],
+            "only the public half is committed; R.key is gitignored, the README was someone else's")
+        # The catalog entry sits on top of the key, so the commit a Hub build
+        # pins carries both.
+        self.assertEqual(self._git("rev-parse", "HEAD~1").stdout.strip(), sealed[0])
+        self.assertEqual(
+            self._git("show", "--name-only", "--pretty=format:", "HEAD").stdout.split(),
+            ["releases/catalog.json"])
+        self.assertIn("README", self._git("status", "--porcelain").stdout)
+
+    def test_no_commit_does_not_seal_the_key_either(self):
+        # --no-commit means every commit is the operator's, so it must not
+        # quietly commit the key material either.
+        keys = self.repo / "shared" / "secure_boot_release_pub.pem"
+        keys.parent.mkdir()
+        keys.write_text("the rotated key\n")
+        self._git("add", "shared")
+        self._git("commit", "-q", "-m", "keys")
+        keys.write_text("a newer key\n")
+        self._state(self.digest)
+        out = self._run("--environment", "staging", "--no-commit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "2")
+        self.assertIn("shared/secure_boot_release_pub.pem", self._git("status", "--porcelain").stdout)
+
     def test_no_commit_leaves_the_entry_for_review(self):
         self._state(self.digest)
         out = self._run("--environment", "staging", "--no-commit")
@@ -516,6 +566,11 @@ with open(path, 'w') as catalog:
             'py() { "$PY" "$@"; }',
             _shell_function("archived_bundle"),
             _shell_function("require_record_environment"),
+            # record seals the Secure Boot public half before writing the
+            # catalog; the tests give it the real function and a repo without
+            # that material, where it is a no-op.
+            _shell_assignment("SECURE_BOOT_PUBLIC_PATHS"),
+            _shell_function("seal_secure_boot_material"),
             _shell_function("cmd_record"),
             # Mirrors crosshost.sh's tee_field, which the extractor cannot lift
             # because it is written on one line.
