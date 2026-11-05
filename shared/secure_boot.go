@@ -363,6 +363,22 @@ func releasePublicKeySPKI() ([]byte, error) {
 	return block.Bytes, nil
 }
 
+// ReleasePublicKeySHA256 is the hex SHA-256 of the DER SubjectPublicKeyInfo of
+// the release key compiled into this build. The key belongs to the binary, not
+// to any one attestation, so a verifier can log it beside a successful proof
+// without threading it out of the verification result. The refusal path already
+// carries releaseKey=, so both paths name the same thing: a Hub reporting a
+// value other than the AMI's R.pub.pem is a Hub that was not rebuilt after the
+// rotation.
+func ReleasePublicKeySHA256() (string, error) {
+	spki, err := releasePublicKeySPKI()
+	if err != nil {
+		return "", err
+	}
+	fingerprint := sha256.Sum256(spki)
+	return fmt.Sprintf("%x", fingerprint), nil
+}
+
 func countCertificatesWithSPKI(certs []x509.Certificate, trustedSPKI []byte) (int, error) {
 	count := 0
 	for i := range certs {

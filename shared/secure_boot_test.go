@@ -1,6 +1,8 @@
 package shared
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -63,6 +65,26 @@ func TestSecureBootPolicyReportNamesTheFailingClause(t *testing.T) {
 	noPost.postAuthorities, noPost.releasePostAuthorities = 0, 0
 	if a, b := secureBootPolicyReport(staleDB), secureBootPolicyReport(noPost); a == b {
 		t.Fatalf("distinct failures produced the same report: %s", a)
+	}
+}
+
+// A Hub logs this next to a successful attestation and an operator compares it
+// with the AMI's R.pub.pem, so it has to describe the key the verifier actually
+// uses -- not a second parse that could drift from it.
+func TestReleasePublicKeyFingerprintIsTheVerifiedKey(t *testing.T) {
+	fp, err := ReleasePublicKeySHA256()
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	if len(fp) != 64 || strings.Trim(fp, "0123456789abcdef") != "" {
+		t.Fatalf("fingerprint is not 32 bytes of lowercase hex: %q", fp)
+	}
+	spki, err := releasePublicKeySPKI()
+	if err != nil {
+		t.Fatalf("embedded SPKI: %v", err)
+	}
+	if want := fmt.Sprintf("%x", sha256.Sum256(spki)); fp != want {
+		t.Fatalf("reported %s, verifier uses %s", fp, want)
 	}
 }
 
