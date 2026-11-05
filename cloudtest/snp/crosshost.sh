@@ -254,7 +254,12 @@ seal_secure_boot_material() {
   [ -n "${dirty}" ] || return 0
   log "secure-boot: public material differs from HEAD; sealing it before ${why}"
   printf '%s\n' "${dirty}" | sed 's/^/  /' >&2
-  git -C "${REPO_ROOT}" add -A -- "${SECURE_BOOT_PUBLIC_PATHS[@]}" 2>/dev/null
+  # Sealing a set that does not describe one key would record the mistake as
+  # history, so the same check snp-build.sh runs gates the commit: R.key, both R
+  # certificates, R.pub.pem and the embedded copy have to agree first. It lives
+  # with the repository it reads, not with the deploy host's state.
+  bash "${REPO_ROOT}/deploy/secure-boot-check.sh"
+  git -C "${REPO_ROOT}" add -A -- "${SECURE_BOOT_PUBLIC_PATHS[@]}"
   # --only keeps an operator's other staged edits out of this commit, for the
   # same reason record uses it: a key rotation should be one reviewable change.
   subject="chore(secure-boot): seal R public material before ${why}"

@@ -240,6 +240,14 @@ class RecordTest(unittest.TestCase):
         self.bundles.mkdir()
         self.deploy = root / "deploy"
         self.deploy.mkdir()
+        # Stand-in for deploy/secure-boot-check.sh: record runs it before sealing
+        # a rotated key and must stop when it fails. The real comparison is
+        # deploy/tests' subject; here the point is that record consults it, and
+        # that nothing is committed when it says no.
+        (self.repo / "deploy").mkdir(exist_ok=True)
+        self.key_check = self.repo / "deploy" / "secure-boot-check.sh"
+        self.key_check.write_text("#!/bin/bash\nexit 0\n")
+        self.key_check.chmod(0o755)
         self.calls = root / "calls.log"
         # Stand-in for release_catalog.py: logs the argv it was handed and keeps
         # the catalog in the shape record reads back (a digest keeps the URL it
@@ -407,6 +415,26 @@ with open(path, 'w') as catalog:
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(self._git("rev-list", "--count", "HEAD").stdout.strip(), "2")
         self.assertIn("shared/secure_boot_release_pub.pem", self._git("status", "--porcelain").stdout)
+
+    def test_a_key_set_the_checker_rejects_is_not_committed(self):
+        # Committing half a rotation would record the mistake as history and hand
+        # it to whoever pins this commit next, so the check gates the seal.
+        keys = self.repo / "shared" / "secure_boot_release_pub.pem"
+        keys.parent.mkdir()
+        keys.write_text("the previous key\n")
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", "keys")
+        keys.write_text("half a rotation\n")
+        self.key_check.write_text("#!/bin/bash\necho 'secure-boot: not one key' >&2\nexit 1\n")
+        before = self._git("rev-parse", "HEAD").stdout.strip()
+        self._state(self.digest)
+        out = self._run("--environment", "staging")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("not one key", out.stdout + out.stderr)
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), before,
+                         "a rejected key set must not reach the history")
+        self.assertIn("shared/secure_boot_release_pub.pem", self._git("status", "--porcelain").stdout)
+        self.assertFalse(self.calls.exists())
 
     def test_no_commit_leaves_the_entry_for_review(self):
         self._state(self.digest)

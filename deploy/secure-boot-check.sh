@@ -1,0 +1,76 @@
+#!/bin/bash
+# Every Secure Boot artifact below has to describe ONE key. R signs the UKI and
+# its certificate is what db trusts, so the image boots only when those agree;
+# the Hub verifies the firmware event log with the public half compiled into it
+# from a commit (shared/secure_boot.go: //go:embed), so the image is accepted
+# only when that copy agrees too.
+#
+#   R.key       signs the UKI                      (private, gitignored, offline ok)
+#   R.crt.pem   the certificate db carries         (source of R.esl)
+#   R.crt.der   the same certificate for GCP's signature-database
+#   R.pub.pem   the verification anchor on the image side
+#   shared/secure_boot_release_pub.pem   the copy compiled into the Hub
+#
+# Half a rotation is invisible at build time and fatal at run time: the TEE
+# comes up and the Hub refuses it with "event log does not prove an R-only
+# post-separator Secure Boot policy". Both snp-build.sh and crosshost.sh call
+# this, so "one key" is decided once. No arguments: the paths come from this
+# script's location.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SECURE_BOOT_DIR="${REPO_ROOT}/deploy/secure-boot"
+RELEASE_PUB="${REPO_ROOT}/shared/secure_boot_release_pub.pem"
+
+# Messages name paths the way the operator wrote them: deploy/secure-boot/...,
+# not an absolute path that has to be read down to its last segment.
+rel() { printf '%s' "${1#"${REPO_ROOT}/"}"; }
+fail() { echo "secure-boot: $*" >&2; exit 1; }
+
+command -v openssl >/dev/null 2>&1 || fail "openssl is required to compare the release keys"
+
+# spki_sha256 <artifact> <kind>: sha256 of the DER SubjectPublicKeyInfo. That
+# encoding is the point: a private key, a certificate and a bare public key are
+# different bytes for the same key, so comparing files would prove nothing.
+# -passin pass: turns an encrypted key into an immediate failure instead of a
+# prompt that waits for a build host nobody is watching.
+spki_sha256() {
+    {
+        case "$2" in
+            key)  openssl pkey -in "$1" -passin pass: -pubout -outform DER ;;
+            pub)  openssl pkey -pubin -in "$1" -outform DER ;;
+            cert) openssl x509 -in "$1" -noout -pubkey | openssl pkey -pubin -outform DER ;;
+            der)  openssl x509 -in "$1" -inform DER -noout -pubkey | openssl pkey -pubin -outform DER ;;
+            *)    return 1 ;;
+        esac
+    } 2>/dev/null | openssl dgst -sha256 | sed -e 's/^.*=[[:space:]]*//' || true
+}
+
+want="" first=""
+for spec in "${SECURE_BOOT_DIR}/R.pub.pem:pub" \
+            "${SECURE_BOOT_DIR}/R.crt.pem:cert" \
+            "${SECURE_BOOT_DIR}/R.crt.der:der" \
+            "${RELEASE_PUB}:pub"; do
+    path="${spec%:*}" kind="${spec##*:}"
+    [[ -f "${path}" ]] || fail "missing $(rel "${path}")"
+    fp="$(spki_sha256 "${path}" "${kind}")"
+    [[ -n "${fp}" ]] || fail "no public key in $(rel "${path}")"
+    if [[ -z "${want}" ]]; then
+        want="${fp}" first="${path}"
+    elif [[ "${fp}" != "${want}" ]]; then
+        fail "$(printf '%s is %s but %s is %s\nsecure-boot: these must be one key: rotate them together, commit the public half, and rebuild the Hub' \
+            "$(rel "${path}")" "${fp}" "$(rel "${first}")" "${want}")"
+    fi
+done
+
+# R.key may sit in an offline vault rather than on the build host, so it is
+# checked only when it is here. When it is, it has to be the key its own
+# certificate names: signing with a key db does not trust bricks the boot.
+if [[ -f "${SECURE_BOOT_DIR}/R.key" ]]; then
+    key_fp="$(spki_sha256 "${SECURE_BOOT_DIR}/R.key" key)"
+    [[ "${key_fp}" == "${want}" ]] || fail "$(printf '%s is %s but its certificate names %s; re-issue R.crt.pem/R.crt.der/R.esl/aws-uefi-data.b64 from this key' \
+        "deploy/secure-boot/R.key" "${key_fp:-<unreadable>}" "${want}")"
+fi
+
+echo "secure-boot: one key, SPKI sha256 ${want}"

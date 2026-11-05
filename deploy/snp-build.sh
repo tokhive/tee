@@ -42,27 +42,13 @@ for required in PK.crt.der KEK.crt.der R.crt.der R.crt.pem R.pub.pem R.key aws-u
     }
 done
 
-# This image is signed by R; the Hub checks the boot chain against the R public
-# key compiled into it (`//go:embed secure_boot_release_pub.pem`). Two copies of
-# one key: deploy/secure-boot/R.pub.pem signs, shared/ embeds. If they drift the
-# build still succeeds and the Hub rejects the TEE at run time with
-# "event log does not prove an R-only post-separator Secure Boot policy", which
-# is a ten-minute deployment failing on a mistake that is visible right here.
-key_spki_sha256() {
-    openssl pkey -pubin -in "$1" -outform DER 2>/dev/null |
-        openssl dgst -sha256 | sed -e 's/^.*=[[:space:]]*//'
-}
-RELEASE_PUB="${REPO_ROOT}/shared/secure_boot_release_pub.pem"
-[[ -f "${RELEASE_PUB}" ]] || { echo "[build] missing ${RELEASE_PUB}" >&2; exit 1; }
-r_fp="$(key_spki_sha256 "${SECURE_BOOT_DIR}/R.pub.pem")"
-hub_fp="$(key_spki_sha256 "${RELEASE_PUB}")"
-if [[ -z "${r_fp}" || "${r_fp}" != "${hub_fp}" ]]; then
-    echo "[build] signing key and verifier key are different keys:" >&2
-    echo "[build]   deploy/secure-boot/R.pub.pem         sha256 ${r_fp:-<unreadable>}" >&2
-    echo "[build]   shared/secure_boot_release_pub.pem  sha256 ${hub_fp:-<unreadable>}" >&2
-    echo "[build] rotate them together, commit the public half, and rebuild the Hub" >&2
-    exit 1
-fi
+# This image is signed by R and the Hub verifies the boot chain against the same
+# key compiled in from a commit (`//go:embed secure_boot_release_pub.pem`). A
+# half-rotated set builds fine and is rejected at run time, so the whole set --
+# R.key, both R certificates, R.pub.pem, and the copy under shared/ -- is checked
+# here. record runs the same script before it commits, so the two cannot disagree
+# about what "one key" means.
+bash "${SCRIPT_DIR}/secure-boot-check.sh"
 
 # The AWS steps go through a flaky local proxy; let the CLI retry dropped
 # connections itself so one blip doesn't kill a 10-min VM-import build.
