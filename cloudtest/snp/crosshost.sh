@@ -46,13 +46,11 @@
 #               append the app an environment runs to releases/catalog.json:
 #               `release` registers the measured bundle once, `activate` moves
 #               the environment onto it, and the entry is committed on its own.
-#               A Secure Boot public half that differs from HEAD is committed
-#               first, so the history holds the key the recorded image was
-#               signed with. Run it after that environment is serving the app;
-#               nothing in build/up/deploy calls it. Production inherits
-#               staging's release when no identity is given; --from <env> names
-#               a different source. --dry-run prints the calls instead of
-#               writing them, --no-commit leaves every commit to the operator.
+#               Run it after that environment is serving the app; nothing in
+#               build/up/deploy calls it. Production inherits staging's release
+#               when no identity is given; --from <env> names a different
+#               source. --dry-run prints the calls instead of writing them,
+#               --no-commit leaves the commit to the operator.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"          # cloudtest/snp
 # The host shell may carry PYTHONHOME/PYTHONPATH injected by an unrelated tool
@@ -234,57 +232,8 @@ archived_bundle() {
   printf '%s\n' "${path}"
 }
 
-# The image is signed by R, and every verifier embeds R's public key from this
-# module (shared/secure_boot.go: //go:embed). The public half therefore has to be
-# in the history before anything is built from it: an image built next to an
-# uncommitted rotation is verified by a Hub compiled from a commit that still
-# holds the old key, and the TEE is rejected at run time with "event log does not
-# prove an R-only post-separator Secure Boot policy". snp-build.sh refuses that
-# state; sealing here is what keeps "generate R, then build" one step and keeps
-# the COMMIT recorded in the AMI a commit that carries the key.
-SECURE_BOOT_PUBLIC_PATHS=(shared/secure_boot_release_pub.pem deploy/secure-boot)
-
-# seal_secure_boot_material <why>: commit the public half when the worktree
-# differs from HEAD. Private keys are gitignored and never enter this commit, and
-# nothing is pushed: which branch a deploy host sits on is not this script's
-# decision.
-seal_secure_boot_material() {
-  local why="$1" dirty subject
-  dirty="$(git -C "${REPO_ROOT}" status --porcelain -- "${SECURE_BOOT_PUBLIC_PATHS[@]}" 2>/dev/null || true)"
-  [ -n "${dirty}" ] || return 0
-  log "secure-boot: public material differs from HEAD; sealing it before ${why}"
-  printf '%s\n' "${dirty}" | sed 's/^/  /' >&2
-  # Sealing a set that does not describe one key would record the mistake as
-  # history, so the same check snp-build.sh runs gates the commit: R.key, both R
-  # certificates, R.pub.pem and the embedded copy have to agree first. It lives
-  # with the repository it reads, not with the deploy host's state.
-  bash "${REPO_ROOT}/deploy/secure-boot-check.sh"
-  # A commit made on a detached HEAD is on no branch, so TEE_REVISION cannot pin
-  # it: the rotation would look committed and still be unreachable. CI checkouts
-  # are detached by construction, which is where this build runs.
-  git -C "${REPO_ROOT}" symbolic-ref -q HEAD >/dev/null || {
-    log "secure-boot: HEAD is detached; a commit here cannot be pinned by TEE_REVISION"
-    log "secure-boot: check out the branch that carries the rotation, then retry"
-    exit 1
-  }
-  git -C "${REPO_ROOT}" add -A -- "${SECURE_BOOT_PUBLIC_PATHS[@]}"
-  # --only keeps an operator's other staged edits out of this commit, for the
-  # same reason record uses it: a key rotation should be one reviewable change.
-  subject="chore(secure-boot): seal R public material before ${why}"
-  git -C "${REPO_ROOT}" commit --only --quiet -m "${subject}" -m \
-    "The image is signed by R and every verifier embeds this key at compile
-time (//go:embed), so both halves have to travel in one commit: an image built
-beside an uncommitted rotation is rejected by a Hub that still holds the old
-key. R.key stays offline and gitignored." -- "${SECURE_BOOT_PUBLIC_PATHS[@]}"
-  log "secure-boot: committed $(git -C "${REPO_ROOT}" --no-pager log --oneline -1)"
-}
-
 cmd_build() {
   log "step: build (certs + policy + real-tee bundle + AMI + linux binaries)"
-  # Before ensure_certs/pack.sh: the bundle manifest records the source commit,
-  # and that commit is what a Hub build pins, so it must already hold the key
-  # this image is signed with.
-  seal_secure_boot_material "build"
   ensure_certs
   ensure_policy
   ( cd "${HERE}" && SNP_POLICY_DIR="${POLICY_DIR}" \
@@ -303,7 +252,6 @@ cmd_build() {
 
 cmd_build_single() {
   log "step: build (certs + policy + supervisor bundle + AMI)"
-  seal_secure_boot_material "build-single"
   ensure_certs
   ensure_policy
   # The supervisor bundle needs the Hub's TLS identity (hub-cert/key) and the
@@ -629,15 +577,6 @@ cmd_record() {
     log "record: ${catalog#"${REPO_ROOT}"/} is not tracked on this branch"
     log "record: switch to the branch that carries it, or add the file yourself"
     exit 1
-  fi
-  # A release record is a claim about a deployment, and that deployment's image
-  # carries R. Seal the public half in the same breath, so the history a Hub
-  # build pins holds the key this image was signed with. --no-commit means the
-  # operator reviews and commits everything, so it skips this too.
-  if [ "${commit}" = 1 ]; then
-    seal_secure_boot_material "recording ${env}"
-  else
-    log "secure-boot: --no-commit; shared/secure_boot_release_pub.pem and deploy/secure-boot are yours to commit"
   fi
   py "${DEPLOY_DIR}/release_catalog.py" release --catalog "${catalog}" \
     --bundle "${bundle}" --manifest "${manifest}" --release-url "${release_url}"

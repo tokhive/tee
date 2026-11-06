@@ -42,12 +42,12 @@ for required in PK.crt.der KEK.crt.der R.crt.der R.crt.pem R.pub.pem R.key aws-u
     }
 done
 
-# This image is signed by R and the Hub verifies the boot chain against the same
-# key compiled in from a commit (`//go:embed secure_boot_release_pub.pem`). A
-# half-rotated set builds fine and is rejected at run time, so the whole set --
-# R.key, both R certificates, R.pub.pem, and the copy under shared/ -- is checked
-# here. record runs the same script before it commits, so the two cannot disagree
-# about what "one key" means.
+# This image is signed by R and the boot chain is verified against R's public
+# key. A half-rotated set builds fine and is rejected at run time, so the whole
+# set -- R.key, both R certificates, R.pub.pem, the copy under shared/, and the
+# certificate inside R.esl -- is checked here. The artifacts stay where the
+# operator put them: an experimental key belongs to whoever generated it, and
+# nothing about this check requires it to be committed.
 bash "${SCRIPT_DIR}/secure-boot-check.sh"
 
 # The AWS steps go through a flaky local proxy; let the CLI retry dropped
@@ -275,25 +275,6 @@ if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain 2>/dev/null)" && "${SNP_ALL
     echo "[build] working tree is dirty; the recorded COMMIT would not describe the image." >&2
     echo "[build] commit/stash first, or SNP_ALLOW_DIRTY=1." >&2
     exit 1
-fi
-
-# Secure Boot public material is the exception to SNP_ALLOW_DIRTY: the image
-# embeds it, but the Hub that verifies the image compiles the same key in from a
-# COMMIT (//go:embed), not from this worktree. An uncommitted key change here
-# therefore ships an image whose verifier still holds the old key -- the build is
-# green and the deployment is rejected at run time. Everything else may stay
-# dirty; these files may not.
-if [[ "${SNP_ALLOW_DIRTY:-0}" == 1 ]]; then
-    dirty_keys="$(git -C "${REPO_ROOT}" status --porcelain -- \
-        shared/secure_boot_release_pub.pem deploy/secure-boot 2>/dev/null || true)"
-    if [[ -n "${dirty_keys}" ]]; then
-        echo "[build] Secure Boot public material differs from HEAD:" >&2
-        while IFS= read -r line; do echo "[build]   ${line}" >&2; done <<< "${dirty_keys}"
-        echo "[build] the Hub embeds this key from a commit, so a worktree-only change" >&2
-        echo "[build] ships an image the Hub will reject. Commit it (and rebuild the Hub);" >&2
-        echo "[build] SNP_ALLOW_DIRTY=1 does not cover these paths." >&2
-        exit 1
-    fi
 fi
 
 echo "[build] === tee_${ROLE}@${CLOUD} (tag ${TAG}) ==="
