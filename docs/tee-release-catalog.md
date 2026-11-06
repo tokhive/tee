@@ -1,6 +1,6 @@
 # TEE 应用身份发布清单
 
-`releases/catalog.json` 是供 Hive 用户页面及独立核对使用的版本化发布记录。它保存应用身份、策略哈希、构建来源、各环境的使用历史及撤销公告；通过 Git 提交和审查发布。`deploy/release_catalog.py` 负责生成构建清单、登记和校验记录，并导出指定环境的公开视图。该工具仅操作本机文件，不创建云资源，也不自动提交或推送；需要在部署机上一条命令完成“登记并提交”时用 `cloudtest/snp/crosshost.sh record`，它提交 `releases/catalog.json`，以及（在两者与 HEAD 不一致时）Secure Boot 的公开材料，且从不推送。
+`releases/catalog.json` 是供 Hive 用户页面及独立核对使用的版本化发布记录。它保存应用身份、策略哈希、构建来源、各环境的使用历史及撤销公告；通过 Git 提交和审查发布。`deploy/release_catalog.py` 负责生成构建清单、登记和校验记录，并导出指定环境的公开视图。该工具仅操作本机文件，不创建云资源，也不自动提交或推送；需要在部署机上一条命令完成“登记并提交”时用 `cloudtest/snp/crosshost.sh record`，它只提交 `releases/catalog.json` 这一个文件，且从不推送。
 
 ## 构建记录与正式发布
 
@@ -27,7 +27,7 @@ tar -xOf "$TEE_BUNDLE" ./policy/policy.cbor | go run ./cmd/tee-policy-info -
 
 构建成功只生成候选清单，**不等于正式发布或已经启用**。缺少 Git 来源、被编译源码未提交、缺失生产策略或公共根证书包，以及 `single`／`stub` 诊断构建均不能登记为正式发布。日常本机调试仍可生成带有不完整来源或 `source_dirty: true` 的构建清单。
 
-“源码不干净”专指会影响被编译产物的改动（Go 源码、模块元数据、策略文档）。运维本地的笔记与工具缓存不会让 `crosshost.sh record` 被拒绝：这些字节若进入 bundle，只能通过 `SNP_*` 指定路径进入，而 bundle 摘要（即应用身份）本身已经把它们固定下来。`record` 只提交两类路径：`releases/catalog.json`，以及 Secure Boot 的公开材料（`shared/secure_boot_release_pub.pem`、`deploy/secure-boot/`）——后者在部署机上是轮换 R 的正常产物，必须在打包前进入历史，否则镜像与 Hub 会各持一把钥匙。其余本地改动既不进提交、也不阻止登记。构建时若存在影响来源的未提交改动，`pack.sh` 的日志会列出具体文件。
+“源码不干净”专指会影响被编译产物的改动（Go 源码、模块元数据、策略文档）。运维本地的密钥轮换、证书更新和笔记不会让 `crosshost.sh record` 被拒绝：这些字节若进入 bundle，只能通过 `SNP_*` 指定路径进入，而 bundle 摘要（即应用身份）本身已经把它们固定下来；`record` 也始终只提交 `releases/catalog.json` 这一个文件，其余本地改动既不进提交、也不阻止登记。构建时若存在影响来源的未提交改动，`pack.sh` 的日志会列出具体文件。
 
 需要 Unix 环境、Python 3.9+、Git 和本仓库要求的 Go 工具链。除 Go 模块依赖外，登记工具不需要 Python 第三方包，也不调用 AWS、GCP 或 Hive API。
 
@@ -91,7 +91,7 @@ python3 deploy/release_catalog.py deactivate \
 ./crosshost.sh record --environment production --application-id 'snp-app:<hex>'
 ```
 
-它先确定要记录的身份：`--application-id` 显式给出；生产版在没给身份时默认沿用 `staging` 当前启用的构建；其余情况读 `cloudtest/crosshost.json` 里本机最后启动的 `app_hash`。要把生产版的默认换成别的来源，用 `--from <环境>`。然后用 `archived_bundle` 取回归档并重算 SHA-256 核对，要求存在 `<sha256>.tar.build.json` 侧车文件；若 Secure Boot 公开材料与 HEAD 不一致，先 `git commit --only shared/secure_boot_release_pub.pem deploy/secure-boot` 把它封存，再依次调用 `release` 与 `activate`，最后 `git commit --only releases/catalog.json`。`--release-url` 缺省为构建来源的提交链接，要指向发布说明或 PR 就显式传入；同一应用身份的链接必须保持不变，否则工具拒绝重新登记。
+它先确定要记录的身份：`--application-id` 显式给出；生产版在没给身份时默认沿用 `staging` 当前启用的构建；其余情况读 `cloudtest/crosshost.json` 里本机最后启动的 `app_hash`。要把生产版的默认换成别的来源，用 `--from <环境>`。然后用 `archived_bundle` 取回归档并重算 SHA-256 核对，要求存在 `<sha256>.tar.build.json` 侧车文件，依次调用 `release` 与 `activate`，最后 `git commit --only releases/catalog.json`。`--release-url` 缺省为构建来源的提交链接，要指向发布说明或 PR 就显式传入；同一应用身份的链接必须保持不变，否则工具拒绝重新登记。
 
 `--from` 读的是清单里已有的记录，所以来源环境必须先登记过，它只决定“记哪个身份”，归档、哈希和侧车校验一样不少。`--application-id` 与 `--from` 同时给会直接被拒，不会静默取其中一个。生产版不读本机状态：本机从不启动生产机，读到的只会是别的环境。
 
