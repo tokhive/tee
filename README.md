@@ -151,6 +151,12 @@ deletion matches on them; renaming them would orphan live instances.
   must name. Both sides compute it from this module so they cannot drift.
 - `tunnel` is the wire format between the Hub and a provider agent.
 - `tee`, `jobs`, `proof` carry the job spec, the response framing and the receipt.
+- `shared.SetReleasePublicKeyPEM` lets a verifier use the release key it was
+  handed (a file or a config value) instead of the copy embedded here. Leave it
+  unset and the embedded key is used; call it with an unparsable key and it
+  returns an error rather than silently falling back. `shared.ReleasePublicKeySHA256`
+  reports whichever key is in effect, so a log line and a verification cannot
+  disagree.
 
 Pin a commit, not a version range. `hive` and `bee` keep the pinned commit in a
 `TEE_REVISION` file and vendor it into `.cache/` at build time.

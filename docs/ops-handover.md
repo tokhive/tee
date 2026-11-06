@@ -121,7 +121,15 @@ cp R.pub.pem ../../shared/secure_boot_release_pub.pem
 
 **密钥材料不必进仓库。** 生产 `R.key` 不交给开发人员，开发自己造的试验用密钥也不应该塞进版本库。这套材料只要求"同一把钥匙"，不要求被提交：`deploy/secure-boot/` 与 `shared/secure_boot_release_pub.pem` 留在生成它的机器上就能构建。真正需要跨机器交付的是**公钥**——Hub 侧以文件或外部配置持有它（Hive 仓库负责读取），部署时把它指向 AMI 里那把 R。
 
-**一致性校验**：`deploy/secure-boot-check.sh` 比对整套材料的 DER SPKI sha256——`R.key`（若在本机）、`R.crt.pem`、`R.crt.der`、`R.pub.pem`、`shared/secure_boot_release_pub.pem`，任何一处不同就失败；它还会检查 `R.esl` 里确实装着当前 `R.crt.der`（漏跑 `cert-to-efi-sig-list` 会在这里被拦下）。`snp-build.sh` 在构建前跑它，所以半套轮换到不了镜像里；它不检查 git 状态，脏工作区里的试验密钥照样能构建。`aws-uefi-data.b64` 是 AWS 自己的容器格式，脚本不解析它，重建后仍按下一节用 `uefivars -i aws -o json` 人工确认。只想看两把公钥是否同一把：
+**一致性校验**：`deploy/secure-boot-check.sh` 比对整套材料的 DER SPKI sha256——`R.key`（若在本机）、`R.crt.pem`、`R.crt.der`、`R.pub.pem`、`shared/secure_boot_release_pub.pem`，任何一处不同就失败；它还会检查 `R.esl` 里确实装着当前 `R.crt.der`（漏跑 `cert-to-efi-sig-list` 会在这里被拦下）。`snp-build.sh` 在构建前跑它，所以半套轮换到不了镜像里；它不检查 git 状态，脏工作区里的试验密钥照样能构建。`aws-uefi-data.b64` 是 AWS 自己的容器格式，脚本不解析它，重建后仍按下一节用 `uefivars -i aws -o json` 人工确认。
+
+生产 Hub 用的是**它自己那份公钥文件**（见 `README.md` 的 `SetReleasePublicKeyPEM`），不是本仓库的 `shared/` 副本。核对两者是否同一把钥匙：
+
+```bash
+./deploy/secure-boot-check.sh --release-pem /etc/hive/release-key.pem   # 路径按实际部署
+```
+
+只想看两把公钥是否同一把：
 
 ```bash
 openssl pkey -pubin -in R.pub.pem -outform DER | openssl dgst -sha256
@@ -350,7 +358,7 @@ cd cloudtest/snp
 
 ## 12. 四条硬约束
 
-1. **R 公钥由 Hub 侧持有，不进仓库。** 生产 `R.key` 不交给开发人员，试验用密钥也不应该提交，所以本仓库只校验这套材料互相一致（`deploy/secure-boot-check.sh`），不要求它出现在任何 commit 里。真正的交付物是公钥：部署时把它以文件或外部配置的形式交给 Hub，并保证它就是 AMI 里那把 R——两边指纹对不上，Hub 会在运行期以 `event log does not prove an R-only post-separator Secure Boot policy` 拒绝 TEE。
+1. **R 公钥由 Hub 侧持有，不进仓库。** 生产 `R.key` 不交给开发人员，试验用密钥也不应该提交，所以本仓库只校验这套材料互相一致（`deploy/secure-boot-check.sh`），不要求它出现在任何 commit 里。真正的交付物是公钥：部署时把它以文件或外部配置的形式交给 Hub（Hub 侧调 `shared.SetReleasePublicKeyPEM` 载入），并保证它就是 AMI 里那把 R。核对方式是 `./deploy/secure-boot-check.sh --release-pem <Hub 的公钥文件>`，或比对 Hub 日志里的 `secure_boot_release_key` 与 `R.pub.pem` 的指纹——对不上时 Hub 会在运行期以 `event log does not prove an R-only post-separator Secure Boot policy` 拒绝 TEE。
 2. **换 R = 换镜像 + 换 Hub 的配置。** 本仓库的 `//go:embed` 副本仍然是 `cmd/tee`/测试用 `cmd/hub` 的验证锚，`crosshost.sh build` 末尾会重编它们（`run.sh build`）；生产 Hub 读的是部署方交给它的那份公钥，轮换时两边一起换，顺序反了就会运行期被拒。
 3. **CA 只生成一次。** `.certs/` 一旦被烘进 AMI，就不能再跑 `gencerts` 覆盖。轮换要 AMI + Hub 一起重做。
 4. **改任何被测字节都要重新 pin。** 代码、白名单、bundle 内证书，任一变化都改 `snp-app:` 摘要。Hub 的 `-expected-app` 与 `crosshost.json` 的 `tee.app_hash` 必须同步更新。

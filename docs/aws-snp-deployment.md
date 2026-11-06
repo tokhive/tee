@@ -59,7 +59,7 @@ openssl pkey -in R.key -pubout -out R.pub.pem
 cert-to-efi-sig-list -g "$(cat GUID.txt)" R.crt.pem R.esl
 ```
 
-第四步，同步发布公钥。`R.pub.pem` 是验证方（Hub）持有的 R 公钥，Hub 用它在固件事件日志里核对 "R-only" 的 Secure Boot 策略。这份公钥**不进仓库、也不需要提交**：本仓库内的 `shared/secure_boot_release_pub.pem` 只是 `cmd/tee` 与测试用 `cmd/hub` 的编译期锚点（`//go:embed`），生产 Hub 由部署方以文件或外部配置的形式拿到它。交付时只要求两边是同一把钥匙，指纹核对见下。这一半弄错，Hub 会在运行期以 `event log does not prove an R-only post-separator Secure Boot policy` 拒绝 TEE：
+第四步，同步发布公钥。`R.pub.pem` 是验证方（Hub）持有的 R 公钥，Hub 用它在固件事件日志里核对 "R-only" 的 Secure Boot 策略。这份公钥**不进仓库、也不需要提交**：本仓库内的 `shared/secure_boot_release_pub.pem` 只是 `cmd/tee` 与测试用 `cmd/hub` 的编译期锚点（`//go:embed`），生产 Hub 由部署方以文件或外部配置的形式拿到它，启动时用 `shared.SetReleasePublicKeyPEM` 载入。交付时只要求两边是同一把钥匙，核对用 `./deploy/secure-boot-check.sh --release-pem <Hub 的公钥文件>`，指纹核对见下。这一半弄错，Hub 会在运行期以 `event log does not prove an R-only post-separator Secure Boot policy` 拒绝 TEE：
 
 ```bash
 cp R.pub.pem ../../shared/secure_boot_release_pub.pem

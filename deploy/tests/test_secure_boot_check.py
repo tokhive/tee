@@ -47,8 +47,16 @@ class SecureBootCheckTest(unittest.TestCase):
         openssl(self.secure_boot, "pkey", "-in", "R.key", "-pubout", "-out", "R.pub.pem")
         shutil.copy(self.secure_boot / "R.pub.pem", self.release_pem)
 
-    def check(self):
-        return subprocess.run(["bash", str(self.deploy / "secure-boot-check.sh")],
+    def other_public_key(self, name="hub"):
+        """A key nothing else here was built with, standing in for the verifier's
+        own copy of the release key."""
+        openssl(self.root, "genpkey", "-algorithm", "RSA",
+                "-pkeyopt", "rsa_keygen_bits:2048", "-out", f"{name}.key")
+        openssl(self.root, "pkey", "-in", f"{name}.key", "-pubout", "-out", f"{name}.pem")
+        return self.root / f"{name}.pem"
+
+    def check(self, *args):
+        return subprocess.run(["bash", str(self.deploy / "secure-boot-check.sh"), *args],
                               capture_output=True, text=True)
 
     def test_one_key_passes_and_names_its_fingerprint(self):
@@ -68,6 +76,32 @@ class SecureBootCheckTest(unittest.TestCase):
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("secure_boot_release_pub.pem", out.stderr)
         self.assertIn("must be one key", out.stderr)
+
+    def test_the_verifiers_own_key_file_can_be_checked(self):
+        # On the deploy host the verifier reads a file of its own; the copy under
+        # shared/ is only this repository's build-time default, so an operator
+        # has to be able to point the check at the file actually in use.
+        self.rotate()
+        same = shutil.copy(self.secure_boot / "R.pub.pem", self.root / "hub.pem")
+        out = self.check("--release-pem", same)
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+        out = self.check("--release-pem", self.other_public_key())
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("hub.pem", out.stderr)
+        self.assertIn("must be one key", out.stderr)
+
+    def test_release_pem_without_a_path_is_refused(self):
+        self.rotate()
+        out = self.check("--release-pem")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("needs a path", out.stderr)
+
+    def test_unknown_arguments_are_refused(self):
+        self.rotate()
+        out = self.check("--key", "x")
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("unknown argument", out.stderr)
 
     def test_a_rotation_that_forgot_the_certificates_is_refused(self):
         # Regenerating R.key alone leaves db trusting a certificate for a key
