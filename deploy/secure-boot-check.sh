@@ -1,21 +1,21 @@
 #!/bin/bash
 # Every Secure Boot artifact below has to describe ONE key. R signs the UKI and
 # its certificate is what db trusts, so the image boots only when those agree;
-# the Hub verifies the firmware event log with the public half compiled into it
-# from a commit (shared/secure_boot.go: //go:embed), so the image is accepted
-# only when that copy agrees too.
+# the verifier rejects the firmware event log unless it holds the same public
+# half, so the image is accepted only when that copy agrees too.
 #
 #   R.key       signs the UKI                      (private, gitignored, offline ok)
 #   R.crt.pem   the certificate db carries         (source of R.esl)
 #   R.crt.der   the same certificate for GCP's signature-database
 #   R.pub.pem   the verification anchor on the image side
-#   shared/secure_boot_release_pub.pem   the copy compiled into the Hub
+#   shared/secure_boot_release_pub.pem   this repository's build-time default
 #
 # Half a rotation is invisible at build time and fatal at run time: the TEE
-# comes up and the Hub refuses it with "event log does not prove an R-only
-# post-separator Secure Boot policy". Both snp-build.sh and crosshost.sh call
-# this, so "one key" is decided once. No arguments: the paths come from this
-# script's location.
+# comes up and the verifier refuses it with "event log does not prove an R-only
+# post-separator Secure Boot policy". snp-build.sh runs this on the build host;
+# --release-pem <path> checks a verifier's own key file instead of the shared
+# copy, which is what a production Hub holds (its key is not this repository's).
+set -euo pipefail
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +27,20 @@ RELEASE_PUB="${REPO_ROOT}/shared/secure_boot_release_pub.pem"
 # not an absolute path that has to be read down to its last segment.
 rel() { printf '%s' "${1#"${REPO_ROOT}/"}"; }
 fail() { echo "secure-boot: $*" >&2; exit 1; }
+
+# The verifier on the deploy host may read its key from a file of its own rather
+# than from this repository (a production R.pub.pem is not shared with
+# developers). --release-pem checks that file instead of the copy under shared/,
+# which is only this repository's build-time default.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --release-pem)
+            [[ $# -ge 2 && -n "$2" ]] || fail "--release-pem needs a path"
+            RELEASE_PUB="$2"
+            shift 2 ;;
+        *) fail "unknown argument $1 (usage: secure-boot-check.sh [--release-pem <path>])" ;;
+    esac
+done
 
 command -v openssl >/dev/null 2>&1 || fail "openssl is required to compare the release keys"
 

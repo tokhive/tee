@@ -1,7 +1,11 @@
 package shared
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"strings"
 	"testing"
@@ -85,6 +89,98 @@ func TestReleasePublicKeyFingerprintIsTheVerifiedKey(t *testing.T) {
 	}
 	if want := fmt.Sprintf("%x", sha256.Sum256(spki)); fp != want {
 		t.Fatalf("reported %s, verifier uses %s", fp, want)
+	}
+}
+
+// releaseKeyPEM builds a throwaway key the way an operator's file would look.
+func releaseKeyPEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("marshal public key: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
+}
+
+// Rotation should not mean rebuilding the verifier: a deployment hands its key
+// in, and every path in this package -- verification, the reported fingerprint --
+// has to follow it.
+func TestConfiguredReleaseKeyReplacesTheEmbeddedOne(t *testing.T) {
+	embedded, err := ReleasePublicKeySHA256()
+	if err != nil {
+		t.Fatalf("embedded fingerprint: %v", err)
+	}
+	configured := releaseKeyPEM(t)
+	if err := SetReleasePublicKeyPEM(configured); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := SetReleasePublicKeyPEM(nil); err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+	})
+
+	spki, err := releasePublicKeySPKI()
+	if err != nil {
+		t.Fatalf("spki: %v", err)
+	}
+	want := fmt.Sprintf("%x", sha256.Sum256(spki))
+	got, err := ReleasePublicKeySHA256()
+	if err != nil {
+		t.Fatalf("configured fingerprint: %v", err)
+	}
+	if got != want {
+		t.Fatalf("reported %s, verifier uses %s", got, want)
+	}
+	if got == embedded {
+		t.Fatal("configured key did not replace the embedded one")
+	}
+}
+
+// Clearing the override has to restore the embedded key, or a test (or a
+// reconfiguration) would leave the process on a key nobody chose.
+func TestClearingTheConfiguredReleaseKeyRestoresTheEmbeddedOne(t *testing.T) {
+	embedded, err := ReleasePublicKeySHA256()
+	if err != nil {
+		t.Fatalf("embedded fingerprint: %v", err)
+	}
+	if err := SetReleasePublicKeyPEM(releaseKeyPEM(t)); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	if err := SetReleasePublicKeyPEM(nil); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	got, err := ReleasePublicKeySHA256()
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	if got != embedded {
+		t.Fatalf("after clearing, verifier still uses %s", got)
+	}
+}
+
+// A key that cannot be parsed must fail loudly: falling back to the embedded
+// copy would verify with a key the operator is not looking at.
+func TestAnUnparsableConfiguredReleaseKeyIsRejected(t *testing.T) {
+	embedded, err := ReleasePublicKeySHA256()
+	if err != nil {
+		t.Fatalf("embedded fingerprint: %v", err)
+	}
+	for _, bad := range [][]byte{[]byte("not a pem block"), {}, []byte("-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n")} {
+		if err := SetReleasePublicKeyPEM(bad); err == nil {
+			t.Fatalf("accepted %q", bad)
+		}
+	}
+	got, err := ReleasePublicKeySHA256()
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	if got != embedded {
+		t.Fatalf("a rejected key changed what the verifier uses: %s", got)
 	}
 }
 

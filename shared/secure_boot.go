@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"encoding/pem"
 	"fmt"
+	"sync"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/go-eventlog/extract"
@@ -25,8 +26,42 @@ const (
 // The deployment release-signing public key is the stable cross-cloud trust
 // root. Certificates in UEFI db may be reissued without changing this key.
 //
+// This copy is the default: a deployment that hands its key in from outside (a
+// file or config) overrides it with SetReleasePublicKeyPEM, so rotating R does
+// not mean rebuilding the verifier.
+//
 //go:embed secure_boot_release_pub.pem
 var secureBootReleasePublicKeyPEM []byte
+
+var (
+	// configuredReleaseKeyPEM holds the override; nil means "use the embedded
+	// copy", which is what every build of this module ships.
+	configuredReleaseKeyPEM []byte
+	releaseKeyMu            sync.RWMutex
+)
+
+// SetReleasePublicKeyPEM replaces the embedded release key with one the caller
+// read from outside this binary -- a file or a configuration value. Passing nil
+// clears the override and restores the embedded copy.
+//
+// An unparsable key is an error, never a silent fallback: a verifier that
+// accepted the embedded key while its operator believed another one was in use
+// would report a fingerprint it does not actually verify with.
+func SetReleasePublicKeyPEM(keyPEM []byte) error {
+	if keyPEM == nil {
+		releaseKeyMu.Lock()
+		configuredReleaseKeyPEM = nil
+		releaseKeyMu.Unlock()
+		return nil
+	}
+	if _, err := spkiFromPEM(keyPEM, "configured"); err != nil {
+		return err
+	}
+	releaseKeyMu.Lock()
+	configuredReleaseKeyPEM = append([]byte(nil), keyPEM...)
+	releaseKeyMu.Unlock()
+	return nil
+}
 
 // SecureBootResult describes the event-log proof layered on top of the current
 // combined SEV2 attestation.
@@ -352,24 +387,38 @@ func secureBootAuthorityPolicyOK(policy secureBootAuthorityPolicy) bool {
 		policy.releasePostAuthorities == policy.postAuthorities
 }
 
+// releasePublicKeySPKI is the key every verification in this process uses: the
+// configured override when one is set, otherwise the copy embedded at build time.
 func releasePublicKeySPKI() ([]byte, error) {
-	block, _ := pem.Decode(secureBootReleasePublicKeyPEM)
+	releaseKeyMu.RLock()
+	configured := configuredReleaseKeyPEM
+	releaseKeyMu.RUnlock()
+	if configured != nil {
+		return spkiFromPEM(configured, "configured")
+	}
+	return spkiFromPEM(secureBootReleasePublicKeyPEM, "embedded")
+}
+
+// spkiFromPEM returns the DER SubjectPublicKeyInfo, which is the encoding every
+// comparison in this package is made over.
+func spkiFromPEM(keyPEM []byte, source string) ([]byte, error) {
+	block, _ := pem.Decode(keyPEM)
 	if block == nil || block.Type != "PUBLIC KEY" {
-		return nil, fmt.Errorf("embedded Secure Boot release public key is invalid PEM")
+		return nil, fmt.Errorf("%s Secure Boot release public key is not a PEM PUBLIC KEY block", source)
 	}
 	if _, err := x509.ParsePKIXPublicKey(block.Bytes); err != nil {
-		return nil, fmt.Errorf("parse embedded Secure Boot release public key: %w", err)
+		return nil, fmt.Errorf("parse %s Secure Boot release public key: %w", source, err)
 	}
 	return block.Bytes, nil
 }
 
 // ReleasePublicKeySHA256 is the hex SHA-256 of the DER SubjectPublicKeyInfo of
-// the release key compiled into this build. The key belongs to the binary, not
-// to any one attestation, so a verifier can log it beside a successful proof
-// without threading it out of the verification result. The refusal path already
-// carries releaseKey=, so both paths name the same thing: a Hub reporting a
-// value other than the AMI's R.pub.pem is a Hub that was not rebuilt after the
-// rotation.
+// the release key this process verifies with -- the configured one when
+// SetReleasePublicKeyPEM was called, otherwise the embedded copy. It is the key
+// the process holds, not a property of any one attestation, so a verifier logs
+// it once beside a successful proof; the refusal path carries releaseKey=, so
+// both name the same thing. A value other than the AMI's R.pub.pem fingerprint
+// means the two sides were handed different keys.
 func ReleasePublicKeySHA256() (string, error) {
 	spki, err := releasePublicKeySPKI()
 	if err != nil {
