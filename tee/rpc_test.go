@@ -6,8 +6,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/tokhive/tee/internal/canonical"
 
 	"github.com/tokhive/tee/jobs"
 )
@@ -252,6 +255,118 @@ func TestServeExecuteSaysNothingExtraWhenTheExchangeCompleted(t *testing.T) {
 	for _, frame := range serveExecuteFrames(t, env, []byte(`{"model":"m"}`)) {
 		if frame.Type == EventFailure {
 			t.Fatalf("a completed exchange emitted a failure frame: %q", frame.Data)
+		}
+	}
+}
+
+// TestInPlaceDecodeAgreesWithCanonical holds the fast path of
+// DecodeExecuteRequest to the general one. The fast path may decline an input
+// — the general decoder then decides — but whenever it accepts, the general
+// decoder must accept too and produce the same request; and every canonical
+// encoding must take the fast path, or the copies it exists to avoid come back
+// unnoticed.
+func TestInPlaceDecodeAgreesWithCanonical(t *testing.T) {
+	spec := jobs.Spec{
+		JobID:    bytes.Repeat([]byte{7}, 16),
+		Provider: "p1",
+		Method:   "POST",
+		Host:     "api.example.com",
+		Path:     "/v1/x",
+		Headers:  map[string]string{"content-type": "application/json"},
+	}
+	bodies := [][]byte{
+		nil, {}, []byte("x"),
+		bytes.Repeat([]byte("a"), 23), bytes.Repeat([]byte("a"), 24),
+		bytes.Repeat([]byte("a"), 255), bytes.Repeat([]byte("a"), 256),
+		bytes.Repeat([]byte("a"), 65535), bytes.Repeat([]byte("a"), 65536),
+	}
+	for _, body := range bodies {
+		encoded, err := (ExecuteRequest{Spec: spec, Body: body}).EncodeCanonical()
+		if err != nil {
+			t.Fatal(err)
+		}
+		fast, ok := decodeExecuteRequestInPlace(encoded)
+		if !ok {
+			t.Fatalf("canonical encoding with a %d-byte body missed the fast path", len(body))
+		}
+		var slow ExecuteRequest
+		if err := canonical.Unmarshal(encoded, &slow); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(fast, slow) {
+			t.Fatalf("fast and canonical decodes differ for a %d-byte body", len(body))
+		}
+
+		// Every single-byte corruption and every truncation: the fast path may
+		// refuse, but it must never accept what the canonical decoder rejects,
+		// nor read the same bytes as a different request.
+		if len(encoded) > 4096 {
+			continue
+		}
+		check := func(mutated []byte) {
+			fast, ok := decodeExecuteRequestInPlace(mutated)
+			if !ok {
+				return
+			}
+			var slow ExecuteRequest
+			if err := canonical.Unmarshal(mutated, &slow); err != nil {
+				t.Fatalf("fast path accepted input the canonical decoder rejects: %v", err)
+			}
+			if !reflect.DeepEqual(fast, slow) {
+				t.Fatal("fast path decoded a mutated input differently")
+			}
+		}
+		for i := range encoded {
+			for _, flip := range []byte{0x01, 0x20, 0x80, 0xff} {
+				mutated := append([]byte(nil), encoded...)
+				mutated[i] ^= flip
+				check(mutated)
+			}
+			check(encoded[:i])
+			check(append(append([]byte(nil), encoded...), encoded[i]))
+		}
+	}
+}
+
+// TestCanonicalByteStringRejectsLongForms pins the half of canonical form the
+// in-place decode checks by hand: a length that fits a shorter header must use
+// it, and an indefinite-length string is never canonical.
+func TestCanonicalByteStringRejectsLongForms(t *testing.T) {
+	for name, data := range map[string][]byte{
+		"1-byte length under 24":    {0x58, 0x01, 'a'},
+		"2-byte length under 256":   {0x59, 0x00, 0x01, 'a'},
+		"4-byte length under 65536": {0x5a, 0x00, 0x00, 0x00, 0x01, 'a'},
+		"8-byte length under 2^32":  {0x5b, 0, 0, 0, 0, 0, 0, 0, 1, 'a'},
+		"indefinite":                {0x5f, 0x41, 'a', 0xff},
+		"trailing byte":             {0x41, 'a', 'b'},
+		"short":                     {0x42, 'a'},
+		"text string":               {0x61, 'a'},
+	} {
+		if _, ok := canonicalByteString(data); ok {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if got, ok := canonicalByteString([]byte{0x41, 'a'}); !ok || string(got) != "a" {
+		t.Errorf("shortest form refused: %q %v", got, ok)
+	}
+}
+
+// TestReadBoundedHonoursTheCapNotTheDeclaredLength: the declared length sizes
+// the buffer and nothing else, so a body longer than it announced is still read
+// to the cap and still caught there.
+func TestReadBoundedHonoursTheCapNotTheDeclaredLength(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), 100)
+	for _, declared := range []int64{-1, 0, 10, 100, 1 << 40} {
+		got, err := readBounded(bytes.NewReader(body), declared, 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 51 {
+			t.Errorf("declared %d: read %d bytes, want cap+1 = 51", declared, len(got))
+		}
+		got, err = readBounded(bytes.NewReader(body), declared, 1000)
+		if err != nil || !bytes.Equal(got, body) {
+			t.Errorf("declared %d: body not read whole (%d bytes, %v)", declared, len(got), err)
 		}
 	}
 }
