@@ -75,10 +75,10 @@ const (
 	EpochRetiredHeader = "X-TokenHive-Epoch-Retired"
 
 	// MaxExecuteBody bounds the canonical-CBOR ExecuteRequest the TEE will
-	// read. A job spec plus its request body is small; a caller declaring a
-	// gigabyte is not submitting a job, it is attempting to exhaust the
-	// enclave's memory before any policy check runs.
-	MaxExecuteBody = 8 << 20
+	// read. The shipped policy permits a 32 MiB request body; this outer cap
+	// leaves room for the canonical JobSpec, headers and credential envelope
+	// without permitting an unbounded allocation before policy validation.
+	MaxExecuteBody = 34 << 20
 
 	// executeReadTimeout bounds how long the TEE spends reading that body, so
 	// a peer that opens the stream and dribbles bytes cannot pin a connection.

@@ -156,10 +156,10 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 		}
 	}
 
-	// The bounds a market request must fit: 8 MiB each way, the request headers
+	// The bounds a market request must fit: 32 MiB each way, the request headers
 	// the market's Codex and Claude adapters send, and the Messages beta query.
-	if p.Limits.MaxBodyBytes != 8<<20 || p.Limits.MaxResponseBytes != 8<<20 {
-		t.Errorf("limits = body %d, response %d; want 8 MiB each", p.Limits.MaxBodyBytes, p.Limits.MaxResponseBytes)
+	if p.Limits.MaxBodyBytes != 32<<20 || p.Limits.MaxResponseBytes != 32<<20 {
+		t.Errorf("limits = body %d, response %d; want 32 MiB each", p.Limits.MaxBodyBytes, p.Limits.MaxResponseBytes)
 	}
 	for _, header := range []string{"content-type", "chatgpt-account-id", "originator", "session-id", "anthropic-version", "anthropic-beta", "x-claude-code-session-id", "x-stainless-helper-method",
 		// What the Codex client sends a subscription on every request.
