@@ -435,8 +435,36 @@ func signingDeadline(signer *proof.Signer) (time.Time, bool) {
 	if epoch == nil {
 		return time.Time{}, false
 	}
-	return rootShared.SNPSigningDeadline(epoch.Identity().Evidence)
+	if memo := lastSigningDeadline.Load(); memo != nil && memo.signer == signer {
+		return memo.deadline, memo.tracked
+	}
+	deadline, tracked := rootShared.SNPSigningDeadline(epoch.Identity().Evidence)
+	lastSigningDeadline.Store(&signingDeadlineMemo{signer: signer, deadline: deadline, tracked: tracked})
+	return deadline, tracked
 }
+
+// signingDeadlineMemo is the answer signingDeadline last worked out, and the
+// signer it worked it out for.
+//
+// The deadline is a property of the epoch — an epoch is immutable, and so is
+// the leaf inside its evidence — but reading it means cloning the evidence and
+// decoding three nested CBOR documents and an X.509 certificate. Every job asks
+// several times (admission, the exchange watcher, the signature), so asking the
+// evidence each time put that parse on the path of every request, to be told
+// the same instant.
+//
+// One entry is enough. Between rotations every caller holds the same signer;
+// across one, an exchange still pinned to the outgoing signer and a job on the
+// incoming one evict each other for as long as both are in flight, which costs
+// exactly what every call cost before. Keeping one also means a retired signer,
+// and the evidence it holds, is released as soon as the next one is asked about.
+type signingDeadlineMemo struct {
+	signer   *proof.Signer
+	deadline time.Time
+	tracked  bool
+}
+
+var lastSigningDeadline atomic.Pointer[signingDeadlineMemo]
 
 // signingBudget is how much room is left under signer before it must stop
 // signing, less signingHandoff: the time until its epoch's NitroTPM leaf reaches
@@ -1148,14 +1176,15 @@ func (s *Service) OpenSession(ctx context.Context, job Job) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	seq, err := s.seq.Next([]byte(job.Spec.Provider))
-	if err != nil {
-		return nil, fmt.Errorf("allocate provider sequence: %w", err)
-	}
-
+	// Before the sequence number, like every other refusal: a transport that
+	// cannot open a session must not cost the provider a hole in its series.
 	opener, ok := s.transport.(SessionOpener)
 	if !ok {
 		return nil, ErrNoSessionSupport
+	}
+	seq, err := s.seq.Next([]byte(job.Spec.Provider))
+	if err != nil {
+		return nil, fmt.Errorf("allocate provider sequence: %w", err)
 	}
 
 	// A session is a GET handshake with no body; the transport adds the

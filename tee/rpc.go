@@ -3,11 +3,13 @@ package tee
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/tokhive/tee/internal/canonical"
@@ -121,12 +123,121 @@ type ExecuteRequest struct {
 func (r ExecuteRequest) EncodeCanonical() ([]byte, error) { return canonical.Marshal(r) }
 
 // DecodeExecuteRequest parses a canonical-CBOR ExecuteRequest.
+//
+// The returned Body may alias data: the caller must not modify data while the
+// request is in use.
+//
+// The general way to check that an encoding is canonical is to decode it and
+// re-encode it (canonical.Unmarshal), which for this structure means copying
+// the request body out and then copying it back — two more copies of a payload
+// that may be 32 MiB, made before policy has decided whether the job runs at
+// all. The body is the one field where that buys nothing: it is an opaque byte
+// string, and a byte string has exactly one canonical encoding, a shortest-form
+// length followed by the bytes. So the spec is checked by re-encoding, as
+// before, and the body is checked by reading its header and taken in place.
+//
+// The fast path only recognises the canonical layout. Anything else is handed
+// to canonical.Unmarshal, which owns the verdict, so the two can differ in
+// cost but never in what they accept.
 func DecodeExecuteRequest(data []byte) (ExecuteRequest, error) {
+	if r, ok := decodeExecuteRequestInPlace(data); ok {
+		return r, nil
+	}
 	var r ExecuteRequest
 	if err := canonical.Unmarshal(data, &r); err != nil {
 		return ExecuteRequest{}, err
 	}
 	return r, nil
+}
+
+// decodeExecuteRequestInPlace decodes the canonical layout of an
+// ExecuteRequest — a two-entry map, key 1 the spec, key 2 the body — without
+// copying the body. ok is false for anything it does not recognise as exactly
+// that layout; it never reports an error of its own.
+func decodeExecuteRequestInPlace(data []byte) (ExecuteRequest, bool) {
+	const (
+		mapOfTwo = 0xa2
+		keySpec  = 0x01
+		keyBody  = 0x02
+		null     = 0xf6
+	)
+	if len(data) < 2 || data[0] != mapOfTwo || data[1] != keySpec {
+		return ExecuteRequest{}, false
+	}
+	var r ExecuteRequest
+	rest, err := canonical.UnmarshalFirst(data[2:], &r.Spec)
+	if err != nil || len(rest) < 2 || rest[0] != keyBody {
+		return ExecuteRequest{}, false
+	}
+	rest = rest[1:]
+	if len(rest) == 1 && rest[0] == null {
+		// A nil body encodes as null, and decodes back to nil.
+		return r, true
+	}
+	body, ok := canonicalByteString(rest)
+	if !ok {
+		return ExecuteRequest{}, false
+	}
+	r.Body = body
+	return r, true
+}
+
+// canonicalByteString returns the contents of data when data is exactly one
+// definite-length CBOR byte string whose length is in shortest form, which is
+// the only encoding of a byte string the canonical encoder produces.
+func canonicalByteString(data []byte) ([]byte, bool) {
+	const majorBytes = 2
+	if len(data) == 0 || data[0]>>5 != majorBytes {
+		return nil, false
+	}
+	var (
+		info   = data[0] & 0x1f
+		length uint64
+		header = 1
+	)
+	switch {
+	case info < 24:
+		length = uint64(info)
+	case info == 24:
+		if len(data) < 2 {
+			return nil, false
+		}
+		length, header = uint64(data[1]), 2
+		if length < 24 {
+			return nil, false
+		}
+	case info == 25:
+		if len(data) < 3 {
+			return nil, false
+		}
+		length, header = uint64(binary.BigEndian.Uint16(data[1:])), 3
+		if length <= 0xff {
+			return nil, false
+		}
+	case info == 26:
+		if len(data) < 5 {
+			return nil, false
+		}
+		length, header = uint64(binary.BigEndian.Uint32(data[1:])), 5
+		if length <= 0xffff {
+			return nil, false
+		}
+	case info == 27:
+		if len(data) < 9 {
+			return nil, false
+		}
+		length, header = binary.BigEndian.Uint64(data[1:]), 9
+		if length <= 0xffffffff {
+			return nil, false
+		}
+	default:
+		// Indefinite length, or a reserved value: never canonical.
+		return nil, false
+	}
+	if uint64(len(data)-header) != length {
+		return nil, false
+	}
+	return data[header:], true
 }
 
 // Job converts the request into the execution input the Service takes.
@@ -168,7 +279,7 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 	tm.Mark(StageRead)
 	control := http.NewResponseController(w)
 	_ = control.SetReadDeadline(time.Now().Add(executeReadTimeout))
-	raw, err := io.ReadAll(io.LimitReader(r.Body, MaxExecuteBody+1))
+	raw, err := readBounded(r.Body, r.ContentLength, MaxExecuteBody)
 	if err != nil {
 		timingErr = err
 		http.Error(w, "read body", http.StatusBadRequest)
@@ -264,6 +375,30 @@ func ServeExecute(svc *Service, w http.ResponseWriter, r *http.Request) {
 	outcome = res.Receipt.Receipt.Completion
 }
 
+// readBounded reads body up to limit+1 bytes, so the caller can tell "exactly
+// at the cap" from "over it".
+//
+// declared is the request's Content-Length, or negative when there is none. It
+// is used only to size the buffer, never to decide how much to read: a body
+// that announces its length is read into one allocation of that size instead of
+// a buffer that doubles its way up, which for a 32 MiB body is the difference
+// between one allocation and a dozen discarded ones. The hint is clamped to the
+// cap, so a peer that lies about its length can reserve no more than a peer
+// that simply sent that much.
+func readBounded(body io.Reader, declared int64, limit int) ([]byte, error) {
+	limited := io.LimitReader(body, int64(limit)+1)
+	if declared <= 0 {
+		return io.ReadAll(limited)
+	}
+	// One spare byte so that a body of exactly the declared length reaches EOF
+	// without the buffer growing to find it.
+	buf := bytes.NewBuffer(make([]byte, 0, min(declared, int64(limit)+1)+1))
+	if _, err := buf.ReadFrom(limited); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // writeStartFrame emits the response-start frame: the upstream status and the
 // allowlisted headers, as JSON on a single data line. It is always written
 // before the first chunk frame, so a caller can commit its own response
@@ -298,12 +433,35 @@ func writeStartFrame(w io.Writer, resp Response) {
 // A chunk is never skipped, including an empty one: StreamingHasher counts
 // empty writes, so a dropped heartbeat would change both the chunk count and
 // the hash, and every receipt for that job would fail to verify.
+//
+// The frame is assembled in a pooled buffer and written once. A chunk of an
+// upstream event stream is mostly short lines, and formatting each of them
+// separately made the per-chunk cost proportional to its line count.
 func writeChunkFrame(w io.Writer, chunk []byte) {
-	for _, line := range bytes.Split(chunk, []byte("\n")) {
-		fmt.Fprintf(w, "data: %s\n", line)
+	buf := chunkFramePool.Get().(*bytes.Buffer)
+	buf.Reset()
+	for {
+		buf.WriteString("data: ")
+		i := bytes.IndexByte(chunk, '\n')
+		if i < 0 {
+			buf.Write(chunk)
+			break
+		}
+		buf.Write(chunk[:i+1])
+		chunk = chunk[i+1:]
 	}
-	fmt.Fprint(w, "\n")
+	buf.WriteString("\n\n")
+	_, _ = w.Write(buf.Bytes())
+	if buf.Cap() <= maxPooledChunkFrame {
+		chunkFramePool.Put(buf)
+	}
 }
+
+// maxPooledChunkFrame keeps an unusually large frame from pinning its buffer in
+// the pool for the life of the process.
+const maxPooledChunkFrame = 128 << 10
+
+var chunkFramePool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
 // writeFailureFrame emits the failure-diagnosis frame: the class, the stage it
 // happened in, and whether a new connection was being established, as JSON on a

@@ -148,14 +148,60 @@ func (s *fileSeqStore) Close() error {
 // flushLocked writes through a temporary file and renames it, so a crash
 // mid-write leaves the previous counters intact instead of a truncated file
 // the next start would refuse to parse.
+//
+// Both the file and the directory entry are synced before it returns. A rename
+// alone only orders the update against other processes; it does not put it on
+// the disk, and a host that loses power — or a guest that is killed — can come
+// back with the old file. That is the one outcome SeqStore forbids: the number
+// just handed out is in a signed receipt, the store has forgotten it, and the
+// next start issues it again. The sync is what makes "recorded" mean what the
+// interface says it means, and it is paid once per job, under the lock.
 func (s *fileSeqStore) flushLocked() error {
-	encoded, err := json.MarshalIndent(s.data, "", "  ")
+	encoded, err := json.Marshal(s.data)
 	if err != nil {
 		return fmt.Errorf("seqstore: marshal: %w", err)
 	}
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, encoded, 0o600); err != nil {
+	if err := writeFileSync(tmp, encoded, 0o600); err != nil {
 		return fmt.Errorf("seqstore: write: %w", err)
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, s.path); err != nil {
+		return fmt.Errorf("seqstore: rename: %w", err)
+	}
+	if err := syncDir(filepath.Dir(s.path)); err != nil {
+		return fmt.Errorf("seqstore: sync dir: %w", err)
+	}
+	return nil
+}
+
+// writeFileSync is os.WriteFile that does not return until the contents are on
+// stable storage.
+func writeFileSync(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// syncDir makes a rename inside dir durable. Without it the new name can be
+// lost even though the file it points at was synced.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }

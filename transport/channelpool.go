@@ -211,10 +211,7 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 	tm := tee.TimingsFrom(ctx)
 	ch.wrote = 0
 
-	requestBytes, err := buildRequestBytes(req)
-	if err != nil {
-		return false, tee.Response{}, err
-	}
+	head := buildRequestHead(req)
 
 	// Clear any deadline a previous exchange's cancellation poke may have left,
 	// then bound this exchange by the caller's deadline. The socket deadline
@@ -246,12 +243,12 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 	}()
 
 	tm.Mark(tee.StageWrite)
-	n, werr := ch.conn.Write(requestBytes)
+	n, werr := ch.writeRequest(head, req.Body)
 	ch.wrote = n
 	if werr != nil {
 		return false, tee.Response{}, ch.fail(tee.StageWrite, fmt.Errorf("write request: %w", werr))
 	}
-	if n != len(requestBytes) {
+	if n != len(head)+len(req.Body) {
 		return false, tee.Response{}, ch.fail(tee.StageWrite, io.ErrShortWrite)
 	}
 
@@ -282,7 +279,12 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 	// (resp.Close) must not be pooled, whatever happens to the bytes after.
 	keep = !resp.Close
 
-	buf := make([]byte, bufSize)
+	// The read buffer is borrowed for the life of this exchange. onChunk is
+	// handed a slice of it and must not keep it — which was already the rule,
+	// since the same buffer is overwritten by the next read.
+	bufp := getReadBuffer(bufSize)
+	defer putReadBuffer(bufp)
+	buf := *bufp
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
@@ -304,14 +306,37 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 	return keep, status, nil
 }
 
-// buildRequestBytes renders a tee.Request as a raw HTTP/1.1 message without any
-// standard-library editorialising.
+// coalesceBodyBytes is the largest request body sent in the same write as its
+// head. Below it, one write keeps a small request in one TLS record and one
+// tunnel frame. Above it the body is written on its own, straight from the
+// caller's slice: building one contiguous message would copy the whole body
+// into a second buffer just to hand it to a writer that splits it again.
+const coalesceBodyBytes = 64 << 10
+
+// writeRequest puts one request on the wire and reports how many bytes of it
+// left. Zero still means what the retry in Do needs it to mean: nothing of this
+// request reached the connection.
+func (ch *channel) writeRequest(head, body []byte) (int, error) {
+	if len(body) <= coalesceBodyBytes {
+		return ch.conn.Write(append(head, body...))
+	}
+	n, err := ch.conn.Write(head)
+	if err != nil || n != len(head) {
+		return n, err
+	}
+	m, err := ch.conn.Write(body)
+	return n + m, err
+}
+
+// buildRequestHead renders the request line and headers of a tee.Request as raw
+// HTTP/1.1, up to and including the blank line, without any standard-library
+// editorialising. The body follows it on the wire unchanged.
 //
 // The response framing (Content-Length, chunked) is understood on read by
 // http.ReadResponse; the request itself is written byte-for-byte. There is no
 // gzip, no retry, no redirect, and no environment proxy here — every byte is
 // one the TEE decided to send, so the signed receipt can describe it exactly.
-func buildRequestBytes(req tee.Request) ([]byte, error) {
+func buildRequestHead(req tee.Request) []byte {
 	var buf bytes.Buffer
 
 	target := req.Path
@@ -329,9 +354,23 @@ func buildRequestBytes(req tee.Request) ([]byte, error) {
 	// legal Content-Length: 0 the same way the standard library rendered it.
 	fmt.Fprintf(&buf, "Content-Length: %d\r\n", len(req.Body))
 	buf.WriteString("\r\n")
-	buf.Write(req.Body)
-	return buf.Bytes(), nil
+	return buf.Bytes()
 }
+
+// readBuffers recycles the per-exchange read buffer. Every exchange needs one
+// for exactly as long as it runs, so allocating it fresh made each request
+// leave 32 KiB behind for the collector.
+var readBuffers sync.Pool
+
+func getReadBuffer(size int) *[]byte {
+	if bufp, ok := readBuffers.Get().(*[]byte); ok && len(*bufp) == size {
+		return bufp
+	}
+	buf := make([]byte, size)
+	return &buf
+}
+
+func putReadBuffer(bufp *[]byte) { readBuffers.Put(bufp) }
 
 // Session is a transparent byte pipe to a provider after an Upgrade handshake.
 // The buffered reader that consumed the 101 may already hold the provider's
@@ -365,7 +404,7 @@ func (s *Session) Write(p []byte) (int, error) { return s.conn.Write(p) }
 func (s *Session) Close() error { return s.conn.Close() }
 
 // buildUpgradeBytes renders a tee.Request as an HTTP/1.1 Upgrade (WebSocket)
-// handshake. Unlike buildRequestBytes it sends no body and adds the protocol's
+// handshake. Unlike buildRequestHead it sends no body and adds the protocol's
 // own handshake headers; the Host and the caller's headers — which include the
 // injected provider credential — are carried through unchanged. The handshake
 // bytes are not counted toward RequestBytes; only post-upgrade writes are.

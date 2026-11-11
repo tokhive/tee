@@ -16,6 +16,22 @@
 // inbound frames onto their streams; outbound frames are serialized under one
 // lock. Flow ids are collision-free across the two endpoints because one side
 // mints ids in the upper half of the space and the other in the lower half.
+//
+// # Backpressure
+//
+// Each stream is flow-controlled by a credit window. A writer may have at most
+// initialWindow bytes outstanding — sent but not yet consumed by the peer's
+// reader — and blocks beyond that until the peer grants more with a KindWindow
+// frame, which it does as its consumer drains. That is what lets a transfer
+// larger than the receive buffer cross a hop whose far side is slower than its
+// near side: the writer waits instead of overrunning the buffer and having the
+// stream reset under it.
+//
+// The window is only enforced against a peer that announced it understands it
+// (KindHello, the first frame either side writes). A peer that never says so is
+// an older build that grants no credit, and waiting on it would wait forever, so
+// streams to it run unthrottled exactly as they did before — with the receive
+// buffer cap (maxBuf) still resetting a stream whose consumer falls behind.
 package tunnel
 
 import (
@@ -24,6 +40,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 )
 
 // Kind identifies what a frame carries.
@@ -39,6 +56,15 @@ const (
 	// KindClose ends a stream. The payload is an informational reason: empty
 	// for a close, closeReasonReset for a reset (see ErrStreamReset).
 	KindClose Kind = 3
+	// KindWindow grants the peer credit to send more bytes on a stream. The
+	// payload is a 4-byte big-endian count of bytes the local reader consumed
+	// since the last grant.
+	KindWindow Kind = 4
+	// KindHello announces that this endpoint grants credit, and is the first
+	// frame it ever writes. It carries no payload and names no stream. An
+	// endpoint enforces the send window only once it has seen its peer's hello;
+	// builds that predate flow control ignore both kinds as unknown.
+	KindHello Kind = 5
 )
 
 // Frame boundaries. The header is kind + 8-byte flow id + 4-byte length.
@@ -46,6 +72,24 @@ const (
 	headerLen  = 13
 	maxPayload = 1 << 20 // one stream write can span several frames, so no single frame needs more
 	maxBuf     = 8 << 20 // inbound buffering cap per stream; further data resets that stream
+
+	// initialWindow is how many bytes a writer may have outstanding on one
+	// stream before it must wait for credit. It sits below maxBuf so a peer that
+	// honours the window can never trip the reset that guards against one that
+	// does not.
+	initialWindow = 4 << 20
+	// windowUpdateThreshold is how much a reader consumes before it tells the
+	// peer. Granting in quarters keeps the control traffic negligible while
+	// never leaving a writer parked on credit the reader has already freed: a
+	// writer blocks only with a full window outstanding, and at most one
+	// threshold of that can be consumed-but-ungranted.
+	windowUpdateThreshold = initialWindow / 4
+
+	// maxKeptScratch bounds the write scratch buffer a multiplexer keeps between
+	// frames. Small frames — the common case for a token stream — reuse it; a
+	// full-size frame borrows a larger one and gives it back, so an idle tunnel
+	// does not sit on a megabyte it used once.
+	maxKeptScratch = 64 << 10
 )
 
 // DefaultMaxStreams bounds how many streams one tunnel carries at once.
@@ -110,8 +154,13 @@ type Connection interface {
 type Multiplexer struct {
 	conn Connection
 	// writeMu serializes outbound frames so concurrent stream writes never
-	// interleave a single frame.
-	writeMu sync.Mutex
+	// interleave a single frame. It also guards helloSent and scratch.
+	writeMu   sync.Mutex
+	helloSent bool
+	scratch   []byte
+	// peerWindowed is set once the peer's hello has been read: from then on
+	// stream writes are held to the credit window.
+	peerWindowed atomic.Bool
 	// mu guards streams and nextID; closed is read-only trends.
 	mu      sync.Mutex
 	streams map[uint64]*Stream
@@ -143,6 +192,10 @@ func NewLimited(conn Connection, side Endpoint, maxStreams int) *Multiplexer {
 		maxStreams: maxStreams,
 	}
 	go m.readLoop()
+	// Say hello promptly rather than with the first frame that happens to be
+	// written, so a peer that only ever receives still learns it may be held to
+	// the window. Off the caller's goroutine because the carrier can block.
+	go m.hello()
 	return m
 }
 
@@ -184,17 +237,48 @@ func (m *Multiplexer) Close() error {
 	return nil
 }
 
+// hello writes the KindHello frame if nothing has been written yet.
+func (m *Multiplexer) hello() {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	_ = m.writeLocked(KindHello, 0, nil)
+}
+
 // writeFrame gains the write lock and writes one frame, refusing a closed tunnel.
 func (m *Multiplexer) writeFrame(kind Kind, id uint64, payload []byte) error {
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
+	return m.writeLocked(kind, id, payload)
+}
+
+// writeLocked writes one frame, preceded by this endpoint's hello if that has
+// not gone out yet: the hello is always the first thing a peer reads, so by the
+// time any of its streams carries data the peer already knows whether to wait
+// for credit. Caller holds writeMu.
+func (m *Multiplexer) writeLocked(kind Kind, id uint64, payload []byte) error {
 	m.mu.Lock()
 	closed := m.closed
 	m.mu.Unlock()
 	if closed {
 		return ErrClosed
 	}
-	if err := writeFrames(m.conn, kind, id, payload); err != nil {
+	if !m.helloSent {
+		m.helloSent = true
+		if err := writeFrames(m.conn, &m.scratch, KindHello, 0, nil); err != nil {
+			m.fail(err)
+			return err
+		}
+		if kind == KindHello {
+			return nil
+		}
+	} else if kind == KindHello {
+		return nil
+	}
+	err := writeFrames(m.conn, &m.scratch, kind, id, payload)
+	if cap(m.scratch) > maxKeptScratch {
+		m.scratch = nil
+	}
+	if err != nil {
 		m.fail(err)
 		return err
 	}
@@ -202,7 +286,13 @@ func (m *Multiplexer) writeFrame(kind Kind, id uint64, payload []byte) error {
 }
 
 // writeFrames splits payload into maxPayload-sized frames and writes them all.
-func writeFrames(w io.Writer, kind Kind, id uint64, payload []byte) error {
+//
+// Each frame goes out in a single Write, header and payload together. The
+// carrier turns every Write into one message (see wsStream), so writing the two
+// halves separately doubled the message count of a stream of small chunks —
+// which is what a token stream is. scratch is the buffer the frame is assembled
+// in, reused across calls.
+func writeFrames(w io.Writer, scratch *[]byte, kind Kind, id uint64, payload []byte) error {
 	var head [headerLen]byte
 	if len(payload) == 0 {
 		frameHeader(head[:], kind, id, 0)
@@ -215,10 +305,10 @@ func writeFrames(w io.Writer, kind Kind, id uint64, payload []byte) error {
 			n = maxPayload
 		}
 		frameHeader(head[:], kind, id, uint32(n))
-		if _, err := w.Write(head[:]); err != nil {
-			return err
-		}
-		if _, err := w.Write(payload[:n]); err != nil {
+		frame := append((*scratch)[:0], head[:]...)
+		frame = append(frame, payload[:n]...)
+		*scratch = frame
+		if _, err := w.Write(frame); err != nil {
 			return err
 		}
 		payload = payload[n:]
@@ -261,6 +351,10 @@ func (m *Multiplexer) readLoop() {
 			m.deliver(id, payload)
 		case KindClose:
 			m.receiveClose(id, payload)
+		case KindWindow:
+			m.receiveWindow(id, payload)
+		case KindHello:
+			m.peerWindowed.Store(true)
 		default:
 			// Unknown kinds are ignored for forward compatibility.
 		}
@@ -309,6 +403,21 @@ func (m *Multiplexer) deliver(id uint64, payload []byte) {
 	m.mu.Unlock()
 	if s != nil {
 		s.push(payload)
+	}
+}
+
+// receiveWindow credits a stream with the bytes its peer's reader consumed. A
+// grant for a stream that has already ended, or one that is not four bytes, is
+// dropped: there is nothing left to send on the one and no count in the other.
+func (m *Multiplexer) receiveWindow(id uint64, payload []byte) {
+	if len(payload) != 4 {
+		return
+	}
+	m.mu.Lock()
+	s := m.streams[id]
+	m.mu.Unlock()
+	if s != nil {
+		s.grant(binary.BigEndian.Uint32(payload))
 	}
 }
 
@@ -433,16 +542,37 @@ type Stream struct {
 
 	mu   sync.Mutex
 	cond *sync.Cond
-	buf  []byte
-	eof  bool
+	// chunks is the inbound queue: the frames the read loop delivered, in
+	// order, each owned by the stream from the moment it is pushed. head is how
+	// much of chunks[0] a reader has already taken, and buffered is the total
+	// still unread. Queuing the frames themselves, rather than appending them to
+	// one growing buffer, is what keeps a delivered byte from being copied twice
+	// on its way to the reader.
+	chunks   [][]byte
+	head     int
+	buffered int
+	eof      bool
 	// err is what a reader sees once the queued bytes are drained, in place of
 	// io.EOF: nil for a clean end, ErrStreamReset for a stream that was reset.
 	err error
+
+	// wcond wakes writers parked on credit. It shares mu with cond but is a
+	// separate condition so that a Signal meant for a reader is never spent on
+	// a writer, or the reverse.
+	wcond *sync.Cond
+	// credit is how many more bytes this side may send before it must wait for
+	// a grant. It is counted from the first byte whether or not the window is
+	// being enforced yet, so the two ends agree on it whenever enforcement
+	// starts; it can therefore be negative.
+	credit int64
+	// consumed is what the local reader has taken since the last grant.
+	consumed int
 }
 
 func newStream(m *Multiplexer, id uint64) *Stream {
-	s := &Stream{id: id, m: m}
+	s := &Stream{id: id, m: m, credit: initialWindow}
 	s.cond = sync.NewCond(&s.mu)
+	s.wcond = sync.NewCond(&s.mu)
 	return s
 }
 
@@ -454,44 +584,95 @@ func newStream(m *Multiplexer, id uint64) *Stream {
 // transfer as whole is what a receipt may never do.
 func (s *Stream) Read(p []byte) (int, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for len(s.buf) == 0 && !s.eof {
+	for s.buffered == 0 && !s.eof {
 		s.cond.Wait()
 	}
-	if len(s.buf) > 0 {
-		n := copy(p, s.buf)
-		s.buf = s.buf[n:]
-		s.cond.Signal() // room for a blocked push
-		return n, nil
+	if s.buffered == 0 {
+		err := s.err
+		s.mu.Unlock()
+		if err != nil {
+			return 0, err
+		}
+		return 0, io.EOF
 	}
-	if s.err != nil {
-		return 0, s.err
+	n := copy(p, s.chunks[0][s.head:])
+	s.head += n
+	s.buffered -= n
+	if s.head == len(s.chunks[0]) {
+		s.chunks[0] = nil
+		s.chunks = s.chunks[1:]
+		s.head = 0
+		if len(s.chunks) == 0 {
+			s.chunks = nil
+		}
 	}
-	return 0, io.EOF
+	// Tell the peer what was freed, in batches. Nothing is owed to a stream
+	// that has ended, or to a peer that does not count credit at all.
+	var grant int
+	if s.m.peerWindowed.Load() && !s.eof {
+		s.consumed += n
+		if s.consumed >= windowUpdateThreshold {
+			grant, s.consumed = s.consumed, 0
+		}
+	}
+	s.mu.Unlock()
+	if grant > 0 {
+		var credit [4]byte
+		binary.BigEndian.PutUint32(credit[:], uint32(grant))
+		_ = s.m.writeFrame(KindWindow, s.id, credit[:])
+	}
+	return n, nil
+}
+
+// grant adds credit the peer's reader freed and wakes any writer waiting on it.
+func (s *Stream) grant(n uint32) {
+	s.mu.Lock()
+	s.credit += int64(n)
+	s.wcond.Broadcast()
+	s.mu.Unlock()
 }
 
 // Write sends payload to the peer, splitting it across frames as needed. It
 // returns an error once the stream (or the tunnel) has ended.
+//
+// Against a peer that grants credit it blocks while a full window is
+// outstanding, and resumes as the peer's reader drains. Nothing but the
+// stream's own end wakes it early, which is the same rule Read follows: a
+// caller that needs a bound closes the stream (see transport.streamConn, which
+// turns a deadline into exactly that).
 func (s *Stream) Write(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
-	s.mu.Lock()
-	eof, ended := s.eof, s.err
-	s.mu.Unlock()
-	if eof {
-		// Report why the stream ended when there is a reason: a reset is a
-		// different fact from a peer that closed, and the writer is the side
-		// whose bytes were being dropped.
-		if ended != nil {
-			return 0, ended
+	total := 0
+	for len(p) > 0 {
+		s.mu.Lock()
+		windowed := s.m.peerWindowed.Load()
+		for windowed && s.credit <= 0 && !s.eof {
+			s.wcond.Wait()
 		}
-		return 0, io.ErrClosedPipe
+		if s.eof {
+			// Report why the stream ended when there is a reason: a reset is a
+			// different fact from a peer that closed, and the writer is the
+			// side whose bytes were being dropped.
+			ended := s.err
+			s.mu.Unlock()
+			if ended != nil {
+				return total, ended
+			}
+			return total, io.ErrClosedPipe
+		}
+		n := min(len(p), maxPayload)
+		if windowed && int64(n) > s.credit {
+			n = int(s.credit)
+		}
+		s.credit -= int64(n)
+		s.mu.Unlock()
+
+		if err := s.m.writeFrame(KindData, s.id, p[:n]); err != nil {
+			return total, err
+		}
+		total += n
+		p = p[n:]
 	}
-	if err := s.m.writeFrame(KindData, s.id, p); err != nil {
-		return 0, err
-	}
-	return len(p), nil
+	return total, nil
 }
 
 // Close ends the stream: the local reader returns io.EOF, the peer receives a
@@ -530,7 +711,7 @@ func (s *Stream) closeFrame() []byte {
 	return nil
 }
 
-// push queues inbound bytes. It never blocks its caller, which is the single
+// push queues inbound bytes, taking ownership of data. It never blocks its caller, which is the single
 // read loop: a stream whose consumer is not draining is reset rather than
 // waiting, so one stuck stream cannot freeze every other stream — and then the
 // carrier itself, once TCP backpressure reaches the peer. The reset ends just
@@ -543,7 +724,11 @@ func (s *Stream) push(data []byte) {
 		s.mu.Unlock()
 		return
 	}
-	if len(s.buf)+len(data) > maxBuf {
+	if len(data) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	if s.buffered+len(data) > maxBuf {
 		// The consumer is not draining. Unblock this stream's reader and tell
 		// the peer, both off the read loop: the reader with a reset error rather
 		// than EOF, the peer with the reason in the close frame. Those bytes are
@@ -557,11 +742,13 @@ func (s *Stream) push(data []byte) {
 		s.eof = true
 		s.err = ErrStreamReset
 		s.cond.Broadcast()
+		s.wcond.Broadcast()
 		s.mu.Unlock()
 		go s.Reset()
 		return
 	}
-	s.buf = append(s.buf, data...)
+	s.chunks = append(s.chunks, data)
+	s.buffered += len(data)
 	s.cond.Signal()
 	s.mu.Unlock()
 }
@@ -581,5 +768,6 @@ func (s *Stream) end(reason error) {
 		s.err = reason
 	}
 	s.cond.Broadcast()
+	s.wcond.Broadcast()
 	s.mu.Unlock()
 }
