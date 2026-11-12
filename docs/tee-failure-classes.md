@@ -75,7 +75,7 @@ relay 抛出的错优先于 transport 返回的错。买家先走，transport �
 
 ## 6. Hub 侧要做的
 
-`hub.Result.Failure` / `hub.Outcome.Failure` 已经能读到这一帧。生产 Hub（`tokhive-mvp` 的 `hive/`）需要按同样口径落到 `attemptFailure`：
+`hub.Result.Failure` / `hub.Outcome.Failure` 已经能读到这一帧。生产 Hub（现仓库 `tokhive-hive` 的 `hive/`，本文写作时叫 `tokhive-mvp`）需要按同样口径落到 `attemptFailure`：
 
 | `class` | 归属 | 是否 `providerSideFailure` / `SupplyFailures` |
 | --- | --- | --- |

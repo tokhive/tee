@@ -13,6 +13,7 @@
 | `catalog.json.sig` | 使用发布私钥对原始 `catalog.json` 字节生成的独立 SSHSIG 签名 | 配合独立可信公钥核验清单的来源和完整性 |
 | `tee-production.json` | 从完整清单按 `production` 导出的环境视图 | 供 Hive 加载并在 `/tee` 页面展示 |
 | `catalog.commit` | 导出／签署清单所用的完整 Git commit，由发布流程保存 | 定位原始清单，不是镜像源码 commit 的别名 |
+| `SHA256SUMS` | 最终发布人对全部公开附件计算的校验和，排除自身 | 文件完整性检查；本身不签名，也不证明发布者身份 |
 
 `signed_release.py sign` 和 `verify` 均只读取源清单，不修改 `catalog.json`。签名或导出输出路径已存在时，工具拒绝覆盖。维护完整清单后重新导出环境视图，不手动分别维护两份 JSON。
 
@@ -122,7 +123,7 @@ python3 deploy/release_catalog.py release \
 
 应用在某环境实际生效后，才登记对应的启用事件。`production` 的启用时间应是 Hive 已实际切换并确认使用该身份的时间；只有 TEE 实例启动或 AMI 创建成功，不足以登记 Hive 已启用。没有实际启用事实时保留候选状态，不能为了成功导出 `tee-production.json` 而虚构事件。
 
-校验并提交 `releases/catalog.json`，完成审查后确定提交 B。登记、启停和 `crosshost.sh record` 的完整命令见 [清单操作说明](tee-release-catalog.md)。
+校验并提交 `releases/catalog.json`，完成审查后确定提交 B。登记、启停和 `crosshost.sh record` 的完整命令见 [清单操作说明](tee-release-catalog.md)；从起新机到改 Hub、回收旧机、再登记的一整套切换命令见 [运维移交手册](ops-handover.md) 的 TL;DR 一节。
 
 ### 3. 固定 tag，准备草稿 Release
 
@@ -210,6 +211,7 @@ python3 deploy/signed_release.py verify \
 | `catalog.json`、`catalog.commit` | 签名人 | 固定提交 B 的原始清单及来源信息 |
 | `catalog.json.sig` | 签名人 | 与原始清单逐字节配套 |
 | `release-signing.pub`、`release-signing.fingerprint` | 签名人 | 配合独立官方指纹确认渠道 |
+| `R.crt.pem`、`R.pub.pem` | 构建／部署人 | Secure Boot 发布证书与公钥，供买家独立核对 "R-only" 引导链；`R.key` 永不发布 |
 | `tee-production.json` | 签名人，可选附件 | 验签后导出的 Hive 配置，能够重新生成 |
 | `allowed_signers` | 签名人，可选示例 | 不是自动建立用户信任的依据 |
 | `SHA256SUMS` | 最终发布人 | 所有最终附件准备好后生成，排除校验和文件自身 |
@@ -227,6 +229,10 @@ Release 正文还应说明版本变化、A 与 B、应用身份、策略哈希�
 - `catalog.commit` 是定位信息，没有被 SSHSIG 额外签入。核对来源需要比较固定提交中的清单字节。
 - 普通 `SHA256SUMS` 用于文件完整性检查，不独立证明发布者身份。构建产物应与已验证清单中的摘要核对。
 - 有效签名不保证清单最新，也不证明实例此刻状态。用户仍需核对最新发布、撤销公告以及真实硬件证据。
+
+**没有逐文件签名，这是当前工具的全部范围。** 本仓库只有 `deploy/signed_release.py` 一个签名工具，它签的仅是 `releases/catalog.json` 的字节；bundle、`.build.json`、`BUILD.md`、回执样例和 `SHA256SUMS` 都没有独立 `.sig`。不要为了补齐「每个附件一个签名」而阻塞发布：附件完整性由 `SHA256SUMS` 保证，附件对应的应用身份与策略由已签名清单中的摘要核对。若将来要把附件整体纳入签名域，做法是签 `SHA256SUMS` 本身（同一把密钥、同一 namespace）而不是逐个文件，那需要新的工具与本节的新章节，不属当前流程。
+
+不可放进附件：`deploy/secure-boot/*.key`、`cloudtest/snp/.certs/`（含 `hub-key.pem`、`mp-key.pem`）、mTLS 证书备份包（如 `tokhive.tee.mtls.certs.*.tgz`）。双机 bundle 内含 `mtls/hub-ca.pem` 与 `policy/policy.cbor`，是否公开逐项判定。
 
 仅公开已检查适合公开的材料。原始 bundle 是否可公开取决于其内容；不能因为有 manifest 就自动上传可能含部署密钥、私有证书材料或内部配置的归档。样例使用合成请求和可公开测试供给，不能修改签名回执来隐藏字段后仍称其为原始证据。
 

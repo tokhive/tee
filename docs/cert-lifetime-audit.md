@@ -254,7 +254,7 @@ inbox 密钥是 `main.go:176` 单独生成、直接传给 `tee.NewService`（`:2
 
 - 只想让 Hive 立刻能用：**重启 TEE**（重新出证，拿到新的 3h 窗口）。
 - 只想验证"到底是什么过期"：`openssl s_client -connect 10.0.1.63:18090 -showcerts` 抓证书，再看 `.2` 扩展里 NitroTPM 叶的 `notAfter`。本次即用此法确认。
-- 关注点提示：Hub 上 Hive 现在是**手工 tmux 跑**（无 systemd unit），重启/升级都要手工——排障时别误判成"服务已停止"。
+- 关注点提示：Hub 上 Hive 在审计当时是**手工 tmux 跑**（无 systemd unit），重启/升级都要手工——排障时别误判成"服务已停止"。2026-11 起已改为 systemd 单元 `tokhive-hive`，`journalctl -u tokhive-hive` 可查，当前运维方式以 `tokhive-hive` 仓库 `docs/operations.md` 为准。
 
 ---
 

@@ -4,8 +4,9 @@
 > 生产 Hub 目前把收据绑到「承载它的那条 TLS 连接」上，会把这种收据判成 `invalid_evidence`。
 > 本文给出最小改动。补丁见同目录 `hub-teeclient-pairing.patch`。
 
-生产 Hub 的仓库是 `tokhive-mvp`，进程 `hive` 跑在 `~/tokhive-mvp`，TEE 客户端在
-`hive/internal/teeclient/client.go`。
+生产 Hub 的代码在 `tokhive-hive`，TEE 客户端在 `hive/internal/teeclient/client.go`；线上由
+systemd 单元 `tokhive-hive` 运行（`/opt/tokhive/current`、`/etc/tokhive/hive.env`）。本文 §5 的
+路径与重启命令来自 2026-10 的手工 `tmux` 部署，已不适用，只作历史记录保留。
 
 ---
 
@@ -93,9 +94,9 @@ key 本身不受任何约束。只删比较、留下 `ApplicationID == expectedA
 
 ---
 
-## 5. 落地步骤
+## 5. 落地步骤（2026-10 历史记录）
 
-在 Hub 机（`ubuntu@10.0.1.151`）上：
+在 Hub 机上（当时的地址是 `ubuntu@10.0.1.151`，检出为 `~/tokhive-mvp`）：
 
 ```bash
 cd ~/tokhive-mvp
