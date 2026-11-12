@@ -145,7 +145,7 @@ gh release create '<release-tag>' --verify-tag --draft \
 
 ### 1. 首次建立发布身份
 
-在可信发布机器上准备专用 Ed25519 发布密钥，使用保护口令并安排备份。公开公钥和指纹，并在独立维护的官方渠道说明该指纹对应 Hive 正式发布身份。首次信任与轮换流程见 [发布签名身份](public-verification.md#发布签名身份)。
+在可信发布机器上准备专用 Ed25519 发布密钥，使用保护口令并安排备份。公开公钥和指纹，并在独立维护的官方渠道说明该指纹对应 Hive 正式发布身份。首次信任与轮换流程见 [发布签名身份](public-verification.md#release-signing-identity)。
 
 ### 2. 检出约定 tag，确认清单来源
 
