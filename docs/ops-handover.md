@@ -1,8 +1,70 @@
-# 从零部署 TEE：运维移交手册
+# 部署与更新 TEE：运维移交手册
 
-本文是移交给运维的从零部署手册，覆盖四件事：造信任根、造证书、打镜像、起机密实例；最后说明每次发版怎么留记录。读者不需要读过本仓库的其它文档，但需要一台 Linux 构建机和 AWS 权限。
+本文是移交给运维的手册：开头的 TL;DR 是一次升级要执行的完整命令，其后是从零部署的四件事——造信任根、造证书、打镜像、起机密实例，最后说明每次发版怎么留记录。读者不需要读过本仓库的其它文档，但需要一台 Linux 构建机和 AWS 权限。
 
 适用范围：双机部署，一台普通机器跑 Hub（仓库 `tokhive-hive`），一台 SEV-SNP 机密实例跑 TEE。本仓库只交付 TEE 侧；Hub 的代码与进程管理在另一个仓库。
+
+## TL;DR：更新已有部署（Hub 与 TEE 都在跑）
+
+只升级到新镜像时读这一节就够；从零部署跳过它，从 §1 开始。本节不涉及造密钥、造 CA，也不涉及签名与 Release。
+
+**一、在构建机**（当初打包、留有 `cloudtest/bin/bundles/` 与 `cloudtest/snp/.certs/` 的那台 Linux）：
+
+```bash
+git fetch && git checkout <本次要发布的源码 commit A>
+git status --short                     # 源码应已提交：未提交的源码会让 record 以 source_dirty 拒绝（密钥、证书、docs 不计入）
+cd cloudtest/snp
+./crosshost.sh build                   # 约 10-18 分钟；记下输出的 snp-app:<sha256>
+```
+
+`cloudtest/.env` 里这两项必须与生产一致，`up` 从它继承：
+
+```text
+TOKENHIVE_RELAY_KEY=<必须等于 Hub 的 HIVE_RELAY_KEY，不要留默认值>
+TOKENHIVE_TEE_INSTANCE_PROFILE=tokenhive-tee-logs
+```
+
+**二、起新 TEE，旧机保留**：
+
+```bash
+TOKENHIVE_TEE_TIMING=summary \
+  ./crosshost.sh up --tee-only --new --host-ip <Hub 私网 IP>
+```
+
+新实例的私网 IP 在 `up` 输出的 `-> instrumentation endpoint http://<ip>:18092/timing` 一行，也在 `cloudtest/crosshost.json` 的 `tee.private_ip`；`tee.app_hash` 同时被写成本次构建的摘要。
+
+**三、在 Hub 机改三行并重启**（`/etc/tokhive/hive.env`）：
+
+```text
+HIVE_TEE_ENDPOINT=https://<新 TEE 私网 IP>:18090
+HIVE_TEE_EXPECTED_APP=snp-app:<build 输出的摘要>
+HIVE_RELAY_ALLOWED_CIDRS=<新 TEE 私网 IP>/32
+```
+
+```bash
+sudo systemctl restart tokhive-hive
+journalctl -u tokhive-hive -n 100      # 应出现 attestation 通过、relay 建立
+```
+
+若本次改动了 `policy/`、协议或回执字段，Hive 二进制要一起换（按 Hive 仓库 `docs/operations.md` 的「升级与回滚」）。`HIVE_TEE_CLIENT_CERT`／`HIVE_TEE_CLIENT_KEY`、`HIVE_RELAY_KEY` 不变；R 没有轮换就不动 `HIVE_TEE_RELEASE_PUBLIC_KEY`。
+
+**四、验收、回收、登记**：
+
+```bash
+./crosshost.sh verify                                  # 串口 attestation + 进程日志
+curl http://<新 TEE 私网 IP>:18092/timing              # 在 Hub 机或同一安全组内执行
+./crosshost.sh down --superseded --dry-run
+./crosshost.sh down --superseded                       # 确认 Hub 已切过去，再删旧机
+./crosshost.sh record --environment production --application-id 'snp-app:<新摘要>'
+```
+
+`record` 之后才是 tag、草稿 Release 与清单签名，见 §8 末尾与 `docs/release-publishing.md`。
+
+三条命令之外、最容易踩空的前提：
+
+1. **relay key 两边必须相同。** TEE 的 user-data 用 `TOKENHIVE_RELAY_KEY`，Hub 用 `HIVE_RELAY_KEY`；不一致时实例健康、日志正常，只是永远不建立 relay。
+2. **Hub 必须在同一个 VPC／安全组内。** `crosshost.sh` 自建 VPC/SG，18085/18090/18092 只对同组成员放行；`--host-ip` 给的是私网地址，组外打不通。
+3. **旧机不能先删。** 顺序只能是「起新 → 改 Hub → 删旧」；`up` 在任何路径上都不终止实例。
 
 ## 0. 先理解三套材料，别混
 
@@ -251,6 +313,12 @@ HIVE_RELAY_ALLOWED_CIDRS=<TEE 私网 IP>/32
 
 重启方式按 Hub 仓库的实际部署；当前部署是 `systemctl restart tokhive-hive`。改文件不重启不生效。
 
+这三项之外的匹配关系写错时，实例看起来完全健康，只是握手或 relay 永远不成立：
+
+- **relay key**：`up` 注入 TEE user-data 的 `TOKENHIVE_RELAY_KEY`（取自 `cloudtest/.env`，缺省 `xhost-relay-key`）必须等于 Hub 的 `HIVE_RELAY_KEY`。缺省值只用于本机闭环，生产必须显式设置。
+- **网络位置**：Hub 必须在 `crosshost.sh` 自建的那个 VPC／安全组内。18085/18090/18092 只对同组实例放行，`--host-ip` 是私网地址，组外不通。
+- **R 公钥**：只有轮换过 R 才需要改 `HIVE_TEE_RELEASE_PUBLIC_KEY`（Hub 读的那份 R 公钥，见 §12）。
+
 验收：
 
 ```bash
@@ -287,6 +355,8 @@ TOKENHIVE_TEE_TIMING=summary \
 ./crosshost.sh down --superseded
 ```
 
+`up --new` 会把新实例自带的 `snp-app` 标签写回 `crosshost.json` 的 `tee.app_hash`，所以第 2 步的 `HIVE_TEE_EXPECTED_APP` 以构建输出或该字段为准，不要沿用旧值。relay key 与 instance profile 的要求同 §6：key 不一致或 Hub 不在同一安全组时，起机、串口、attestation 都正常，只有 relay 建不起来。
+
 `down --superseded` 会先确认当前 TEE 已记录且在运行，再按记录逐个核对双 tag；它从不按 tag 枚举。Hub 是否真的切过去了，它看不到，所以第 2 步必须人工确认。
 
 ## 8. 记录每次发版
@@ -314,12 +384,22 @@ cd cloudtest/snp
 
 环境名只接受 `staging` 与 `production`，与 Hive 页面读的导出视图同名；拼成 `prod` 不会报错，只会另起一段没人看的历史。
 
+**当前清单里只有 `production`，没有 `staging`。** 所以上面那条「生产版默认沿用测试版」在这里会以 `record: staging has no active release to copy` 失败。第一次登记必须显式给身份：
+
+```bash
+./crosshost.sh record --environment production --application-id 'snp-app:<sha256>'
+```
+
+先补一条 `staging` 也能让默认值恢复可用，但那会凭空多出一段 staging 历史；只有真的在 staging 跑过才该记。
+
 ```bash
 ./crosshost.sh record --environment staging --dry-run     # 只打印解析结果，不写文件
 ./crosshost.sh record --environment staging --no-commit   # 写清单但不提交，diff 自己看
 ```
 
 不想留下提交，就用上面两条里的任意一条；完全不想记录就别跑 `record`，其余流程不受影响。清单的字段、只追加规则与 `validate` / `export` 的用法见 `docs/tee-release-catalog.md`。
+
+`record` 只登记并提交 `releases/catalog.json`，**不签名、不打 tag、不建 Release**。声明这条记录已发布的 tag、草稿 Release 与 `catalog.json.sig` 见 `docs/release-publishing.md` 第三、五、六节。
 
 ## 9. 拆除与安全边界
 
@@ -336,8 +416,8 @@ cd cloudtest/snp
 | 物品 | 位置 | 性质 | 交接要求 |
 | --- | --- | --- | --- |
 | `PK.key` / `KEK.key` / `R.key` | `deploy/secure-boot/` | 秘密 | 离线密钥库，两份异地；绝不进 git |
-| PK/KEK/R 证书、ESL、`GUID.txt`、`aws-uefi-data.b64` | 同上 | 公开 | 随仓库交接 |
-| `shared/secure_boot_release_pub.pem` | `shared/` | 公开 | 必须与 `R.pub.pem` 同 SPKI |
+| PK/KEK/R 证书、ESL、`GUID.txt`、`aws-uefi-data.b64` | 同上 | 公开 | 随仓库交接；`R.crt.pem`／`R.pub.pem` 还作为 Release 附件发布 |
+| `shared/secure_boot_release_pub.pem` | `shared/` | 公开 | 必须与 `R.pub.pem` 同 SPKI；是编译期锚点，不是生产 Hub 的信任来源 |
 | `cloudtest/snp/.certs/` | `.certs/` | 含秘密 | 备份；CA 只此一份 |
 | `cloudtest/bin/bundles/<digest>.tar` | `bin/bundles/` | 公开 | 保留与在跑 TEE 匹配的那份 |
 | `cloudtest/crosshost.json` | `cloudtest/` | 状态 | 含 `tee.app_hash`、实例 ID，随部署保留 |
@@ -355,10 +435,12 @@ cd cloudtest/snp
 | 上游 TLS 只发 ClientHello | `upstream TLS trust: ... -> N anchors` | `N=0` 说明根没进信任库 |
 | 串口被 handshake 错误刷屏 | `cmd/tee/listenerlog.go` | 已折叠为每分钟一行计数；看第一行原因 |
 | 一条日志都没有 | 实例是否有 instance profile | 没有 profile 只有串口；挂 `TOKENHIVE_TEE_INSTANCE_PROFILE` |
+| attestation 通过，但没有 relay 建立 | 两边 relay key 是否相同 | `up` 注入的 `TEE_RELAY_KEY` 取 `TOKENHIVE_RELAY_KEY`，Hub 读 `HIVE_RELAY_KEY`；不一致时实例健康、日志正常，只是永不建立 relay |
+| Hub 连不上 18090 / 18085 | Hub 是否在 `crosshost.sh` 的 VPC／安全组内 | 这两个端口只对同组成员放行，`--host-ip` 的私网地址组外不通 |
 
 ## 12. 四条硬约束
 
-1. **R 公钥由 Hub 侧持有，不进仓库。** 生产 `R.key` 不交给开发人员，试验用密钥也不应该提交，所以本仓库只校验这套材料互相一致（`deploy/secure-boot-check.sh`），不要求它出现在任何 commit 里。真正的交付物是公钥：部署时把它以文件或外部配置的形式交给 Hub（Hub 侧调 `shared.SetReleasePublicKeyPEM` 载入），并保证它就是 AMI 里那把 R。核对方式是 `./deploy/secure-boot-check.sh --release-pem <Hub 的公钥文件>`，或比对 Hub 日志里的 `secure_boot_release_key` 与 `R.pub.pem` 的指纹——对不上时 Hub 会在运行期以 `event log does not prove an R-only post-separator Secure Boot policy` 拒绝 TEE。
+1. **R 私钥不进仓库，生产 Hub 用自己那份公钥文件。** 生产 `R.key` 不交给开发人员，试验用密钥也不应该提交，所以本仓库只校验这套材料互相一致（`deploy/secure-boot-check.sh`），不要求它出现在任何 commit 里。仓库中提交的 `shared/secure_boot_release_pub.pem` 只是 `cmd/tee`、`cmd/hub` 的 `//go:embed` 编译期锚点与测试锚，不是生产 Hub 的信任来源。真正的交付物是公钥：部署时把它以文件或外部配置的形式交给 Hub（Hive 的变量名是 `HIVE_TEE_RELEASE_PUBLIC_KEY`，Hub 侧调 `shared.SetReleasePublicKeyPEM` 载入），并保证它就是 AMI 里那把 R。核对方式是 `./deploy/secure-boot-check.sh --release-pem <Hub 的公钥文件>`，或比对 Hub 日志里的 `secure_boot_release_key` 与 `R.pub.pem` 的指纹——对不上时 Hub 会在运行期以 `event log does not prove an R-only post-separator Secure Boot policy` 拒绝 TEE。
 2. **换 R = 换镜像 + 换 Hub 的配置。** 本仓库的 `//go:embed` 副本仍然是 `cmd/tee`/测试用 `cmd/hub` 的验证锚，`crosshost.sh build` 末尾会重编它们（`run.sh build`）；生产 Hub 读的是部署方交给它的那份公钥，轮换时两边一起换，顺序反了就会运行期被拒。
 3. **CA 只生成一次。** `.certs/` 一旦被烘进 AMI，就不能再跑 `gencerts` 覆盖。轮换要 AMI + Hub 一起重做。
 4. **改任何被测字节都要重新 pin。** 代码、白名单、bundle 内证书，任一变化都改 `snp-app:` 摘要。Hub 的 `-expected-app` 与 `crosshost.json` 的 `tee.app_hash` 必须同步更新。
