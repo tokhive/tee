@@ -1,10 +1,13 @@
 package shared
 
 import (
+	"bytes"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/pem"
 	"fmt"
 	"strings"
@@ -228,5 +231,59 @@ func TestVerifyTypedSNPNonceAttestationDispatch(t *testing.T) {
 				t.Fatalf("verification error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+// buildSecureBootEventLog returns a minimal TPM 2.0 event log whose only
+// replayed event is a PCR 7 event with the given type, plus PCR values that
+// replay cleanly for PCR 7.
+func buildSecureBootEventLog(t *testing.T, eventType uint32, data []byte) ([]byte, map[uint32][]byte) {
+	t.Helper()
+
+	spec := new(bytes.Buffer)
+	spec.WriteString("Spec ID Event03\x00")
+	binary.Write(spec, binary.LittleEndian, uint32(0)) // platform class
+	spec.Write([]byte{0, 2, 0, 2})                     // minor, major, errata, uintn size
+	binary.Write(spec, binary.LittleEndian, uint32(1)) // algorithm count
+	binary.Write(spec, binary.LittleEndian, uint16(0x000B))
+	binary.Write(spec, binary.LittleEndian, uint16(sha256.Size))
+	spec.Write([]byte{0}) // vendor info size
+
+	var log bytes.Buffer
+	binary.Write(&log, binary.LittleEndian, uint32(0)) // spec ID event: PCR 0
+	binary.Write(&log, binary.LittleEndian, uint32(3)) // EV_NO_ACTION
+	log.Write(make([]byte, 20))                        // unused SHA-1 digest
+	binary.Write(&log, binary.LittleEndian, uint32(spec.Len()))
+	log.Write(spec.Bytes())
+
+	digest := sha256.Sum256(data)
+	binary.Write(&log, binary.LittleEndian, uint32(7)) // PCR 7
+	binary.Write(&log, binary.LittleEndian, eventType)
+	binary.Write(&log, binary.LittleEndian, uint32(1)) // digest count
+	binary.Write(&log, binary.LittleEndian, uint16(0x000B))
+	log.Write(digest[:])
+	binary.Write(&log, binary.LittleEndian, uint32(len(data)))
+	log.Write(data)
+
+	extend := sha256.New()
+	extend.Write(make([]byte, sha256.Size))
+	extend.Write(digest[:])
+	pcrs := map[uint32][]byte{
+		4:  make([]byte, sha256.Size),
+		7:  extend.Sum(nil),
+		11: make([]byte, sha256.Size),
+	}
+	return log.Bytes(), pcrs
+}
+
+// GO-2026-6893: the event type is a plain uint32 copied from the log and no
+// digest covers it, so a host can put an arbitrary value there. A type the
+// verifier does not recognise must be an error, never a panic.
+func TestReleaseSecureBootEventLogRejectsUnknownEventType(t *testing.T) {
+	eventLog, pcrs := buildSecureBootEventLog(t, 0x800000FF, []byte("event data"))
+
+	_, err := verifyReleaseSecureBootEventLog(eventLog, pcrs, crypto.SHA256)
+	if err == nil || !strings.Contains(err.Error(), "unrecognised event type") {
+		t.Fatalf("verification error = %v, want it to report an unrecognised event type", err)
 	}
 }

@@ -53,7 +53,7 @@ exists so the harness can drive a full business loop without a cloud account.
 
 ## Build and test
 
-Go 1.27.3 or newer, per `go.mod`.
+Go 1.27.4 or newer, per `go.mod`.
 
 ```sh
 go build ./...
