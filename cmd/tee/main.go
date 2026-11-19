@@ -51,13 +51,13 @@ import (
 
 	"go.uber.org/zap"
 
-	rootShared "github.com/tokhive/tee/shared"
 	"github.com/tokhive/tee/cmd/internal/shared"
 	"github.com/tokhive/tee/evidence"
 	"github.com/tokhive/tee/hub"
 	"github.com/tokhive/tee/internal/mtls"
 	"github.com/tokhive/tee/metrics"
 	"github.com/tokhive/tee/proof"
+	rootShared "github.com/tokhive/tee/shared"
 	"github.com/tokhive/tee/tee"
 	"github.com/tokhive/tee/transport"
 )
@@ -330,7 +330,24 @@ func main() {
 	// set/drop endpoints; envelopes live in the Hub's credential store and ride
 	// onto each job.
 	mux.HandleFunc("/v1/credential-key", func(w http.ResponseWriter, r *http.Request) {
-		tee.ServeCredentialKey(inbox, w, r)
+		if r.URL.Query().Get("nonce") == "" {
+			tee.ServeCredentialKey(inbox, w, r)
+			return
+		}
+		// A nonce makes the answer unforgeable by the Hub: only the enclave
+		// holding the attested epoch key can sign this challenge over its inbox
+		// key. Refuse rather than sign with an epoch whose evidence has already
+		// aged out; the provider would reject it anyway.
+		current := liveSigner.Load()
+		if current == nil {
+			http.Error(w, "no attested signer available", http.StatusServiceUnavailable)
+			return
+		}
+		if deadline, tracked := rootShared.SNPSigningDeadline(current.Epoch().Identity().Evidence); tracked && time.Now().After(deadline) {
+			http.Error(w, "attested signer is past its signing deadline", http.StatusServiceUnavailable)
+			return
+		}
+		tee.ServeAttestedCredentialKey(inbox, current, policyHash, w, r)
 	})
 	// Evidence retrieval: serves the restart-surviving evidence store so a Hub
 	// or auditor can resolve a hash-only receipt's EvidenceHash against a real

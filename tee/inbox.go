@@ -10,6 +10,7 @@ import (
 	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/tokhive/tee/internal/canonical"
+	"github.com/tokhive/tee/proof"
 )
 
 // CredentialEnvelopeDomain separates the credential-envelope key derivation
@@ -292,6 +294,63 @@ func ServeCredentialKey(key *InboxKey, w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", CredentialKeyContentType)
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(enc)
+}
+
+// ServeAttestedCredentialKey answers a nonce-challenged credential-key fetch.
+//
+// The inbox key alone is just a key: a relay that sits between the TEE and a
+// provider could replace it and read every credential sealed to it. The
+// statement signed here binds this inbox key to the attested epoch key that
+// signs execution receipts, so a provider can verify the key against the same
+// measured image it already trusts.
+func ServeAttestedCredentialKey(key *InboxKey, signer *proof.Signer, policyHash [32]byte, w http.ResponseWriter, r *http.Request) {
+	if key == nil || signer == nil {
+		http.Error(w, "no attested inbox key configured", http.StatusServiceUnavailable)
+		return
+	}
+	nonce, err := hex.DecodeString(strings.TrimSpace(r.URL.Query().Get("nonce")))
+	if err != nil || len(nonce) != proof.CredentialKeyNonceLength {
+		http.Error(w, "nonce must be 32 hex-encoded bytes", http.StatusBadRequest)
+		return
+	}
+
+	public := key.Public()
+	signed, err := signer.SignCredentialKey(proof.CredentialKeyStatement{
+		Version:     proof.VersionV1,
+		Nonce:       nonce,
+		InboxKeyID:  public.KeyID[:],
+		InboxPublic: public.PublicKey,
+		PolicyHash:  policyHash[:],
+		IssuedAt:    time.Now().Unix(),
+	})
+	if err != nil {
+		http.Error(w, "attest credential key: "+err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	statement, err := signed.EncodeCanonical()
+	if err != nil {
+		http.Error(w, "encode credential key attestation: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	enc, err := json.Marshal(attestedCredentialKeyJSON{
+		KeyID:       base64.StdEncoding.EncodeToString(public.KeyID[:]),
+		PublicKey:   base64.StdEncoding.EncodeToString(public.PublicKey),
+		Attestation: base64.StdEncoding.EncodeToString(statement),
+	})
+	if err != nil {
+		http.Error(w, "encode credential key: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", CredentialKeyContentType)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(enc)
+}
+
+type attestedCredentialKeyJSON struct {
+	KeyID       string `json:"key_id"`
+	PublicKey   string `json:"public_key"`
+	Attestation string `json:"attestation"`
 }
 
 // CredentialKeyRequest is the helper a client (or agent) uses to fetch an

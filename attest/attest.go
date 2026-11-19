@@ -174,11 +174,31 @@ func (v *Verifier) Check(signed proof.SignedReceipt) error {
 	if err != nil {
 		return err
 	}
+	return v.CheckIdentity(id)
+}
+
+// CheckIdentity validates an attested key identity that is not carried by a
+// receipt, such as the key that signed a credential-key statement. It applies
+// the same trust root as Check: the platform allow-list, evidence resolution,
+// the pinned deployment policy, and the platform's evidence verifier.
+//
+// The caller is responsible for verifying the signature over the statement
+// that names this identity.
+func (v *Verifier) CheckIdentity(id platform.Identity) error {
+	if v == nil {
+		return errors.New("attest: nil verifier")
+	}
+	if _, ok := v.allowed[id.Platform]; !ok {
+		return fmt.Errorf("%w: %q", proof.ErrPlatformNotAllowed, id.Platform)
+	}
 
 	// Resolve full evidence for a hash-only reference. The Fetcher must return
 	// bytes whose hash matches; refusing on a miss is what makes the hash
 	// meaningful rather than decorative.
 	if len(id.Evidence) == 0 {
+		if v.fetcher == nil {
+			return proof.ErrEvidenceRequired
+		}
 		ev, err := v.fetcher.Fetch(context.Background(), id)
 		if err != nil {
 			return fmt.Errorf("resolve attestation evidence: %w", err)

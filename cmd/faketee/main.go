@@ -217,7 +217,11 @@ func main() {
 	// Credential plane, mirroring cmd/tee: agents (or one-shot tools) fetch the
 	// inbox key, seal their token to it, and present the envelope on each job.
 	mux.HandleFunc("/v1/credential-key", func(w http.ResponseWriter, r *http.Request) {
-		tee.ServeCredentialKey(inbox, w, r)
+		if r.URL.Query().Get("nonce") == "" {
+			tee.ServeCredentialKey(inbox, w, r)
+			return
+		}
+		tee.ServeAttestedCredentialKey(inbox, signer, policyHash, w, r)
 	})
 	// Evidence retrieval, mirroring cmd/tee: serve the restart-surviving store
 	// so a remote Hub or auditor resolves a hash-only receipt's EvidenceHash.
