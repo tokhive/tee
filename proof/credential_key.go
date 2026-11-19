@@ -31,7 +31,6 @@ var (
 	ErrInvalidCredentialKeyNonce       = errors.New("invalid credential-key nonce")
 	ErrCredentialKeyNonceMismatch      = errors.New("credential-key nonce does not match")
 	ErrInvalidInboxKey                 = errors.New("invalid inbox key")
-	ErrInboxKeyMismatch                = errors.New("inbox key does not match the attested statement")
 	ErrCredentialKeyPolicyMismatch     = errors.New("credential-key policy hash does not match")
 	ErrCredentialKeyTooOld             = errors.New("credential-key statement is older than the allowed window")
 )
@@ -77,7 +76,7 @@ func (s CredentialKeyStatement) Validate() error {
 		return fmt.Errorf("%w: length %d, want %d", ErrInvalidPolicyHash, len(s.PolicyHash), PolicyHashLength)
 	}
 	if s.IssuedAt <= 0 {
-		return fmt.Errorf("%w: issued at %d", ErrInvalidInboxKey, s.IssuedAt)
+		return fmt.Errorf("credential-key statement has invalid issue time %d", s.IssuedAt)
 	}
 	if err := validateInboxPublic(s.InboxPublic); err != nil {
 		return err
