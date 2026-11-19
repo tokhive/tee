@@ -241,21 +241,27 @@ func validateAttestation(ref *AttestationRef) error {
 // Identity reconstructs the signing identity from the attestation reference so
 // that signature verification reuses the platform verification path.
 func (r Receipt) Identity() (platform.Identity, error) {
-	if err := validateAttestation(r.Attestation); err != nil {
+	return identityFromAttestation(r.Attestation)
+}
+
+// identityFromAttestation is shared by receipts and credential-key statements:
+// both bind a signed statement to the attested key named by the same reference.
+func identityFromAttestation(ref *AttestationRef) (platform.Identity, error) {
+	if err := validateAttestation(ref); err != nil {
 		return platform.Identity{}, err
 	}
 
 	var keyID, evidenceHash [32]byte
-	copy(keyID[:], r.Attestation.KeyID)
-	copy(evidenceHash[:], r.Attestation.EvidenceHash)
+	copy(keyID[:], ref.KeyID)
+	copy(evidenceHash[:], ref.EvidenceHash)
 
 	return platform.Identity{
-		Platform:        r.Attestation.Platform,
-		AttestationType: r.Attestation.AttestationType,
-		ApplicationID:   r.Attestation.ApplicationID,
-		Evidence:        r.Attestation.Evidence,
+		Platform:        ref.Platform,
+		AttestationType: ref.AttestationType,
+		ApplicationID:   ref.ApplicationID,
+		Evidence:        ref.Evidence,
 		EvidenceHash:    evidenceHash,
-		PublicKeyDER:    r.Attestation.PublicKeyDER,
+		PublicKeyDER:    ref.PublicKeyDER,
 		KeyID:           keyID,
 	}, nil
 }
