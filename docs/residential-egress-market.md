@@ -637,6 +637,33 @@ Go/No-Go：第 2 步的复购率与溢价、第 3 步的投诉率（每千租约
 
 ---
 
+## 14 上线状态与兼容性（2026-11-23）
+
+### 14.1 已实现
+
+| 能力 | 位置 |
+|---|---|
+| CONNECT 代理、预付租约、逐租约 HMAC 令牌（令牌不含买家 ID） | Hive `internal/egress` |
+| 目标策略（80/443、拒绝 IP 字面量与私网）、字节/速率上限、域名后缀规则（`bps: 0` 拒绝） | Bee `beewire` + `agent/egress_residential.go` |
+| 买家扣款、卖家分成入账、释放时按未用分钟退款（卖家同比例回收） | Hive `service.EgressWallet` + `egress.Service` |
+| 买家/卖家各自用量（字节、租约数、活跃租约） | `GET /v1/egress/usage`、`GET /api/bee/egress/usage` |
+| Clash 订阅（每个活跃租约一个 `type: http` + TLS 代理） | `GET /v1/egress/subscription` |
+
+默认价 $0.30/小时，含 1 GiB；平台佣金 30%。1 GiB 中继带宽约 $0.05，因此满用仍有正毛利；每个买家同时最多 4 个活跃租约。价格是默认值，卖家报价可覆盖。
+
+### 14.2 兼容与灰度
+
+- 租约令牌带 `v`（当前 1）；Hive 与 Bee 都只接受已知版本，未知版本被拒绝而不是误解。
+- Bee 在连接头 `X-Bee-Controls` 中声明 `egress`；Hive 只把声明了的设备列为卖家。旧 Bee 不声明→不被派单，但仍正常提供 token 供给；旧 Hive 看到未知声明会忽略。
+- 因此升级顺序不受限：先升 Hive（egress 暂时没有卖家）或先升 Bee（暂不被列入卖家）都不会产生错误派单，也不会影响既有的 token 业务。
+
+### 14.3 未实现（不阻塞现有 token 业务）
+
+- 隧道半关闭（单向 FIN）：买家 `shutdown(SHUT_WR)` 会连带关闭响应。
+- VLESS / XUDP：不做；客户端用标准 HTTP CONNECT 或 Clash 订阅接入。
+- 订阅按国家/中国组分组：需要卖家的国家元数据，目前 `Seller` 无国家字段，订阅只输出“全部”。
+- 质量分、探测、IP 漂移处理、用量持久化（当前用量在进程内存，重启归零；账单以钱包流水为准）。
+
 ## 附录 A：与原方案（v1）的差异
 
 | v1 | v2 | 原因 |
