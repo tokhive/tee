@@ -230,6 +230,7 @@ requested → probing → active → renewing → active
 | POST | `/v1/egress/leases/{id}/renew` | 续租（余额不足即失败） |
 | DELETE | `/v1/egress/leases/{id}` | 释放，按分钟退未用时长 |
 | GET | `/v1/egress/leases/{id}/usage` | 字节、连接、失败、当前速率 |
+| GET | `/v1/egress/usage` | 买家自己的购买量：累计字节、租约数、活跃租约 |
 | GET | `/v1/egress/leases/{id}/evidence` | 签名证据（§6.4） |
 | CONNECT | `/v1/egress` | 数据面；`Proxy-Authorization` 或租约 ID 绑定的 key |
 
@@ -497,6 +498,8 @@ Hive 在自己的隧道上向卖家开一条流，目标是 `n<nonce>.echo.<doma
 - 一键 kill switch（Bee 本地生效，不等 Hive）。
 - 明确告知：80 端口是明文，买家与路径上的任何人都能看到；卖家可选择只卖 443。
 - 卖家的上行被占满时，Bee 本地背压优先保证自己的正常上网（可配置保留带宽）。
+- 域名规则（已实现）：`residential.rules` 按域名后缀匹配、最长后缀优先；`bps` 是该后缀的速率上限，`bps: 0` 直接拒绝该后缀及其子域，因此 `cn`、`ru` 这类国家后缀等价于按国家域名限速或封禁。规则只能收紧买家的速率，不能放宽。
+- 买家匿名（已实现）：签给 Bee 的租约令牌不含买家 ID，Bee 只校验租约与卖家；卖家的出售量在 `/api/bee/egress/usage`（设备凭证鉴权）读取，买家用 `/v1/egress/usage` 只看自己的数据。
 
 ### 7.6 与 token 供给的隔离（硬规则）
 
