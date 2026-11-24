@@ -1,7 +1,7 @@
 # TokenHive 住宅出口市场：设计方案（v2）
 
 日期：2026-11-23
-状态：中继模式已实现（Bee 卖家面 + Hive 租约与 CONNECT 数据面）；Hive 的账本 Wallet 适配器与半关闭帧仍待做，直连模式未实现
+状态：中继模式已实现（Bee 卖家面 + Hive 租约与 CONNECT 数据面 + VLESS TCP 接入入口，见 §2.6）；Hive 的账本 Wallet 适配器与半关闭帧仍待做，直连模式未实现
 变更：按 2026-11-23 的审计意见重写。核心修正四处（佣金口径、时长计费与余额模型的冲突、包含额度的量级、TEE 探测的定位），新增三处上线阻断项（CONNECT 私网防护、逐租约签名令牌、与 token 供给的 IP 隔离），并给出传输层的选型论证（CONNECT / SOCKS5 / VLESS / XUDP / MASQUE）。原方案的差异见附录 A。
 
 定位：本文描述一个只卖"住宅网络出口"的产品形态：买家带自己的凭据，TokenHive 提供一条从住宅 IP 出去的通道，并对这条通道收钱。与 [`remote-workspace-market.md`](remote-workspace-market.md) 是两条独立的产品线。
@@ -16,7 +16,7 @@
 4. **按量费是主要收入**，包含额度按"每已开始小时 N MiB"计（原方案 1–5 GiB/小时是 720–3600 GiB/月，带宽成本高于 IP 租金本身，必然亏损）。
 5. **质量不是档位而是连续分**，买家按 `min_score` 过滤，同分段内按价格排序。新卖家有置信区间与试用配额，避免"无数据→无单→无数据"的冷启动死锁。
 6. 三件 P0 不做就不上线：**私网/端口/扫描防护**、**逐租约签名令牌**（Bee 验签，防止隧道被当成开放代理）、**与 token 供给的 IP 隔离**（否则爬虫流量会烧掉卖家的订阅账号）。
-7. 不做的：UDP/QUIC（v1）、VLESS 本体、REALITY 类伪装、TEE 终结形态、共享 IP 的高保证档、"账号不被风控"的任何承诺。
+7. 不做的：UDP/QUIC（v1）、REALITY 类伪装、TEE 终结形态、共享 IP 的高保证档、"账号不被风控"的任何承诺。VLESS 只作为 **TCP 接入外壳**实现（§2.6）：租约、策略、计量与 CONNECT 共用，不引入它的 UDP、Mux.Cool 与伪装。
 8. **可选直连（§2.5）**：卖家有可映射端口时，买家直连卖家，Hive 只验证端点、签发租约；计费退化为"带宽·时间"预付，字节计量标注为卖家自报。默认关闭。
 
 一句诚实的边界：**我们能证明"这条连接从那个 IP 出去"，不能证明"你所有的连接都从那个 IP 出去"。**
@@ -39,7 +39,9 @@
 
 ## 2. 数据面形态与传输选型
 
-### 2.1 形态 A：TCP CONNECT（默认，v1 唯一的形态）
+### 2.1 形态 A：TCP CONNECT（默认入口）
+
+买家有两个接入方式：这里的 CONNECT（默认）与 §2.6 的 VLESS TCP。两者在 Hive 内汇合到同一个 `egress.Service`——租约、目标策略、字节上限、并发上限、卖家域名规则全部相同，区别只在外层协议。
 
 买家向 Hive 的 `/v1/egress` 发 `CONNECT host:port`，Hive 在卖家的 Bee 隧道上开一条流，Bee 拨目标，双向复制字节。
 
@@ -76,7 +78,7 @@ VLESS 是 Xray 的轻量无状态代理协议：1 字节版本 + 16 字节 UUID 
 | XUDP | 见 §2.2：在 TCP 上模拟 UDP 会放大 HOL |
 | XTLS Vision / splice | 它依赖在同机内识别内层 TLS 并做零拷贝转发；我们的 Hive 与 Bee 跨主机、且 Hive 不解内层 TLS，无法 splice |
 
-**结论：协议层用标准 HTTP CONNECT（+ 可选 SOCKS5），把 VLESS/XUDP 的可取之处吸收进现有隧道，而不是把 VLESS 引进来。**
+**结论：隧道、鉴权、计费仍是我们自己的；VLESS 只作为第二个接入外壳（§2.6），用来承接已经装了 Xray / sing-box / Clash 客户端的买家。XUDP 仍然不做。**
 
 ### 2.4 传输栈与容量预算（估算，需压测校准）
 
@@ -153,11 +155,26 @@ Bee 检测 NAT 类型与映射结果，上报 `endpoint`（公网 IP:port）；*
 
 ---
 
+### 2.6 VLESS TCP 入口（已实现）
+
+买家手里常见的客户端是 Xray、sing-box、mihomo（Clash Meta）、v2rayN，它们把 `vless://` 当一等公民；"HTTP CONNECT + 代理口令"要么要手工填，要么没有入口。因此 Hive 另开一个 VLESS TCP 监听面，**只换接入外壳**：汇合到同一个 `egress.Service`，租约、策略、计量、卖家规则都共用。完整协议与部署细节见 [`egress-vless-tcp.md`](egress-vless-tcp.md)。
+
+- **身份**：VLESS 凭据是 16 字节 UUID，签名令牌装不进去，所以 `uuid = HMAC-SHA256(HIVE_EGRESS_KEY, "vless|" + token)[0:16]`（置 UUIDv4 版本/变体位）。Hive 维护 `UUID → 租约` 的内存索引，Bee 仍只验签令牌。租约释放、过期或用尽，UUID 同时失效。
+- **策略不变**：仍只允许 80/443，仍拒绝 IP 字面量与私网目标。客户端若自行解析域名并发 IP，Hive 直接拒绝，而不是让 Bee 再解析一次。
+- **计量不变**：字节上限与并发流上限在两条入口之间共享，换入口不能多用一个字节。
+- **不做**：命令 2（UDP）与命令 3（Mux.Cool）在握手阶段关闭连接；REALITY / XTLS Vision 不做（理由同 §2.3）。
+- **传输**：VLESS 自身不加密，公网入口必须 `VLESS over TLS`（Hive 持证书）；明文监听只用于本机联调。
+- **部署**：`HIVE_EGRESS_VLESS_ADDR`（监听）、`_CERT` / `_KEY`（同时设置）、`_PUBLIC`（链接里的 host:port）、`_SNI`（可选）。缺 `_PUBLIC` 时不输出任何 `vless://` 链接。
+- **买家订阅**：`GET /v1/egress/subscription?format=vless`（base64 的 `vless://` 列表）、`format=clash&transport=vless`（mihomo VLESS 组）、`GET /v1/egress/leases/{id}/link`（单条租约）。
+- **代价**：多一个监听端口要管（证书、防火墙、CDN 关系）；VLESS 没有标准只有实现，客户端升级可能带来字段差异，验收要覆盖 Xray、sing-box、mihomo 三家。
+- **已知缺口**：隧道仍无半关闭（§2.1），VLESS 浏览器场景更容易触发；每租约默认 8 条并发流在浏览器下容易打满。
+
 ## 3. 架构与职责
 
 ```mermaid
 flowchart LR
-    B["买家客户端<br/>HTTPS CONNECT"] -->|TLS + CONNECT| E["/v1/egress<br/>Hive"]
+    B["买家客户端<br/>HTTPS CONNECT"] -->|TLS + CONNECT| E["/v1/egress + VLESS<br/>Hive"]
+    V["买家客户端<br/>VLESS TCP"] -->|TLS + VLESS| E
     E -->|现有隧道开流| A["Bee（卖家的住宅网络）"]
     A -->|TCP| U["目标站点 / API"]
     E -.计量.-> L["Hive 账本 / 租约"]
@@ -181,6 +198,7 @@ flowchart LR
 | Bee 的 `targets` | 精确 `host:port`，最多 16 条 | **结构性不兼容**：新增 residential 配置段与逐流授权模型；不能用现有 targets 表达"买家任意目标" |
 | Bee 的出口 | 只搬 AI 上游的密文 | 新增目标策略、私网过滤、租约验签、计数上报 |
 | Hive relay | 源 IP 白名单只放行 TEE | 新增买家认证的 egress 端点、独立流预算、独立限速 |
+| Hive 买家接入面 | 只有 CONNECT | 新增 VLESS TCP 监听（独立端口、同一 `egress.Service`）：UUID 由租约令牌派生、策略与计量共用；订阅可只导出 VLESS |
 | TEE | — | 零改动（这正是选形态 A 的主要收益） |
 
 ---
