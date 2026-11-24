@@ -120,3 +120,55 @@ func TestBuildUpgradeBytesKeepsCallerHeadersButNotHandshakeOnes(t *testing.T) {
 		t.Fatalf("Sec-WebSocket-Key appears %d times, want exactly once", got)
 	}
 }
+
+// A handshake has no body, so a caller-supplied framing header can only be a
+// second framing the provider did not agree to. It is dropped with the rest of
+// what the TEE owns.
+func TestBuildUpgradeBytesDropsFramingHeaders(t *testing.T) {
+	req := tee.Request{
+		Method: "GET",
+		Host:   "api.example.com",
+		Path:   "/v1/realtime",
+		Headers: map[string]string{
+			"Content-Length":      "99",
+			"Transfer-Encoding":   "chunked",
+			"Keep-Alive":          "timeout=5",
+			"Proxy-Authorization": "Basic caller",
+			"X-Custom":            "kept",
+		},
+	}
+	raw, err := buildUpgradeBytes(req, "verified-key")
+	if err != nil {
+		t.Fatalf("buildUpgradeBytes: %v", err)
+	}
+	wire := string(raw)
+	for _, unwanted := range []string{"Content-Length", "Transfer-Encoding", "Keep-Alive", "Proxy-Authorization"} {
+		if strings.Contains(wire, unwanted) {
+			t.Fatalf("handshake carries %q, which the TEE must not copy:\n%s", unwanted, wire)
+		}
+	}
+	if !strings.Contains(wire, "X-Custom: kept\r\n") {
+		t.Fatalf("caller header dropped:\n%s", wire)
+	}
+}
+
+// The request line is rendered from fields the TEE owns, so a line break or a
+// space in any of them is refused instead of splitting what the receipt says
+// from what goes on the wire.
+func TestBuildRequestRejectsLineBreaks(t *testing.T) {
+	cases := map[string]tee.Request{
+		"method": {Method: "GET\r\nX-Injected: 1", Host: "api.example.com", Path: "/"},
+		"host":   {Method: "GET", Host: "api.example.com\r\nX-Injected: 1", Path: "/"},
+		"path":   {Method: "GET", Host: "api.example.com", Path: "/v1\r\nX-Injected: 1"},
+		"query":  {Method: "GET", Host: "api.example.com", Path: "/v1", Query: "a=1\r\nX-Injected: 1"},
+		"space":  {Method: "GET", Host: "api.example.com", Path: "/v1 a"},
+	}
+	for name, req := range cases {
+		if _, err := buildRequestHead(req); err == nil {
+			t.Errorf("%s: buildRequestHead accepted a line break", name)
+		}
+		if _, err := buildUpgradeBytes(req, "verified-key"); err == nil {
+			t.Errorf("%s: buildUpgradeBytes accepted a line break", name)
+		}
+	}
+}

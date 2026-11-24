@@ -211,7 +211,10 @@ func (ch *channel) exchange(ctx context.Context, req tee.Request, onChunk func([
 	tm := tee.TimingsFrom(ctx)
 	ch.wrote = 0
 
-	head := buildRequestHead(req)
+	head, err := buildRequestHead(req)
+	if err != nil {
+		return false, tee.Response{}, err
+	}
 
 	// Clear any deadline a previous exchange's cancellation poke may have left,
 	// then bound this exchange by the caller's deadline. The socket deadline
@@ -336,7 +339,10 @@ func (ch *channel) writeRequest(head, body []byte) (int, error) {
 // http.ReadResponse; the request itself is written byte-for-byte. There is no
 // gzip, no retry, no redirect, and no environment proxy here — every byte is
 // one the TEE decided to send, so the signed receipt can describe it exactly.
-func buildRequestHead(req tee.Request) []byte {
+func buildRequestHead(req tee.Request) ([]byte, error) {
+	if err := validRequestLine(req); err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
 
 	target := req.Path
@@ -347,14 +353,78 @@ func buildRequestHead(req tee.Request) []byte {
 	fmt.Fprintf(&buf, "%s %s HTTP/1.1\r\n", req.Method, target)
 	fmt.Fprintf(&buf, "Host: %s\r\n", req.Host)
 	fmt.Fprintf(&buf, "Connection: keep-alive\r\n")
-	for name, value := range req.Headers {
-		fmt.Fprintf(&buf, "%s: %s\r\n", name, value)
+	names := make([]string, 0, len(req.Headers))
+	for name := range req.Headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		// Framing and connection headers belong to this exchange, not to the
+		// caller's spec. A second Host or Content-Length, or a smuggled
+		// Transfer-Encoding, would change what the TEE actually sent while the
+		// receipt still described only the spec.
+		if reservedRequestHeader(name) {
+			continue
+		}
+		if err := validHeaderField(name, req.Headers[name]); err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(&buf, "%s: %s\r\n", name, req.Headers[name])
 	}
 	// Always explicit, including zero, so a bodyless request still carries a
 	// legal Content-Length: 0 the same way the standard library rendered it.
 	fmt.Fprintf(&buf, "Content-Length: %d\r\n", len(req.Body))
 	buf.WriteString("\r\n")
-	return buf.Bytes()
+	return buf.Bytes(), nil
+}
+
+// reservedRequestHeader reports whether a header belongs to the framing of the
+// exchange and must not be copied from the caller's spec.
+func reservedRequestHeader(name string) bool {
+	switch strings.ToLower(name) {
+	case "host", "connection", "content-length", "transfer-encoding",
+		"keep-alive", "proxy-connection", "upgrade", "te", "trailer",
+		"proxy-authorization", "proxy-authenticate":
+		return true
+	}
+	return false
+}
+
+// validRequestLine rejects a method, host, or target that would change the
+// shape of the request line. The spec is validated before it is accepted, but
+// the TEE is the boundary that signs what it actually wrote, so it checks here
+// as well rather than trusting that every caller ran the same validation.
+func validRequestLine(req tee.Request) error {
+	if req.Method == "" || strings.ContainsAny(req.Method, " \t\r\n") {
+		return fmt.Errorf("transport: invalid method %q", req.Method)
+	}
+	if req.Host == "" || strings.ContainsAny(req.Host, " \t\r\n") {
+		return fmt.Errorf("transport: invalid host %q", req.Host)
+	}
+	target := req.Path
+	if req.Query != "" {
+		target += "?" + req.Query
+	}
+	// A space inside the target would split the request line; CR or LF would
+	// end it, letting the rest become headers the receipt never described.
+	if strings.ContainsAny(target, " \t\r\n") {
+		return fmt.Errorf("transport: invalid request target %q", target)
+	}
+	return nil
+}
+
+// validHeaderField rejects names and values that would split one header into
+// two on the wire. The caller's map comes from the Hub and is already filtered,
+// but the TEE is the boundary that signs what it sent, so it validates here
+// rather than trusting an upstream invariant.
+func validHeaderField(name, value string) error {
+	if name == "" || strings.ContainsAny(name, " \t\r\n:") {
+		return fmt.Errorf("transport: invalid header name %q", name)
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("transport: invalid value for header %q", name)
+	}
+	return nil
 }
 
 // readBuffers recycles the per-exchange read buffer. Every exchange needs one
@@ -409,6 +479,9 @@ func (s *Session) Close() error { return s.conn.Close() }
 // injected provider credential — are carried through unchanged. The handshake
 // bytes are not counted toward RequestBytes; only post-upgrade writes are.
 func buildUpgradeBytes(req tee.Request, key string) ([]byte, error) {
+	if err := validRequestLine(req); err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
 
 	target := req.Path
@@ -434,6 +507,9 @@ func buildUpgradeBytes(req tee.Request, key string) ([]byte, error) {
 		if reservedUpgradeHeader(name) {
 			continue
 		}
+		if err := validHeaderField(name, req.Headers[name]); err != nil {
+			return nil, err
+		}
 		fmt.Fprintf(&buf, "%s: %s\r\n", name, req.Headers[name])
 	}
 	buf.WriteString("\r\n")
@@ -444,7 +520,11 @@ func buildUpgradeBytes(req tee.Request, key string) ([]byte, error) {
 // handshake and must not be copied from the caller's spec.
 func reservedUpgradeHeader(name string) bool {
 	switch strings.ToLower(name) {
-	case "host", "connection", "upgrade", "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions":
+	case "host", "connection", "upgrade", "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions",
+		// Framing headers have no meaning before a successful 101, and a
+		// caller-supplied one would only be read as part of the handshake.
+		"content-length", "transfer-encoding", "keep-alive", "proxy-connection",
+		"te", "trailer", "proxy-authorization", "proxy-authenticate":
 		return true
 	}
 	return false

@@ -123,6 +123,88 @@ func TestChannelBasicExchange(t *testing.T) {
 	}
 }
 
+// TestChannelOwnsFramingHeaders pins the boundary the TEE signs: a caller
+// cannot smuggle a second Host, a different Content-Length, or a
+// Transfer-Encoding into what the TEE sends upstream.
+func TestChannelOwnsFramingHeaders(t *testing.T) {
+	var got struct {
+		host     string
+		length   int64
+		transfer []string
+		custom   string
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.host = r.Host
+		got.length = r.ContentLength
+		got.transfer = r.TransferEncoding
+		got.custom = r.Header.Get("X-Custom")
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	cm := newTestManager(t)
+	resp, err := cm.Do(context.Background(),
+		testReq(tee.Request{
+			Method: "POST",
+			Host:   hostOf(srv),
+			Path:   "/v1/messages",
+			Headers: map[string]string{
+				"Host":              "evil.example",
+				"Connection":        "close",
+				"Content-Length":    "99",
+				"Transfer-Encoding": "chunked",
+				"X-Custom":          "kept",
+			},
+			Body: []byte("abc"),
+		}),
+		func([]byte) error { return nil })
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if got.host != hostOf(srv) {
+		t.Errorf("upstream host = %q, want %q", got.host, hostOf(srv))
+	}
+	if got.length != 3 {
+		t.Errorf("content length = %d, want 3", got.length)
+	}
+	if len(got.transfer) != 0 {
+		t.Errorf("transfer encoding = %v, want none", got.transfer)
+	}
+	if got.custom != "kept" {
+		t.Errorf("X-Custom = %q, want kept", got.custom)
+	}
+}
+
+// TestChannelRejectsHeaderInjection covers the other half: a value that would
+// split into two headers is refused before anything reaches the Provider.
+func TestChannelRejectsHeaderInjection(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	cm := newTestManager(t)
+	_, err := cm.Do(context.Background(),
+		testReq(tee.Request{
+			Method:  "GET",
+			Host:    hostOf(srv),
+			Path:    "/",
+			Headers: map[string]string{"X-Evil": "a\r\nX-Injected: 1"},
+		}),
+		func([]byte) error { return nil })
+	if err == nil {
+		t.Fatal("injected header was forwarded")
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("upstream received %d requests, want 0", hits.Load())
+	}
+}
+
 // TestChannelReportsResponseStart pins the transport half of the start-frame
 // contract: the onStart callback fires exactly once, as soon as the response
 // headers are parsed and before the first body chunk, carrying the status and
