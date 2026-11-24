@@ -150,6 +150,9 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 		// The API reseller the market falls back to, on both shapes.
 		{"api.wokey.ai", "/v1/responses", "POST"},
 		{"api.wokey.ai", "/v1/messages", "POST"},
+		// A Google subscription (Gemini CLI OAuth) on the Code Assist API.
+		{"cloudcode-pa.googleapis.com", "/v1internal:generateContent", "POST"},
+		{"cloudcode-pa.googleapis.com", "/v1internal:streamGenerateContent", "POST"},
 	} {
 		if err := p.AllowsRoute(r.host, r.path, r.method); err != nil {
 			t.Errorf("%s %s%s not admitted by the default policy: %v", r.method, r.host, r.path, err)
@@ -181,6 +184,29 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 	}
 	if !beta {
 		t.Error("the Messages rule does not admit the beta query")
+	}
+
+	// Code Assist streams over SSE, which it is asked for with ?alt=sse.
+	sse := false
+	for _, rule := range p.Rules {
+		if rule.Path == "/v1internal:streamGenerateContent" {
+			for _, key := range rule.QueryKeys {
+				sse = sse || (key == "alt" && rule.AllowStream)
+			}
+		}
+	}
+	if !sse {
+		t.Error("the Code Assist stream rule does not admit a streamed ?alt=sse request")
+	}
+
+	// Only generation reaches Code Assist through the enclave. Onboarding,
+	// quota and settings calls are account management the Bee makes with its
+	// own token; matching is per segment, so the generation rules must not
+	// admit them.
+	for _, path := range []string{"/v1internal:loadCodeAssist", "/v1internal:onboardUser", "/v1internal:setUserSettings", "/v1internal:retrieveUserQuotaSummary"} {
+		if err := p.AllowsRoute("cloudcode-pa.googleapis.com", path, "POST"); err == nil {
+			t.Errorf("the default policy admitted Code Assist account management %s", path)
+		}
 	}
 
 	// A host the deployment does not reach is still refused, so admitting the

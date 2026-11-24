@@ -5,7 +5,8 @@
     "api.openai.com",
     "api.anthropic.com",
     "chatgpt.com",
-    "api.wokey.ai"
+    "api.wokey.ai",
+    "cloudcode-pa.googleapis.com"
   ],
   "rules": [
     {
@@ -39,6 +40,16 @@
       "methods": ["GET"],
       "path": "/backend-api/codex/models",
       "query_keys": ["client_version"]
+    },
+    {
+      "methods": ["POST"],
+      "path": "/v1internal:generateContent"
+    },
+    {
+      "methods": ["POST"],
+      "path": "/v1internal:streamGenerateContent",
+      "allow_stream": true,
+      "query_keys": ["alt"]
     },
     {
       "methods": ["GET"],
