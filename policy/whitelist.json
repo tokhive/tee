@@ -6,7 +6,9 @@
     "api.anthropic.com",
     "chatgpt.com",
     "api.wokey.ai",
-    "cloudcode-pa.googleapis.com"
+    "cloudcode-pa.googleapis.com",
+    "daily-cloudcode-pa.googleapis.com",
+    "generativelanguage.googleapis.com"
   ],
   "rules": [
     {
@@ -48,6 +50,16 @@
     {
       "methods": ["POST"],
       "path": "/v1internal:streamGenerateContent",
+      "allow_stream": true,
+      "query_keys": ["alt"]
+    },
+    {
+      "methods": ["POST"],
+      "path": "/v1internal:countTokens"
+    },
+    {
+      "methods": ["POST"],
+      "path": "/v1beta/models/{model}",
       "allow_stream": true,
       "query_keys": ["alt"]
     },

@@ -153,6 +153,14 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 		// A Google subscription (Gemini CLI OAuth) on the Code Assist API.
 		{"cloudcode-pa.googleapis.com", "/v1internal:generateContent", "POST"},
 		{"cloudcode-pa.googleapis.com", "/v1internal:streamGenerateContent", "POST"},
+		{"cloudcode-pa.googleapis.com", "/v1internal:countTokens", "POST"},
+		// Code Assist's daily environment, the fallback Antigravity uses.
+		{"daily-cloudcode-pa.googleapis.com", "/v1internal:streamGenerateContent", "POST"},
+		// An OAuth account without a project, on the AI Studio API: the model
+		// and the action share one segment.
+		{"generativelanguage.googleapis.com", "/v1beta/models/gemini-2.5-pro:generateContent", "POST"},
+		{"generativelanguage.googleapis.com", "/v1beta/models/gemini-2.5-pro:streamGenerateContent", "POST"},
+		{"generativelanguage.googleapis.com", "/v1beta/models/gemini-2.5-pro:countTokens", "POST"},
 	} {
 		if err := p.AllowsRoute(r.host, r.path, r.method); err != nil {
 			t.Errorf("%s %s%s not admitted by the default policy: %v", r.method, r.host, r.path, err)
@@ -186,17 +194,19 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 		t.Error("the Messages rule does not admit the beta query")
 	}
 
-	// Code Assist streams over SSE, which it is asked for with ?alt=sse.
-	sse := false
-	for _, rule := range p.Rules {
-		if rule.Path == "/v1internal:streamGenerateContent" {
-			for _, key := range rule.QueryKeys {
-				sse = sse || (key == "alt" && rule.AllowStream)
+	// Both Google APIs stream over SSE, which they are asked for with ?alt=sse.
+	for _, path := range []string{"/v1internal:streamGenerateContent", "/v1beta/models/{model}"} {
+		sse := false
+		for _, rule := range p.Rules {
+			if rule.Path == path {
+				for _, key := range rule.QueryKeys {
+					sse = sse || (key == "alt" && rule.AllowStream)
+				}
 			}
 		}
-	}
-	if !sse {
-		t.Error("the Code Assist stream rule does not admit a streamed ?alt=sse request")
+		if !sse {
+			t.Errorf("the %s rule does not admit a streamed ?alt=sse request", path)
+		}
 	}
 
 	// Only generation reaches Code Assist through the enclave. Onboarding,
