@@ -150,6 +150,17 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 		// The API reseller the market falls back to, on both shapes.
 		{"api.wokey.ai", "/v1/responses", "POST"},
 		{"api.wokey.ai", "/v1/messages", "POST"},
+		// A Google subscription (Gemini CLI OAuth) on the Code Assist API.
+		{"cloudcode-pa.googleapis.com", "/v1internal:generateContent", "POST"},
+		{"cloudcode-pa.googleapis.com", "/v1internal:streamGenerateContent", "POST"},
+		{"cloudcode-pa.googleapis.com", "/v1internal:countTokens", "POST"},
+		// Code Assist's daily environment, the fallback Antigravity uses.
+		{"daily-cloudcode-pa.googleapis.com", "/v1internal:streamGenerateContent", "POST"},
+		// An OAuth account without a project, on the AI Studio API: the model
+		// and the action share one segment.
+		{"generativelanguage.googleapis.com", "/v1beta/models/gemini-2.5-pro:generateContent", "POST"},
+		{"generativelanguage.googleapis.com", "/v1beta/models/gemini-2.5-pro:streamGenerateContent", "POST"},
+		{"generativelanguage.googleapis.com", "/v1beta/models/gemini-2.5-pro:countTokens", "POST"},
 	} {
 		if err := p.AllowsRoute(r.host, r.path, r.method); err != nil {
 			t.Errorf("%s %s%s not admitted by the default policy: %v", r.method, r.host, r.path, err)
@@ -181,6 +192,31 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 	}
 	if !beta {
 		t.Error("the Messages rule does not admit the beta query")
+	}
+
+	// Both Google APIs stream over SSE, which they are asked for with ?alt=sse.
+	for _, path := range []string{"/v1internal:streamGenerateContent", "/v1beta/models/{model}"} {
+		sse := false
+		for _, rule := range p.Rules {
+			if rule.Path == path {
+				for _, key := range rule.QueryKeys {
+					sse = sse || (key == "alt" && rule.AllowStream)
+				}
+			}
+		}
+		if !sse {
+			t.Errorf("the %s rule does not admit a streamed ?alt=sse request", path)
+		}
+	}
+
+	// Only generation reaches Code Assist through the enclave. Onboarding,
+	// quota and settings calls are account management the Bee makes with its
+	// own token; matching is per segment, so the generation rules must not
+	// admit them.
+	for _, path := range []string{"/v1internal:loadCodeAssist", "/v1internal:onboardUser", "/v1internal:setUserSettings", "/v1internal:retrieveUserQuotaSummary"} {
+		if err := p.AllowsRoute("cloudcode-pa.googleapis.com", path, "POST"); err == nil {
+			t.Errorf("the default policy admitted Code Assist account management %s", path)
+		}
 	}
 
 	// A host the deployment does not reach is still refused, so admitting the
