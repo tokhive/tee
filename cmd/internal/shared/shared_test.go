@@ -161,6 +161,46 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 		{"generativelanguage.googleapis.com", "/v1beta/models/gemini-2.5-pro:generateContent", "POST"},
 		{"generativelanguage.googleapis.com", "/v1beta/models/gemini-2.5-pro:streamGenerateContent", "POST"},
 		{"generativelanguage.googleapis.com", "/v1beta/models/gemini-2.5-pro:countTokens", "POST"},
+		// xAI Grok: the API on every shape, and a SuperGrok subscription on the
+		// Grok CLI's chat proxy.
+		{"api.x.ai", "/v1/chat/completions", "POST"},
+		{"api.x.ai", "/v1/responses", "POST"},
+		{"api.x.ai", "/v1/messages", "POST"},
+		{"cli-chat-proxy.grok.com", "/v1/responses", "POST"},
+		// Meta Muse, on the Responses shape.
+		{"api.meta.ai", "/v1/responses", "POST"},
+		// Zhipu GLM, mainland and international: pay-as-you-go, the coding
+		// plan, and the Anthropic-compatible endpoint both share.
+		{"open.bigmodel.cn", "/api/paas/v4/chat/completions", "POST"},
+		{"open.bigmodel.cn", "/api/paas/v4/responses", "POST"},
+		{"open.bigmodel.cn", "/api/coding/paas/v4/chat/completions", "POST"},
+		{"open.bigmodel.cn", "/api/anthropic/v1/messages", "POST"},
+		{"api.z.ai", "/api/paas/v4/chat/completions", "POST"},
+		{"api.z.ai", "/api/coding/paas/v4/chat/completions", "POST"},
+		{"api.z.ai", "/api/anthropic/v1/messages", "POST"},
+		// Moonshot Kimi, mainland and international, and the Kimi Code
+		// subscription on both of its hosts.
+		{"api.moonshot.cn", "/v1/chat/completions", "POST"},
+		{"api.moonshot.cn", "/v1/responses", "POST"},
+		{"api.moonshot.cn", "/anthropic/v1/messages", "POST"},
+		{"api.moonshot.ai", "/v1/chat/completions", "POST"},
+		{"api.moonshot.ai", "/anthropic/v1/messages", "POST"},
+		{"api.kimi.com", "/coding/v1/chat/completions", "POST"},
+		{"api.kimi.com", "/coding/v1/responses", "POST"},
+		{"api.kimi.com", "/coding/v1/messages", "POST"},
+		{"api.kimi.com", "/coding/v1/messages/count_tokens", "POST"},
+		{"api.kimi.ai", "/coding/v1/messages", "POST"},
+		// DeepSeek, which serves its OpenAI shapes from the root as well as /v1.
+		{"api.deepseek.com", "/chat/completions", "POST"},
+		{"api.deepseek.com", "/v1/chat/completions", "POST"},
+		{"api.deepseek.com", "/responses", "POST"},
+		{"api.deepseek.com", "/anthropic/v1/messages", "POST"},
+		// MiniMax, mainland and international.
+		{"api.minimaxi.com", "/v1/chat/completions", "POST"},
+		{"api.minimaxi.com", "/v1/responses", "POST"},
+		{"api.minimaxi.com", "/anthropic/v1/messages", "POST"},
+		{"api.minimax.io", "/v1/chat/completions", "POST"},
+		{"api.minimax.io", "/anthropic/v1/messages", "POST"},
 	} {
 		if err := p.AllowsRoute(r.host, r.path, r.method); err != nil {
 			t.Errorf("%s %s%s not admitted by the default policy: %v", r.method, r.host, r.path, err)
@@ -176,7 +216,13 @@ func TestDefaultPolicyCoversTheRealAPIs(t *testing.T) {
 		// What the Codex client sends a subscription on every request.
 		"x-openai-internal-codex-responses-lite", "x-codex-beta-features", "x-codex-turn-state", "x-codex-turn-metadata", "x-codex-window-id", "x-codex-parent-thread-id", "x-openai-subagent", "x-codex-routing-hint",
 		// A request body the market compressed.
-		"content-encoding"} {
+		"content-encoding",
+		// What the Grok CLI sends a SuperGrok subscription.
+		"x-xai-token-auth", "x-grok-client-version", "x-grok-client-identifier", "x-authenticateresponse", "x-grok-conv-id",
+		// What the Kimi Code client sends.
+		"x-msh-platform", "x-msh-version", "x-msh-device-name", "x-msh-device-model", "x-msh-device-id",
+		// What the Muse Code client sends.
+		"x-client-id", "x-meta-ai-gateway-session-id", "x-tbh-session-id", "x-tbh-thread-id", "x-tbh-root-session-id", "x-tbh-agent-role", "x-tbh-contributor-mode"} {
 		if !p.Limits.HeaderAllowed(header) {
 			t.Errorf("header %q is not allowed", header)
 		}

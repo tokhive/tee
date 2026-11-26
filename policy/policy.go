@@ -50,9 +50,9 @@ const (
 	// TokenHive stack.
 	PolicyHashDomain = "TokenHive.Policy.v1"
 
-	MaxHosts          = 16
+	MaxHosts          = 32
 	MaxRules          = 64
-	MaxAllowedHeaders = 64
+	MaxAllowedHeaders = 128
 	MaxQueryKeys      = 64
 	MaxPlaceholderLen = 32
 )
