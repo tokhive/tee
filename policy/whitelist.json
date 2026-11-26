@@ -8,7 +8,19 @@
     "api.wokey.ai",
     "cloudcode-pa.googleapis.com",
     "daily-cloudcode-pa.googleapis.com",
-    "generativelanguage.googleapis.com"
+    "generativelanguage.googleapis.com",
+    "api.x.ai",
+    "cli-chat-proxy.grok.com",
+    "api.meta.ai",
+    "open.bigmodel.cn",
+    "api.z.ai",
+    "api.moonshot.cn",
+    "api.moonshot.ai",
+    "api.kimi.com",
+    "api.kimi.ai",
+    "api.deepseek.com",
+    "api.minimaxi.com",
+    "api.minimax.io"
   ],
   "rules": [
     {
@@ -64,6 +76,59 @@
       "query_keys": ["alt"]
     },
     {
+      "methods": ["POST"],
+      "path": "/chat/completions",
+      "allow_stream": true
+    },
+    {
+      "methods": ["POST"],
+      "path": "/responses",
+      "allow_stream": true
+    },
+    {
+      "methods": ["POST"],
+      "path": "/anthropic/v1/messages",
+      "allow_stream": true,
+      "query_keys": ["beta"]
+    },
+    {
+      "methods": ["POST"],
+      "path": "/api/anthropic/v1/messages",
+      "allow_stream": true,
+      "query_keys": ["beta"]
+    },
+    {
+      "methods": ["POST"],
+      "path": "/api/paas/v4/chat/completions",
+      "allow_stream": true
+    },
+    {
+      "methods": ["POST"],
+      "path": "/api/paas/v4/responses",
+      "allow_stream": true
+    },
+    {
+      "methods": ["POST"],
+      "path": "/api/coding/paas/v4/chat/completions",
+      "allow_stream": true
+    },
+    {
+      "methods": ["POST"],
+      "path": "/coding/v1/chat/completions",
+      "allow_stream": true
+    },
+    {
+      "methods": ["POST"],
+      "path": "/coding/v1/responses",
+      "allow_stream": true
+    },
+    {
+      "methods": ["POST"],
+      "path": "/coding/v1/messages",
+      "allow_stream": true,
+      "query_keys": ["beta"]
+    },
+    {
       "methods": ["GET"],
       "path": "/v1/realtime",
       "allow_stream": true,
@@ -115,7 +180,25 @@
       "x-client-app",
       "x-anthropic-additional-protection",
       "origin",
-      "sec-websocket-protocol"
+      "sec-websocket-protocol",
+      "x-xai-token-auth",
+      "x-grok-client-version",
+      "x-grok-client-identifier",
+      "x-authenticateresponse",
+      "x-grok-conv-id",
+      "x-msh-platform",
+      "x-msh-version",
+      "x-msh-device-name",
+      "x-msh-device-model",
+      "x-msh-device-id",
+      "x-client-id",
+      "x-meta-ai-gateway-session-id",
+      "x-tbh-session-id",
+      "x-tbh-thread-id",
+      "x-tbh-root-session-id",
+      "x-tbh-agent-role",
+      "x-tbh-contributor-mode",
+      "cache-control"
     ]
   }
 }

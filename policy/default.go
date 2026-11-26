@@ -50,18 +50,24 @@ var defaultWhitelist []byte
 //
 // The document carries the rules — which hosts the enclave may reach, which
 // request families on them, and the bounds a job must stay inside. Hosts name
-// the upstreams the deployment is willing to reach: the two AI vendors' API
-// endpoints, the ChatGPT subscription endpoint a logged-in account speaks to,
-// the API reseller the market falls back to when no subscription account can
-// serve a request (wokey, which speaks the vendors' Responses and Messages
-// shapes), and the mock host the simulation runs every shape behind. Its paths mirror
-// the Hub's user-facing routes: the OpenAI chat completions endpoint, the
-// OpenAI Responses endpoint, the Anthropic messages endpoint, the ChatGPT
-// subscription endpoint and the Codex model catalog beside it, and the
-// streaming-session endpoint. In a real
-// deployment those live on api.openai.com, api.anthropic.com and chatgpt.com;
-// the simulation serves every shape from one mock host, so one whitelist covers
-// them all.
+// the upstreams the deployment is willing to reach: every vendor a seller may
+// supply — OpenAI, Anthropic, Google, xAI Grok, Meta Muse, Zhipu GLM, Moonshot
+// Kimi, DeepSeek and MiniMax — on their API hosts, their mainland and
+// international hosts where they run both, and the hosts their subscription
+// clients (ChatGPT, Gemini CLI, Grok CLI, Kimi Code) speak to; the API reseller
+// the market falls back to when no subscription account can serve a request
+// (wokey); and the mock host the simulation runs every shape behind. Vendors
+// are admitted all at once rather than as each is launched, because every
+// whitelist change moves the measured image and forces a TEE release.
+//
+// Rules are not tied to a host: each admits its path family on every host
+// above. They cover the OpenAI chat completions and Responses shapes, the
+// Anthropic Messages shape, the ChatGPT Codex endpoints, Google's Code Assist
+// and AI Studio generation, the streaming-session endpoint, and the prefixes
+// the other vendors mount those same shapes under (DeepSeek's bare root,
+// Zhipu's /api/paas/v4 and /api/coding/paas/v4, Kimi Code's /coding/v1, and
+// the /anthropic and /api/anthropic Messages endpoints). The simulation serves
+// every shape from one mock host, so one whitelist covers them all.
 //
 // The window is stamped here rather than written into the document, because it
 // is policy about every whitelist this codebase ships, not something a
