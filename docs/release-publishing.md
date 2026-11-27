@@ -248,6 +248,15 @@ HIVE_TEE_RELEASE_CATALOG_COMMIT=<full-catalog-commit-B>
 
 Hive 在启动时读取该配置，因此更新视图及来源配置后应重启 Hive。发布签名本身不要求重启或重新部署 TEE。环境视图只用于发布信息展示，不替代 `HIVE_TEE_EXPECTED_APP` 等运行时信任配置。
 
+正式版 Bee 从 v0.0.14 起（tokhive/bee#98）按这份签名清单决定信任哪些 TEE 镜像：它从 `releases/latest` 下载 `catalog.json` 和 `catalog.json.sig`，用生产发布签名公钥验签，只信任 `production` 当前启用的镜像。因此：
+
+- 生产切换后，尽快登记启用事件、签名并发布 Release。从切换到发布这段时间，Bee 认不出新镜像，无法向它重新加密凭据，供给暂停并持续重试，Release 发布后自动恢复。
+- 生产 Release 必须是正式发布（`--latest`），staging Release 保持 pre-release，否则 `releases/latest` 指向的清单不对。staging 清单用 staging 密钥签名，Bee 会拒绝它并沿用已有的信任。
+- 登记停用事件并发布新 Release，就会撤销对应镜像，Bee 在下次读取清单时生效（缓存 10 分钟）。
+- 更换生产发布签名密钥或 Secure Boot R 公钥时，Bee 需要发新版。
+
+verifier 网页按应用身份从 `web/static/release-catalog.json` 查 Secure Boot R 公钥，每个新的生产镜像都要在 tokhive/verifier 里加一条（只需应用身份和 R 公钥，可在切换前完成），合并后网页自动部署。
+
 TEE 发版时检查 verifier 兼容性：仅修改清单、签名、文档和发布工具通常无需更新 verifier 的 TEE 库依赖；应用或策略变更但证明协议兼容时，核对新的可信预期身份和策略；证明格式、回执协议、验证规则变化或验证库安全修复需要评估并发布新版 verifier。
 
 应用撤销、发布密钥撤销和运行 epoch 密钥轮换是不同操作。按各自流程处理并保留历史，不把一次清单签名或生产实例启动视为整个 #200 已完成。
