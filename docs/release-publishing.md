@@ -121,7 +121,7 @@ python3 deploy/release_catalog.py release \
 
 已登记版本应保留原始 `release_url` 和构建来源，不为补附件强行改写历史。可在新的 Release 正文引用原记录和原发布依据。
 
-应用在某环境实际生效后，才登记对应的启用事件。`production` 的启用时间应是 Hive 已实际切换并确认使用该身份的时间；只有 TEE 实例启动或 AMI 创建成功，不足以登记 Hive 已启用。没有实际启用事实时保留候选状态，不能为了成功导出 `tee-production.json` 而虚构事件。
+应用在某环境实际生效后，才登记对应的启用事件。`production` 例外：正式版 Bee 只信任签名清单里 `production` 当前启用的镜像，所以顺序是部署新 TEE、验收、登记启用并发布 Release，然后再切 Hive。`production` 的启用时间是新 TEE 已部署、验收通过、即将切换 Hive 的时间；只有 TEE 实例启动或 AMI 创建成功、尚未验收，不足以登记。没有部署事实时保留候选状态，不能为了成功导出 `tee-production.json` 而虚构事件。
 
 校验并提交 `releases/catalog.json`，完成审查后确定提交 B。登记、启停和 `crosshost.sh record` 的完整命令见 [清单操作说明](tee-release-catalog.md)；从起新机到改 Hub、回收旧机、再登记的一整套切换命令见 [运维移交手册](ops-handover.md) 的 TL;DR 一节。
 
@@ -250,12 +250,13 @@ Hive 在启动时读取该配置，因此更新视图及来源配置后应重启
 
 正式版 Bee 从 v0.0.14 起（tokhive/bee#98）按这份签名清单决定信任哪些 TEE 镜像：它从 `releases/latest` 下载 `catalog.json` 和 `catalog.json.sig`，用生产发布签名公钥验签，只信任 `production` 当前启用的镜像。因此：
 
-- 生产切换后，尽快登记启用事件、签名并发布 Release。从切换到发布这段时间，Bee 认不出新镜像，无法向它重新加密凭据，供给暂停并持续重试，Release 发布后自动恢复。
+- 顺序是部署新 TEE、验收、登记启用、签名并发布 Release，再切 Hive。先切 Hive 的话，Release 发布前 Bee 认不出新镜像，无法向它重新加密凭据，供给暂停并持续重试，Release 发布后自动恢复。
+- Release 发布后尽快切 Hive：清单里旧镜像已停用，Bee 刷新清单（缓存 10 分钟）后不再向旧 TEE 加密凭据，会重试到 Hive 切换为止。
 - 生产 Release 必须是正式发布（`--latest`），staging Release 保持 pre-release，否则 `releases/latest` 指向的清单不对。staging 清单用 staging 密钥签名，Bee 会拒绝它并沿用已有的信任。
-- 登记停用事件并发布新 Release，就会撤销对应镜像，Bee 在下次读取清单时生效（缓存 10 分钟）。
+- 登记停用或撤销（`revoke`）并发布新 Release，Bee 就不再信任对应镜像，在下次读取清单时生效（缓存 10 分钟）。撤销不必同时停用：Bee v0.0.15 起不信任撤销记录里的镜像，即使它仍是启用状态。
 - 更换生产发布签名密钥或 Secure Boot R 公钥时，Bee 需要发新版。
 
-verifier 网页按应用身份从 `web/static/release-catalog.json` 查 Secure Boot R 公钥，每个新的生产镜像都要在 tokhive/verifier 里加一条（只需应用身份和 R 公钥，可在切换前完成），合并后网页自动部署。
+verifier 网页按应用身份从 `web/static/release-catalog.json` 查 Secure Boot R 公钥，每个新的生产镜像都要在 tokhive/verifier 里加一条（只需应用身份和 R 公钥，可在发版前完成），合并后网页自动部署。
 
 TEE 发版时检查 verifier 兼容性：仅修改清单、签名、文档和发布工具通常无需更新 verifier 的 TEE 库依赖；应用或策略变更但证明协议兼容时，核对新的可信预期身份和策略；证明格式、回执协议、验证规则变化或验证库安全修复需要评估并发布新版 verifier。
 
