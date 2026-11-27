@@ -33,7 +33,17 @@ TOKENHIVE_TEE_TIMING=summary \
 
 新实例的私网 IP 在 `up` 输出的 `-> instrumentation endpoint http://<ip>:18092/timing` 一行，也在 `cloudtest/crosshost.json` 的 `tee.private_ip`；`tee.app_hash` 同时被写成本次构建的摘要。
 
-**三、在 Hub 机改三行并重启**（`/etc/tokhive/hive.env`）：
+**三、验收新 TEE，登记并发版**：
+
+```bash
+./crosshost.sh verify                                  # 串口 attestation + 进程日志
+curl http://<新 TEE 私网 IP>:18092/timing              # 在 Hub 机或同一安全组内执行
+./crosshost.sh record --environment production --application-id 'snp-app:<新摘要>'
+```
+
+`record` 之后是 tag、清单签名和发布 Release，见 §8 末尾与 `docs/release-publishing.md`。**Release 发布后再切 Hub**：正式版 Bee（v0.0.14 起）只信任最新 Release 签名清单里 `production` 当前启用的镜像，先切 Hub 会让 Bee 在 Release 发布前无法向新 TEE 加密凭据。
+
+**四、在 Hub 机改三行并重启**（`/etc/tokhive/hive.env`）：
 
 ```text
 HIVE_TEE_ENDPOINT=https://<新 TEE 私网 IP>:18090
@@ -48,17 +58,14 @@ journalctl -u tokhive-hive -n 100      # 应出现 attestation 通过、relay �
 
 若本次改动了 `policy/`、协议或回执字段，Hive 二进制要一起换（按 Hive 仓库 `docs/operations.md` 的「升级与回滚」）。`HIVE_TEE_CLIENT_CERT`／`HIVE_TEE_CLIENT_KEY`、`HIVE_RELAY_KEY` 不变；R 没有轮换就不动 `HIVE_TEE_RELEASE_PUBLIC_KEY`。
 
-**四、验收、回收、登记**：
+Release 发布后尽快切 Hub：清单里旧镜像已经停用，Bee 刷新清单（缓存 10 分钟）后不再向旧 TEE 加密凭据，会重试到 Hub 切换为止。
+
+**五、回收旧机**：
 
 ```bash
-./crosshost.sh verify                                  # 串口 attestation + 进程日志
-curl http://<新 TEE 私网 IP>:18092/timing              # 在 Hub 机或同一安全组内执行
 ./crosshost.sh down --superseded --dry-run
 ./crosshost.sh down --superseded                       # 确认 Hub 已切过去，再删旧机
-./crosshost.sh record --environment production --application-id 'snp-app:<新摘要>'
 ```
-
-`record` 之后才是 tag、草稿 Release 与清单签名，见 §8 末尾与 `docs/release-publishing.md`。
 
 三条命令之外、最容易踩空的前提：
 
@@ -357,11 +364,11 @@ TOKENHIVE_TEE_TIMING=summary \
 
 `up --new` 会把新实例自带的 `snp-app` 标签写回 `crosshost.json` 的 `tee.app_hash`，所以第 2 步的 `HIVE_TEE_EXPECTED_APP` 以构建输出或该字段为准，不要沿用旧值。relay key 与 instance profile 的要求同 §6：key 不一致或 Hub 不在同一安全组时，起机、串口、attestation 都正常，只有 relay 建不起来。
 
-`down --superseded` 会先确认当前 TEE 已记录且在运行，再按记录逐个核对双 tag；它从不按 tag 枚举。Hub 是否真的切过去了，它看不到，所以第 2 步必须人工确认。
+`down --superseded` 会先确认当前 TEE 已记录且在运行，再按记录逐个核对双 tag；它从不按 tag 枚举。Hub 是否真的切过去了，它看不到，所以删旧机前必须人工确认。
 
 ## 8. 记录每次发版
 
-环境开始服务某个构建之后，把这件事记一笔。手工跑一次 `record`：`build`、`up`、`deploy` 都不调用它，没在某个环境真正服务过的构建不会进历史。记的是期望；写早一步，就是一句没人核对过的话。
+环境开始服务某个构建之后，把这件事记一笔；`production` 例外，在新 TEE 部署并验收后、切 Hub 之前登记，因为正式版 Bee 要从签名清单里看到它才信任它（见第 7 节 TL;DR 与 `docs/release-publishing.md` 第七节）。手工跑一次 `record`：`build`、`up`、`deploy` 都不调用它，没在某个环境真正服务过的构建不会进历史。记的是期望；写早一步，就是一句没人核对过的话。
 
 ```bash
 cd cloudtest/snp

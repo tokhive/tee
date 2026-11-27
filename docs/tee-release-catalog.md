@@ -62,7 +62,7 @@ python3 deploy/release_catalog.py activate \
   --application-id 'snp-app:<64-character-lowercase-hex>'
 ```
 
-默认记录当前 UTC 时间。补录时可显式传入 `--at '2026-11-03T08:00:00Z'` 或其他带时区的 RFC 3339 时间。时间应为 Hive 实际切换并确认使用该 TEE 的时间；启动实例、注册 AMI 或构建完成都不证明 Hive 已经切换，因此 `up`／`deploy` 都不会自动执行 `activate`。下一节的 `record` 把这两步合起来，同样需要人工触发。
+默认记录当前 UTC 时间。补录时可显式传入 `--at '2026-11-03T08:00:00Z'` 或其他带时区的 RFC 3339 时间。时间应为该环境实际启用的时间；`production` 是新 TEE 已部署、验收通过、即将切换 Hive 的时间，登记后发布 Release，再切 Hive（正式版 Bee 只信任签名清单里启用的镜像，见 `docs/release-publishing.md` 第七节）。启动实例、注册 AMI 或构建完成都不等于验收通过，因此 `up`／`deploy` 都不会自动执行 `activate`。下一节的 `record` 把这两步合起来，同样需要人工触发。
 
 切换到不同版本时，工具先追加旧版本的停用事件，再追加新版本的启用事件，两者使用同一个切换时间。回滚时重新引用旧版本，产生新的使用区间，不覆盖旧区间。各环境的状态相互独立。
 
